@@ -8,7 +8,7 @@ mod real {
     pub type Result<T = ()> = std::result::Result<T, Error>;
 
     #[derive(Debug)]
-    pub struct Error(pub &'static str);
+    pub struct Error(pub String);
 
     impl std::fmt::Display for Error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,6 +68,7 @@ mod real {
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
         fn cudaMemset(ptr: *mut c_void, value: i32, bytes: usize) -> i32;
         fn cudaDeviceSynchronize() -> i32;
+        fn pulsar_cuda_device_info(dev: i32, out: *mut PulsarCudaDeviceInfo) -> i32;
 
         fn pulsar_embed_q8_0(
             out: *mut c_void,
@@ -741,7 +742,7 @@ mod real {
             Ok(())
         } else {
             eprintln!("pulsar: CUDA op {op} returned status {ret}");
-            Err(Error(op))
+            Err(Error(op.into()))
         }
     }
 
@@ -750,7 +751,7 @@ mod real {
             Ok(())
         } else {
             eprintln!("pulsar: CUDA runtime op {op} returned status {ret}");
-            Err(Error(op))
+            Err(Error(op.into()))
         }
     }
 
@@ -768,8 +769,85 @@ mod real {
 
     unsafe impl Send for DeviceBuf {}
 
-    const ATTR_CC_MAJOR: i32 = 75;
-    const ATTR_CC_MINOR: i32 = 76;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PulsarCudaDeviceInfo {
+        name: [u8; 256],
+        uuid: [u8; 16],
+        total_mem: usize,
+        cc_major: i32,
+        cc_minor: i32,
+        pci_domain: i32,
+        pci_bus: i32,
+        pci_device: i32,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CudaDeviceInfo {
+        pub index: i32,
+        pub name: String,
+        pub uuid: String,
+        pub total_mem: usize,
+        pub cc_major: i32,
+        pub cc_minor: i32,
+        pub pci_domain: i32,
+        pub pci_bus: i32,
+        pub pci_device: i32,
+        pub h2d_gbps: Option<f64>,
+    }
+
+    fn cstr(bytes: &[u8]) -> String {
+        let n = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..n]).into_owned()
+    }
+
+    fn uuid_string(bytes: &[u8; 16]) -> String {
+        format!(
+            "GPU-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+            bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        )
+    }
+
+    pub fn cuda_devices(measure_h2d: bool) -> Result<Vec<CudaDeviceInfo>> {
+        let mut n = 0;
+        check_rt(unsafe { cudaGetDeviceCount(&mut n) }, "cudaGetDeviceCount")?;
+        let mut devices = Vec::with_capacity(n.max(0) as usize);
+        for index in 0..n {
+            let mut raw = PulsarCudaDeviceInfo {
+                name: [0; 256],
+                uuid: [0; 16],
+                total_mem: 0,
+                cc_major: 0,
+                cc_minor: 0,
+                pci_domain: 0,
+                pci_bus: 0,
+                pci_device: 0,
+            };
+            check_rt(
+                unsafe { pulsar_cuda_device_info(index, &mut raw) },
+                "cudaGetDeviceProperties",
+            )?;
+            devices.push(CudaDeviceInfo {
+                index,
+                name: cstr(&raw.name),
+                uuid: uuid_string(&raw.uuid),
+                total_mem: raw.total_mem,
+                cc_major: raw.cc_major,
+                cc_minor: raw.cc_minor,
+                pci_domain: raw.pci_domain,
+                pci_bus: raw.pci_bus,
+                pci_device: raw.pci_device,
+                h2d_gbps: if measure_h2d {
+                    Some(raw_h2d_probe(index))
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(devices)
+    }
 
     /// Raw probe used during device selection (must not route through
     /// set_device - Once re-entrancy). Best-of-3 pinned 64MB H2D, GB/s.
@@ -808,59 +886,63 @@ mod real {
     /// static rankings lie about what matters: expert streaming is H2D-bound,
     /// and substrate's 4060 Ti sits in a slot that trains PCIe x1 (0.8 GB/s vs
     /// the 5060 Ti's 28.8) - a compute-capability heuristic can't see that, and
-    /// neither can lspci at idle. So MEASURE: probe H2D bandwidth per device
-    /// and take the fastest link (~100ms/device at startup, tie-break by
-    /// compute capability). PULSAR_GPU overrides with a CUDA device index.
-    fn ensure_device() {
-        use std::sync::Once;
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            let pick = std::env::var("PULSAR_GPU")
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok());
-            let mut probed = 0.0;
-            let dev = pick.unwrap_or_else(|| {
-                let mut n = 0;
-                if unsafe { cudaGetDeviceCount(&mut n) } != 0 || n <= 1 {
-                    return 0;
-                }
-                let cc = |d: i32| -> i32 {
-                    let (mut maj, mut min) = (0, 0);
-                    unsafe {
-                        cudaDeviceGetAttribute(&mut maj, ATTR_CC_MAJOR, d);
-                        cudaDeviceGetAttribute(&mut min, ATTR_CC_MINOR, d);
-                    }
-                    maj * 10 + min
-                };
-                let best = (0..n)
-                    .map(|d| (d, raw_h2d_probe(d)))
-                    .max_by(|a, b| {
-                        a.1.partial_cmp(&b.1)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| cc(a.0).cmp(&cc(b.0)))
-                            .then_with(|| b.0.cmp(&a.0))
-                    })
-                    .unwrap_or((0, 0.0));
-                probed = best.1;
-                best.0
-            });
-            if unsafe { cudaSetDevice(dev) } != 0 {
-                eprintln!("pulsar: cudaSetDevice({dev}) failed, falling back to CUDA default");
-            } else if std::env::var_os("PULSAR_QUIET").is_none() {
-                if probed > 0.0 {
-                    eprintln!("pulsar: using CUDA device {dev} ({probed:.1} GB/s H2D measured)");
-                } else {
-                    eprintln!("pulsar: using CUDA device {dev}");
-                }
+    /// neither can lspci at idle. K3 also needs capacity for its resident
+    /// trunk, so automatic selection ranks total VRAM first, then measured H2D
+    /// bandwidth and compute capability. PULSAR_GPU overrides with a CUDA
+    /// device index.
+    fn ensure_device() -> Result {
+        use std::sync::OnceLock;
+        static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let mut n = 0;
+            if unsafe { cudaGetDeviceCount(&mut n) } != 0 || n <= 0 {
+                return Err("no CUDA devices are visible".to_string());
             }
-        });
+            let requested = std::env::var("PULSAR_GPU").ok();
+            let dev = if let Some(value) = requested.as_deref() {
+                let dev = value
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| format!("PULSAR_GPU={value:?} is not a CUDA index"))?;
+                if dev < 0 || dev >= n {
+                    return Err(format!(
+                        "PULSAR_GPU={dev} is invalid: visible CUDA device indices are 0..{}",
+                        n - 1
+                    ));
+                }
+                dev
+            } else {
+                let devices = cuda_devices(true).map_err(|e| e.to_string())?;
+                devices
+                    .iter()
+                    .max_by(|a, b| {
+                        a.total_mem
+                            .cmp(&b.total_mem)
+                            .then_with(|| a.h2d_gbps.unwrap_or(0.0).total_cmp(&b.h2d_gbps.unwrap_or(0.0)))
+                            .then_with(|| (a.cc_major, a.cc_minor).cmp(&(b.cc_major, b.cc_minor)))
+                            .then_with(|| b.index.cmp(&a.index))
+                    })
+                    .map(|d| d.index)
+                    .unwrap_or(0)
+            };
+            if unsafe { cudaSetDevice(dev) } != 0 {
+                return Err(format!("cudaSetDevice({dev}) failed"));
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(Error)
     }
 
     /// Switch the calling thread's current CUDA device. Kernel wrappers
     /// launch on whatever device is current; the engine brackets its
     /// attn-GPU segments with this.
     pub fn set_device(dev: i32) -> Result {
-        ensure_device();
+        ensure_device()?;
+        let n = device_count();
+        if dev < 0 || dev >= n {
+            return Err(Error("invalid CUDA device index".into()));
+        }
         check_rt(unsafe { cudaSetDevice(dev) }, "cudaSetDevice")
     }
 
@@ -874,6 +956,11 @@ mod real {
         let mut n = 0;
         unsafe { cudaGetDeviceCount(&mut n) };
         n
+    }
+
+    pub fn selected_device() -> Result<i32> {
+        ensure_device()?;
+        Ok(get_device())
     }
 
     /// Measured H2D bandwidth to `dev` in GB/s (pinned 64MB, best of 3).
@@ -922,7 +1009,9 @@ mod real {
             Some("0") => return false,
             _ => {}
         }
-        ensure_device();
+        if ensure_device().is_err() {
+            return false;
+        }
         const ATTR_INTEGRATED: i32 = 18;
         let mut v = 0;
         unsafe { cudaDeviceGetAttribute(&mut v, ATTR_INTEGRATED, get_device()) };
@@ -945,7 +1034,7 @@ mod real {
 
     impl DeviceBuf {
         pub fn alloc(bytes: usize) -> Result<Self> {
-            ensure_device();
+            ensure_device()?;
             let mut ptr = std::ptr::null_mut();
             if let Err(e) = check_rt(unsafe { cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc") {
                 eprintln!(
@@ -966,7 +1055,7 @@ mod real {
         /// Mapped pinned host memory; `ptr()` is device-visible. With UVA
         /// (64-bit Linux) the pointer is valid on every device.
         pub fn alloc_pinned(bytes: usize) -> Result<Self> {
-            ensure_device();
+            ensure_device()?;
             const MAPPED: u32 = 2; // cudaHostAllocMapped
             let mut host = std::ptr::null_mut();
             check_rt(
@@ -1002,6 +1091,12 @@ mod real {
 
         pub fn is_pinned(&self) -> bool {
             !self.host.is_null()
+        }
+
+        /// Process-local CUDA device owning this allocation; -1 is mapped
+        /// pinned host memory (UVA), not a VRAM allocation.
+        pub fn device(&self) -> i32 {
+            self.dev
         }
 
         pub fn ptr(&self) -> *const c_void {
@@ -1113,7 +1208,9 @@ mod real {
     }
 
     pub fn pinned_alloc(bytes: usize) -> *mut u8 {
-        ensure_device();
+        if ensure_device().is_err() {
+            return std::ptr::null_mut();
+        }
         if let Some(ptr) = pinned_pool()
             .lock()
             .unwrap()
@@ -1182,7 +1279,7 @@ mod real {
 
     impl CopyStream {
         pub fn new() -> Result<CopyStream> {
-            ensure_device();
+            ensure_device()?;
             const NON_BLOCKING: u32 = 1;
             const DISABLE_TIMING: u32 = 2;
             let mut stream = std::ptr::null_mut();

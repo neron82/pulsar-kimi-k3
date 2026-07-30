@@ -738,6 +738,9 @@ mod real {
         /// (virtual base, path) per shard; single file = one entry, base 0.
         shards: Vec<(u64, std::path::PathBuf)>,
         pub shape: Shape,
+        /// Resolved process-local CUDA index selected before any model
+        /// allocation. K3 never re-runs automatic selection after this.
+        pub primary_device: i32,
         pub gguf: Gguf,
         token_embd: DeviceBuf,
         output_norm: DeviceBuf,
@@ -783,6 +786,7 @@ mod real {
         /// Kimi K3 output AttnRes norm and projection (global tensors)
         pub k3_output_res_norm: Option<DeviceBuf>,
         pub k3_output_res_proj: Option<DeviceBuf>,
+        k3_device_log: std::sync::OnceLock<()>,
     }
 
     /// deepseek4 output_hc_*: collapse the final HC streams before
@@ -1043,6 +1047,10 @@ mod real {
 
         fn slot_ptr(&self, slot: u32) -> *const std::ffi::c_void {
             self.pool.ptr_at(slot as usize * self.slab_bytes)
+        }
+
+        pub fn device(&self) -> i32 {
+            self.pool.device()
         }
 
         fn get(&mut self, offset: u64, len: u64) -> Option<*const std::ffi::c_void> {
@@ -2218,6 +2226,38 @@ mod real {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
+            let primary_device = kernels::selected_device()?;
+            let requested = std::env::var("PULSAR_GPU").unwrap_or_else(|_| "<automatic>".into());
+            let devices = kernels::cuda_devices(true)?;
+            kernels::set_device(primary_device)?;
+            eprintln!(
+                "pulsar: PULSAR_GPU={requested} -> primary CUDA device {primary_device}"
+            );
+            for d in &devices {
+                let role = if d.index == primary_device {
+                    if shape.family == Family::KimiK3 {
+                        "primary K3 compute/expert-streaming"
+                    } else {
+                        "primary compute/expert-streaming"
+                    }
+                } else {
+                    "secondary/resident-tier"
+                };
+                eprintln!(
+                    "CUDA device {}:\n  name: {}\n  uuid: {}\n  memory: {} MiB\n  compute capability: {}.{}\n  PCI: {:04x}:{:02x}:{:02x} (link width/generation unavailable through CUDA runtime)\n  H2D bandwidth: {:.1} GB/s\n  role: {}",
+                    d.index,
+                    d.name,
+                    d.uuid,
+                    d.total_mem / (1024 * 1024),
+                    d.cc_major,
+                    d.cc_minor,
+                    d.pci_domain,
+                    d.pci_bus,
+                    d.pci_device,
+                    d.h2d_gbps.unwrap_or(0.0),
+                    role
+                );
+            }
             let k3_layer_kinds = if shape.family == Family::KimiK3 {
                 let Value::Array(values) = gguf
                     .arch_meta("attention.head_count_kv")
@@ -2339,7 +2379,8 @@ mod real {
             // only needs capacity - a bandwidth-crippled slot still serves
             // it at full speed, paying only once at load.
             // PULSAR_ATTN_GPU=<idx> forces, =off disables auto-detection.
-            let primary = kernels::get_device();
+            let primary = primary_device;
+            kernels::set_device(primary)?;
             let attn_dev = match shape.family {
                 Family::Mla => match std::env::var("PULSAR_ATTN_GPU").ok().as_deref() {
                     Some("off") | Some("-1") => None,
@@ -3373,6 +3414,7 @@ mod real {
                 path: path.to_path_buf(),
                 shards,
                 shape,
+                primary_device,
                 gguf,
                 token_embd,
                 output_norm,
@@ -3399,6 +3441,7 @@ mod real {
                 k3_layer_kinds,
                 k3_output_res_norm,
                 k3_output_res_proj,
+                k3_device_log: std::sync::OnceLock::new(),
             })
         }
     }
@@ -3929,7 +3972,8 @@ mod real {
 
             // everything the attn segment touches lives on the attn GPU
             // when one is set: KV, MLA scratch, q/heads, hop buffers
-            let primary = kernels::get_device();
+            let primary = m.primary_device;
+            kernels::set_device(primary)?;
             if let Some(d) = m.attn_dev {
                 kernels::set_device(d)?;
             }

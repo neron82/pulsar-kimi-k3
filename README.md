@@ -132,12 +132,14 @@ halves to f16 (the reference indexer ships FP8 in production).
 On a single RTX 4060 Ti (where NeutronStar set its numbers): Hy3 2.6,
 GLM 0.56.
 
-**Zero-config multi-GPU.** At startup pulsar *measures* each card's H2D
-bandwidth (labels lie: an x8-labeled slot can train x1, a driver bug can
-park a Gen5 card at Gen1, only a measurement sees that) and assigns
-roles by what each card is actually good at:
+**Zero-config multi-GPU.** At startup pulsar identifies each visible card and
+measures its H2D bandwidth (labels lie: an x8-labeled slot can train x1, a
+driver bug can park a Gen5 card at Gen1). Automatic K3 primary selection
+prefers total VRAM capacity, then measured H2D bandwidth and compute
+capability; explicit `PULSAR_GPU` always wins.
 
-- **Expert streaming** needs link bandwidth → the fastest measured card.
+- **Expert streaming** uses the selected primary; H2D bandwidth breaks
+  automatic-selection ties after VRAM capacity.
 - **Attention residency** (MLA models: the whole ~14GB attn stack + KV
   parked on a second card) only needs capacity, weights cross the bus
   once at load, then only activations hop (2× 24KB per layer). A
@@ -249,7 +251,7 @@ Everything auto-configures; these override.
 
 | var | default | what |
 |---|---|---|
-| `PULSAR_GPU` | measured | CUDA index of the expert-streaming (primary) GPU |
+| `PULSAR_GPU` | automatic | Process-local CUDA index of the K3 primary compute/expert-streaming GPU; invalid values fail |
 | `PULSAR_ATTN_GPU` | auto (MLA) | attention GPU by CUDA index. MLA models auto-offload (`off` disables); GQA models are opt-in by index: a capacity shuffle that loses on 2 GPUs at short context, pays on 3+ GPUs or long context |
 | `PULSAR_KV` | f32 | `fp8` stores GQA K/V as e4m3 + per-row scale (~3.9x smaller KV, longer contexts in the same VRAM). Lossy, hence opt-in: the default keeps decode bit-exact. Runs on any GPU (storage format, no fp8 hardware needed). Measured: greedy ids unchanged on short-context runs |
 | `PULSAR_TIERS` | on | `off` disables resident expert tiers (also the bit-exact single-device path) |

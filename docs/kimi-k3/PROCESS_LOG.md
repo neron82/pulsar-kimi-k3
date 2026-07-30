@@ -210,6 +210,27 @@ out = moe_out + shared
 - Current tree is a large uncommitted K3 rewrite; no existing changes are to be discarded or committed by delegated workers. Four bounded lanes were dispatched under delegation `deleg_156f75cb`: read-only runtime audit, kernel-only Q2/Q3 CUDA primitives, stream-crate-only SSD pipeline, and read-only hot-tier architecture audit.
 - Parent verification gate remains strict: delegated summaries are hypotheses until the merged tree compiles, focused tests and full workspace tests pass, the real model produces output, and cold/hot timings are captured from completed runs rather than exit codes alone.
 
+## 2026-07-30 — CUDA placement audit
+
+Implementation plan for the device-assignment audit:
+
+1. Make CUDA selection explicit and fail-closed: `PULSAR_GPU` remains a
+   process-local CUDA index, while automatic K3 selection prefers sufficient
+   VRAM before using measured H2D bandwidth as a tie-breaker.
+2. Add runtime device identity diagnostics (index, UUID, name, VRAM, compute
+   capability, PCI identity, and measured H2D bandwidth where probed).
+3. Record actual `DeviceBuf` ownership and validate/report the K3 primary
+   allocations immediately before the first K3 forward.
+4. Document the two explicit-device smoke commands and verify remapping with
+   `CUDA_VISIBLE_DEVICES`.
+
+Working hypothesis: the previous bandwidth-only automatic resolver can select
+the 3060 Ti, and invalid `PULSAR_GPU` values were silently converted to
+automatic selection or fell back to CUDA's default. K3 allocations inherit
+whatever device is current when each allocation is made, so the resolver must
+be initialized before model loading and the K3 forward must restore/validate
+the selected primary.
+
 ## 2026-07-30 — SSD stream lane reconciliation
 
 - The stream worker's first partial patch added an unsafe/incomplete `PipelineBatch` API and did not compile: duplicate fields, stale test signatures, and mutable-borrow errors. It was not accepted.

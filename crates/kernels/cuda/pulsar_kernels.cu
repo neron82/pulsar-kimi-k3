@@ -28,6 +28,35 @@ static int cuda_ok(cudaError_t err, const char *what) {
     return 0;
 }
 
+/* Keep the CUDA runtime ABI details in CUDA code; cudaDeviceProp contains
+ * version-dependent fields and must not be reconstructed in Rust. */
+typedef struct pulsar_cuda_device_info_data {
+    char name[256];
+    unsigned char uuid[16];
+    size_t total_mem;
+    int cc_major;
+    int cc_minor;
+    int pci_domain;
+    int pci_bus;
+    int pci_device;
+} pulsar_cuda_device_info_data;
+
+extern "C" int pulsar_cuda_device_info(int dev, pulsar_cuda_device_info_data *out) {
+    if (!out) return 1;
+    cudaDeviceProp prop;
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties")) return 1;
+    memset(out, 0, sizeof(*out));
+    strncpy(out->name, prop.name, sizeof(out->name) - 1);
+    memcpy(out->uuid, prop.uuid.bytes, sizeof(out->uuid));
+    out->total_mem = prop.totalGlobalMem;
+    out->cc_major = prop.major;
+    out->cc_minor = prop.minor;
+    out->pci_domain = prop.pciDomainID;
+    out->pci_bus = prop.pciBusID;
+    out->pci_device = prop.pciDeviceID;
+    return 0;
+}
+
 static ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;

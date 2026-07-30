@@ -1652,6 +1652,72 @@ impl Model {
         // Get K3 runtime state
         let rt = st.kimi_k3.as_mut().ok_or("K3 forward: missing KimiK3Rt")?;
 
+        // All K3 compute and primary-side state must stay on the resolved
+        // process-local device. Pinned weights are explicitly reported as
+        // host/UVA and are valid inputs, but outputs and scratch may not move.
+        kernels::set_device(self.primary_device)?;
+        if self.k3_device_log.get().is_none() {
+            let first = self.layers.first().ok_or("K3 forward: no layers")?;
+            let super::Attn::KimiK3(k3w) = &first.attn else {
+                return Err("K3 forward: first layer is not KimiK3".into());
+            };
+            let device = |b: &DeviceBuf| {
+                if b.is_pinned() {
+                    "host-pinned/UVA".to_string()
+                } else {
+                    format!("CUDA {}", b.device())
+                }
+            };
+            let check = |name: &str, b: &DeviceBuf| -> Result {
+                if !b.is_pinned() && b.device() != self.primary_device {
+                    return Err(format!(
+                        "K3 device validation failed: {name} is on CUDA {}, expected CUDA {}",
+                        b.device(), self.primary_device
+                    )
+                    .into());
+                }
+                Ok(())
+            };
+            let check_dev = |name: &str, d: i32| -> Result {
+                if d >= 0 && d != self.primary_device {
+                    return Err(format!(
+                        "K3 device validation failed: {name} is on CUDA {d}, expected CUDA {}",
+                        self.primary_device
+                    )
+                    .into());
+                }
+                Ok(())
+            };
+            check("cur", &st.cur)?;
+            check("dense weights", k3w.ffn_gate.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm))?;
+            check("router", k3w.ffn_gate_inp.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm))?;
+            check("KDA/attention", &k3w.attn_norm)?;
+            check("expert staging", &st.staging)?;
+            check_dev("expert device cache", st.dev_cache.device())?;
+            check("MoE compute", &rt.expert_mid)?;
+            check("output projection / LM head", &self.output)?;
+            check("logits", &st.logits)?;
+            eprintln!(
+                "K3 allocation/execution summary:\n  K3 primary compute device: CUDA {}\n  K3 expert-streaming device: {}\n  K3 dense weights: {}\n  K3 router: {}\n  K3 KDA: {}\n  K3 attention: {}\n  K3 expert staging buffers: {}\n  K3 expert device cache: {}\n  K3 MoE compute: {}\n  K3 output projection / LM head: {}\n  K3 logits buffers: {}",
+                self.primary_device,
+                device(&st.staging),
+                device(k3w.ffn_gate.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm)),
+                device(k3w.ffn_gate_inp.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm)),
+                device(&k3w.attn_norm),
+                device(&k3w.attn_norm),
+                device(&st.staging),
+                if st.dev_cache.device() < 0 {
+                    "host-pinned/UVA".to_string()
+                } else {
+                    format!("CUDA {}", st.dev_cache.device())
+                },
+                device(&rt.expert_mid),
+                device(&self.output),
+                device(&st.logits),
+            );
+            self.k3_device_log.set(()).ok();
+        }
+
         // Check output_res_norm and output_res_proj are loaded
         let output_res_norm = self
             .k3_output_res_norm
