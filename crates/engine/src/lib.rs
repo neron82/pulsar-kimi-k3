@@ -1193,9 +1193,10 @@ mod real {
 
     impl DeviceSlabCache {
         fn new(budget_bytes: usize, slab_bytes: usize) -> Result<DeviceSlabCache> {
-            let slots = (budget_bytes / slab_bytes.max(1)).clamp(1, 4096);
+            let slots = if budget_bytes == 0 { 0 } else { (budget_bytes / slab_bytes.max(1)).clamp(1, 4096) };
+            let pool_bytes = (slots * slab_bytes + SLAB_SLACK).max(1);
             Ok(DeviceSlabCache {
-                pool: DeviceBuf::alloc(slots * slab_bytes + SLAB_SLACK)?,
+                pool: DeviceBuf::alloc_named(pool_bytes, if slots == 0 { "K3 expert device cache placeholder" } else { "K3 expert device cache" })?,
                 slab_bytes,
                 map: std::collections::HashMap::with_capacity(slots),
                 meta: vec![(0, u64::MAX); slots],
@@ -2091,10 +2092,19 @@ mod real {
     /// otherwise normal VRAM. Activations, runtime scratch, and expert
     /// cache/staging should NOT use this — they stay on VRAM.
     fn upload_k3_host(bytes: &[u8]) -> Result<DeviceBuf> {
-        let mut buf = if k3_use_host_pinned() {
+        const K3_VRAM_RESERVE: usize = 1536 << 20;
+        let force_host = k3_use_host_pinned();
+        let use_host = force_host || kernels::selected_device().ok()
+            .and_then(|dev| kernels::mem_info(dev).ok())
+            .map(|(free, _)| free < bytes.len().saturating_add(K3_VRAM_RESERVE))
+            .unwrap_or(false);
+        if use_host && !force_host {
+            eprintln!("pulsar: K3 VRAM resident budget reached; keeping {:.2} MiB weight host-mapped to preserve {:.0} MiB CUDA headroom", bytes.len() as f64 / (1 << 20) as f64, K3_VRAM_RESERVE as f64 / (1 << 20) as f64);
+        }
+        let mut buf = if use_host {
             DeviceBuf::alloc_pinned(bytes.len())?
         } else {
-            DeviceBuf::alloc(bytes.len())?
+            DeviceBuf::alloc_named(bytes.len(), "K3 resident weight")?
         };
         buf.write(0, bytes)?;
         Ok(buf)
@@ -2500,18 +2510,13 @@ mod real {
                 let mut buf = if matches!(shape.family, Family::Mla | Family::Dsv4) {
                     DeviceBuf::alloc_pinned(bytes.len())?
                 } else if shape.family == Family::KimiK3 {
-                    // K3 token embedding: respect PULSAR_K3_HOST=1
-                    let mut b = if k3_use_host_pinned() {
-                        DeviceBuf::alloc_pinned(bytes.len())?
-                    } else {
-                        DeviceBuf::alloc(bytes.len())?
-                    };
-                    b.write(0, &bytes)?;
-                    b
+                    upload_k3_host(&bytes)?
                 } else {
                     DeviceBuf::alloc(bytes.len())?
                 };
-                buf.write(0, &bytes)?;
+                if shape.family != Family::KimiK3 {
+                    buf.write(0, &bytes)?;
+                }
                 buf
             };
             let output_norm = if shape.family == Family::KimiK3 {
@@ -4140,7 +4145,8 @@ mod real {
             let mb = std::env::var("PULSAR_BATCH")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(256)
+                // K3's wide expert scratch is reserved for explicit batching.
+                .unwrap_or(if s.family == Family::KimiK3 { 1 } else { 256 })
                 .max(1);
 
             // everything the attn segment touches lives on the attn GPU
@@ -4315,9 +4321,9 @@ mod real {
                 // placeholders: the capacity solver below sizes both from
                 // MEASURED free VRAM once every fixed buffer has landed
                 // (unified boxes keep the 1-byte cache: zero-copy resolve)
-                dev_cache: DeviceSlabCache::new(1, max_slab)?,
+                dev_cache: DeviceSlabCache::new(0, max_slab)?,
                 warm_seeds: std::collections::HashMap::new(),
-                staging: DeviceBuf::alloc(1)?,
+                staging: DeviceBuf::alloc_named(1, "K3 expert staging placeholder")?,
                 expert_ptrs: DeviceBuf::alloc(
                     mb as usize * n_used * std::mem::size_of::<ExpertPtrs>(),
                 )?,
@@ -4508,14 +4514,29 @@ mod real {
                     };
                     // decode floor: one layer's slot resolve always fits
                     let staging_bytes = stage_worst(chunk).max(n_used * 3 * max_slab);
-                    let dev_bytes = match dev_env {
-                        Some(b) => b.max(1),
-                        None => pool
-                            .saturating_sub(staging_bytes)
-                            .clamp(256 << 20, pool.max(256 << 20)),
+                    let gpu_moe = std::env::var_os("PULSAR_K3_GPU_MOE").is_some();
+                    let (dev_bytes, staging_bytes) = if !gpu_moe {
+                        (0, 1)
+                    } else {
+                        let requested = dev_env.unwrap_or_else(|| {
+                            pool.saturating_sub(staging_bytes).saturating_sub(reserve)
+                        });
+                        if requested.saturating_add(staging_bytes).saturating_add(reserve) > free {
+                            return Err(format!(
+                                "K3 expert device cache request {:.2} GiB is unsafe: {:.2} GiB free, {:.2} GiB staging, {:.2} MiB safety margin",
+                                requested as f64 / (1 << 30) as f64,
+                                free as f64 / (1 << 30) as f64,
+                                staging_bytes as f64 / (1 << 30) as f64,
+                                reserve as f64 / (1 << 20) as f64,
+                            ).into());
+                        }
+                        (requested.max(1), staging_bytes)
                     };
                     st.dev_cache = DeviceSlabCache::new(dev_bytes, max_slab)?;
-                    st.staging = DeviceBuf::alloc(staging_bytes + SLAB_SLACK)?;
+                    st.staging = DeviceBuf::alloc_named(
+                        staging_bytes + SLAB_SLACK,
+                        "K3 expert staging arena",
+                    )?;
                     st.max_batch = (chunk as u32).clamp(1, st.max_batch);
                     eprintln!(
                         "pulsar: auto budget: {:.1}GB VRAM free -> expert cache {:.1}GB, staging {:.1}GB, prefill chunk {}",

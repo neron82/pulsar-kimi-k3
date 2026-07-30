@@ -4,6 +4,7 @@
 #[cfg(target_os = "linux")]
 mod real {
     use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
 
     pub type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -755,6 +756,104 @@ mod real {
         }
     }
 
+    struct AllocTrace {
+        next: u64,
+        live: usize,
+        peak: usize,
+        by_device: std::collections::HashMap<i32, (usize, usize)>,
+    }
+
+    fn alloc_trace() -> &'static Mutex<AllocTrace> {
+        static TRACE: OnceLock<Mutex<AllocTrace>> = OnceLock::new();
+        TRACE.get_or_init(|| {
+            Mutex::new(AllocTrace {
+                next: 0,
+                live: 0,
+                peak: 0,
+                by_device: std::collections::HashMap::new(),
+            })
+        })
+    }
+
+    fn trace_enabled() -> bool {
+        std::env::var_os("PULSAR_CUDA_ALLOC_TRACE").is_some()
+    }
+
+    fn mem_info_current() -> (usize, usize) {
+        let (mut free, mut total) = (0, 0);
+        unsafe { cudaMemGetInfo(&mut free, &mut total) };
+        (free, total)
+    }
+
+    fn device_identity(dev: i32) -> (String, String) {
+        let mut raw = PulsarCudaDeviceInfo {
+            name: [0; 256],
+            uuid: [0; 16],
+            total_mem: 0,
+            cc_major: 0,
+            cc_minor: 0,
+            pci_domain: 0,
+            pci_bus: 0,
+            pci_device: 0,
+        };
+        if unsafe { pulsar_cuda_device_info(dev, &mut raw) } == 0 {
+            (cstr(&raw.name), uuid_string(&raw.uuid))
+        } else {
+            ("unknown".to_string(), "unknown".to_string())
+        }
+    }
+
+    fn allocation_event(label: &str, bytes: usize, dev: i32, result: i32, free_before: usize) {
+        let mut t = alloc_trace().lock().unwrap();
+        t.next += 1;
+        if result == 0 {
+            t.live = t.live.saturating_add(bytes);
+            t.peak = t.peak.max(t.live);
+            let entry = t.by_device.entry(dev).or_default();
+            entry.0 = entry.0.saturating_add(bytes);
+            entry.1 = entry.1.max(entry.0);
+        }
+        if trace_enabled() || result != 0 {
+            let (free_after, total) = mem_info_current();
+            let (name, uuid) = device_identity(dev);
+            let (device_live, device_peak) = t.by_device.get(&dev).copied().unwrap_or_default();
+            eprintln!(
+                "CUDA allocation #{}\n  label: {}\n  device: CUDA {} / {} / {}\n  requested: {:.2} MiB\n  free before: {:.2} MiB\n  free after: {:.2} MiB\n  total: {:.2} MiB\n  result: {}\n  tracked live/peak: {:.2}/{:.2} MiB\n  device live/peak: {:.2}/{:.2} MiB",
+                t.next, label, dev, name, uuid, bytes as f64 / (1 << 20) as f64,
+                free_before as f64 / (1 << 20) as f64,
+                free_after as f64 / (1 << 20) as f64,
+                total as f64 / (1 << 20) as f64, result,
+                t.live as f64 / (1 << 20) as f64,
+                t.peak as f64 / (1 << 20) as f64,
+                device_live as f64 / (1 << 20) as f64,
+                device_peak as f64 / (1 << 20) as f64,
+            );
+        }
+    }
+
+    fn deallocation_event(label: &str, bytes: usize, dev: i32) {
+        let mut t = alloc_trace().lock().unwrap();
+        t.live = t.live.saturating_sub(bytes);
+        if let Some(entry) = t.by_device.get_mut(&dev) {
+            entry.0 = entry.0.saturating_sub(bytes);
+        }
+        if trace_enabled() {
+            let (free, total) = mem_info_current();
+            let (name, uuid) = device_identity(dev);
+            let (device_live, device_peak) = t.by_device.get(&dev).copied().unwrap_or_default();
+            eprintln!(
+                "CUDA deallocation\n  label: {}\n  device: CUDA {} / {} / {}\n  released: {:.2} MiB\n  free: {:.2} MiB\n  total: {:.2} MiB\n  tracked live/peak: {:.2}/{:.2} MiB\n  device live/peak: {:.2}/{:.2} MiB",
+                label, dev, name, uuid, bytes as f64 / (1 << 20) as f64,
+                free as f64 / (1 << 20) as f64,
+                total as f64 / (1 << 20) as f64,
+                t.live as f64 / (1 << 20) as f64,
+                t.peak as f64 / (1 << 20) as f64,
+                device_live as f64 / (1 << 20) as f64,
+                device_peak as f64 / (1 << 20) as f64,
+            );
+        }
+    }
+
     /// An owned device-visible allocation: VRAM (cudaMalloc) or mapped
     /// pinned host memory (weights too big for VRAM, read zero-copy over
     /// PCIe - ds4's trick for GLM-class backbones). Byte-oriented; callers
@@ -765,6 +864,7 @@ mod real {
         bytes: usize,
         /// CUDA device the VRAM lives on (-1 for pinned host memory).
         dev: i32,
+        label: String,
     }
 
     unsafe impl Send for DeviceBuf {}
@@ -918,7 +1018,11 @@ mod real {
                     .max_by(|a, b| {
                         a.total_mem
                             .cmp(&b.total_mem)
-                            .then_with(|| a.h2d_gbps.unwrap_or(0.0).total_cmp(&b.h2d_gbps.unwrap_or(0.0)))
+                            .then_with(|| {
+                                a.h2d_gbps
+                                    .unwrap_or(0.0)
+                                    .total_cmp(&b.h2d_gbps.unwrap_or(0.0))
+                            })
                             .then_with(|| (a.cc_major, a.cc_minor).cmp(&(b.cc_major, b.cc_minor)))
                             .then_with(|| b.index.cmp(&a.index))
                     })
@@ -1034,13 +1138,22 @@ mod real {
 
     impl DeviceBuf {
         pub fn alloc(bytes: usize) -> Result<Self> {
+            Self::alloc_named(bytes, "unlabeled device allocation")
+        }
+
+        pub fn alloc_named(bytes: usize, label: &str) -> Result<Self> {
             ensure_device()?;
+            let dev = get_device();
+            let (free_before, _) = mem_info_current();
             let mut ptr = std::ptr::null_mut();
-            if let Err(e) = check_rt(unsafe { cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc") {
+            let ret = unsafe { cudaMalloc(&mut ptr, bytes.max(1)) };
+            allocation_event(label, bytes, dev, ret, free_before);
+            if let Err(e) = check_rt(ret, "cudaMalloc") {
                 eprintln!(
-                    "pulsar: cudaMalloc({:.2} GB) failed on device {}",
+                    "pulsar: cudaMalloc({:.2} GB) failed on device {} for {}",
                     bytes as f64 / 1e9,
-                    get_device()
+                    dev,
+                    label,
                 );
                 return Err(e);
             }
@@ -1048,7 +1161,8 @@ mod real {
                 ptr,
                 host: std::ptr::null_mut(),
                 bytes,
-                dev: get_device(),
+                dev,
+                label: label.to_string(),
             })
         }
 
@@ -1072,6 +1186,7 @@ mod real {
                 host,
                 bytes,
                 dev: -1,
+                label: "mapped pinned host allocation".to_string(),
             })
         }
 
@@ -1185,6 +1300,7 @@ mod real {
                     unsafe { cudaSetDevice(self.dev) };
                 }
                 unsafe { cudaFree(self.ptr) };
+                deallocation_event(&self.label, self.bytes, self.dev);
                 if self.dev >= 0 && self.dev != cur {
                     unsafe { cudaSetDevice(cur) };
                 }
@@ -1265,8 +1381,14 @@ mod real {
             ensure_device()?;
             let mut start = std::ptr::null_mut();
             let mut end = std::ptr::null_mut();
-            check_rt(unsafe { cudaEventCreateWithFlags(&mut start, 0) }, "profile event create")?;
-            if let Err(e) = check_rt(unsafe { cudaEventCreateWithFlags(&mut end, 0) }, "profile event create") {
+            check_rt(
+                unsafe { cudaEventCreateWithFlags(&mut start, 0) },
+                "profile event create",
+            )?;
+            if let Err(e) = check_rt(
+                unsafe { cudaEventCreateWithFlags(&mut end, 0) },
+                "profile event create",
+            ) {
                 unsafe { cudaEventDestroy(start) };
                 return Err(e);
             }
@@ -1274,14 +1396,26 @@ mod real {
         }
 
         pub fn start(&self) -> Result {
-            check_rt(unsafe { cudaEventRecord(self.start, std::ptr::null_mut()) }, "profile event start")
+            check_rt(
+                unsafe { cudaEventRecord(self.start, std::ptr::null_mut()) },
+                "profile event start",
+            )
         }
 
         pub fn stop_ms(&self) -> Result<f32> {
-            check_rt(unsafe { cudaEventRecord(self.end, std::ptr::null_mut()) }, "profile event stop")?;
-            check_rt(unsafe { cudaEventSynchronize(self.end) }, "profile event wait")?;
+            check_rt(
+                unsafe { cudaEventRecord(self.end, std::ptr::null_mut()) },
+                "profile event stop",
+            )?;
+            check_rt(
+                unsafe { cudaEventSynchronize(self.end) },
+                "profile event wait",
+            )?;
             let mut ms = 0.0;
-            check_rt(unsafe { cudaEventElapsedTime(&mut ms, self.start, self.end) }, "profile event elapsed")?;
+            check_rt(
+                unsafe { cudaEventElapsedTime(&mut ms, self.start, self.end) },
+                "profile event elapsed",
+            )?;
             Ok(ms)
         }
     }

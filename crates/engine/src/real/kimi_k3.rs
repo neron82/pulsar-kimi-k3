@@ -383,30 +383,30 @@ impl KimiK3Rt {
             match kind {
                 K3LayerKind::Kda => {
                     // Three conv streams (Q, K, V) + one SSM state
-                    let q = DeviceBuf::alloc(conv_state_bytes)?;
-                    let k = DeviceBuf::alloc(conv_state_bytes)?;
-                    let v = DeviceBuf::alloc(conv_state_bytes)?;
+                    let q = DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
+                    let k = DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
+                    let v = DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
                     conv_states.push([q, k, v]);
                     let ssm_bytes = kda_hd * kda_hd * n_head * 4; // f32 [head_dim][head_dim][n_head]
-                    ssm_states.push(DeviceBuf::alloc(ssm_bytes)?);
+                    ssm_states.push(DeviceBuf::alloc_named(ssm_bytes, "K3 KDA recurrent SSM state")?);
                 }
                 K3LayerKind::Mla => {
                     // Dummy entries (MLA has no recurrent state)
                     conv_states.push([
-                        DeviceBuf::alloc(4)?,
-                        DeviceBuf::alloc(4)?,
-                        DeviceBuf::alloc(4)?,
+                        DeviceBuf::alloc_named(4, "K3 MLA state placeholder")?,
+                        DeviceBuf::alloc_named(4, "K3 MLA state placeholder")?,
+                        DeviceBuf::alloc_named(4, "K3 MLA state placeholder")?,
                     ]);
-                    ssm_states.push(DeviceBuf::alloc(4)?);
+                    ssm_states.push(DeviceBuf::alloc_named(4, "K3 MLA state placeholder")?);
                 }
             }
         }
 
         let res_block = s.attn_res_block_size.max(1) as usize;
         let res_bank_cap = (n_layer + res_block - 1) / res_block;
-        let res_bank = DeviceBuf::alloc(res_bank_cap * n_embd * 4)?;
+        let res_bank = DeviceBuf::alloc_named(res_bank_cap * n_embd * 4, "K3 AttnRes snapshot bank")?;
 
-        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        let f32s = |n: usize| DeviceBuf::alloc_named(n * 4, "K3 runtime scratch");
         let mb = 1; // decode-only for now
                     // K3 MLA intermediates are wider than the hidden state: Q has
                     // n_head * (qk_nope + qk_rope) elements and the gated attention
