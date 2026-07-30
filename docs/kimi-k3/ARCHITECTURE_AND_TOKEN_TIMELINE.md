@@ -25,6 +25,8 @@ Live geprüft mit `nvidia-smi -L`:
 
 Die aktuellen K3-Testkommandos setzen `PULSAR_GPU=1` und loggen `using CUDA device 1`; dieser Pfad läuft damit auf der RTX 3090. Andere laufende Services, insbesondere `llama-server` und ComfyUI, können gleichzeitig Speicher auf beiden Geräten belegen. GPU-Auslastung muss deshalb immer während des K3-Prozesses und nicht nach dessen Ende gemessen werden.
 
+Wichtig: Der generische `ExpertTier`-Builder kann bei vorhandener Warm-Census-Datei zusätzlich einen Tier auf CUDA-Gerät 0 anlegen. Der aktuelle K3-spezifische Resolver nutzt diese generische Tier-Liste jedoch noch nicht; K3 verwendet wirksam den Primary-DeviceSlabCache auf Gerät 1 und das Primary-Staging. Ein Log wie `expert tier on CUDA device 0: 0 triples` ist daher keine K3-Expert-Residency und darf nicht als Nutzung der RTX 3060 Ti gewertet werden. Remote-GPU-Expert-Ausführung bzw. ein sicherer Peer-Copy-Pfad ist noch offen.
+
 Honcho läuft geschützt auf `127.0.0.1:8001` und muss während der Tests verfügbar bleiben.
 
 ## Datenpfad: SSD → RAM → VRAM → Kernel
