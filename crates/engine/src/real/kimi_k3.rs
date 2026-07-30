@@ -393,12 +393,18 @@ impl KimiK3Rt {
             match kind {
                 K3LayerKind::Kda => {
                     // Three conv streams (Q, K, V) + one SSM state
-                    let q = DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
-                    let k = DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
-                    let v = DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
+                    let q =
+                        DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
+                    let k =
+                        DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
+                    let v =
+                        DeviceBuf::alloc_named(conv_state_bytes, "K3 KDA recurrent conv state")?;
                     conv_states.push([q, k, v]);
                     let ssm_bytes = kda_hd * kda_hd * n_head * 4; // f32 [head_dim][head_dim][n_head]
-                    ssm_states.push(DeviceBuf::alloc_named(ssm_bytes, "K3 KDA recurrent SSM state")?);
+                    ssm_states.push(DeviceBuf::alloc_named(
+                        ssm_bytes,
+                        "K3 KDA recurrent SSM state",
+                    )?);
                 }
                 K3LayerKind::Mla => {
                     // Dummy entries (MLA has no recurrent state)
@@ -414,7 +420,8 @@ impl KimiK3Rt {
 
         let res_block = s.attn_res_block_size.max(1) as usize;
         let res_bank_cap = (n_layer + res_block - 1) / res_block;
-        let res_bank = DeviceBuf::alloc_named(res_bank_cap * n_embd * 4, "K3 AttnRes snapshot bank")?;
+        let res_bank =
+            DeviceBuf::alloc_named(res_bank_cap * n_embd * 4, "K3 AttnRes snapshot bank")?;
 
         let f32s = |n: usize| DeviceBuf::alloc_named(n * 4, "K3 runtime scratch");
         let mb = 1; // decode-only for now
@@ -522,17 +529,17 @@ impl Model {
     pub(super) fn k3_mla_step(
         &self,
         rt: &mut KimiK3Rt,
-        x: &DeviceBuf,                 // [n_embd] f32
-        mla_wq_a: &K3DenseWeight,      // [n_embd, q_lora_rank] K3DenseWeight
-        mla_wq_b: &K3DenseWeight,      // [q_lora_rank, n_head * qk_dim] K3DenseWeight
-        mla_q_a_norm: &DeviceBuf,      // [q_lora_rank] f32
-        mla_wkv_a_mqa: &K3DenseWeight, // [n_embd, kv_lora_rank + qk_rope] K3DenseWeight
-        mla_kv_a_norm: &DeviceBuf,     // [kv_lora_rank] f32
-        mla_wk_b: Option<&DeviceBuf>,  // [qk_nope, kv_lora_rank, n_head] f32 (split path)
-        mla_wv_b: Option<&DeviceBuf>,  // [kv_lora_rank, v_mla, n_head] f32 (split path)
+        x: &DeviceBuf,                     // [n_embd] f32
+        mla_wq_a: &K3DenseWeight,          // [n_embd, q_lora_rank] K3DenseWeight
+        mla_wq_b: &K3DenseWeight,          // [q_lora_rank, n_head * qk_dim] K3DenseWeight
+        mla_q_a_norm: &DeviceBuf,          // [q_lora_rank] f32
+        mla_wkv_a_mqa: &K3DenseWeight,     // [n_embd, kv_lora_rank + qk_rope] K3DenseWeight
+        mla_kv_a_norm: &DeviceBuf,         // [kv_lora_rank] f32
+        mla_wk_b: Option<&DeviceBuf>,      // [qk_nope, kv_lora_rank, n_head] f32 (split path)
+        mla_wv_b: Option<&DeviceBuf>,      // [kv_lora_rank, v_mla, n_head] f32 (split path)
         mla_wkv_b: Option<&K3DenseWeight>, // [kv_lora_rank, n_head * (qk_nope + v_mla)] K3DenseWeight (fused path)
-        mla_wqkv_gate: &K3DenseWeight, // [n_embd, n_head * v_mla] K3DenseWeight
-        mla_wo: &K3DenseWeight,        // [n_head * v_mla, n_embd] K3DenseWeight
+        mla_wqkv_gate: &K3DenseWeight,     // [n_embd, n_head * v_mla] K3DenseWeight
+        mla_wo: &K3DenseWeight,            // [n_head * v_mla, n_embd] K3DenseWeight
         dims: &K3MlaDims,
         eps: f32,
     ) -> Result {
@@ -562,16 +569,19 @@ impl Model {
 
         // 1. Q low-rank projection: q_lora = rms_norm(x @ wq_a, q_a_norm)
         // wq_a is K3DenseWeight
-        mla_wq_a.matmul(q_lora, x, &mut rt.q8k_scratch, n_embd, q_lora_rank, 1)
+        mla_wq_a
+            .matmul(q_lora, x, &mut rt.q8k_scratch, n_embd, q_lora_rank, 1)
             .map_err(|e| format!("K3 MLA q_a: {e}"))?;
         kernels::rms_norm_inplace(q_lora, mla_q_a_norm, q_lora_rank, 1, eps)?;
 
         // q_full = q_lora @ wq_b  (wq_b is K3DenseWeight)
-        mla_wq_b.matmul(q_full, q_lora, &mut rt.q8k_scratch, q_lora_rank, q_b_out, 1)
+        mla_wq_b
+            .matmul(q_full, q_lora, &mut rt.q8k_scratch, q_lora_rank, q_b_out, 1)
             .map_err(|e| format!("K3 MLA q_b: {e}"))?;
 
         // 2. KV compression: kv_pe = x @ wkv_a_mqa  (wkv_a_mqa is K3DenseWeight)
-        mla_wkv_a_mqa.matmul(kv_pe, x, &mut rt.q8k_scratch, n_embd, kv_a_out, 1)
+        mla_wkv_a_mqa
+            .matmul(kv_pe, x, &mut rt.q8k_scratch, n_embd, kv_a_out, 1)
             .map_err(|e| format!("K3 MLA kv_a: {e}"))?;
 
         // 3. Split kv_cmpr and k_pe
@@ -612,7 +622,15 @@ impl Model {
                 // wkv_b is K3DenseWeight
                 let kv_fused = &mut rt.mix_scores; // reuse mix_scores scratch
                 let kv_fused_dim = n_head * (qk_nope + v_mla);
-                wkv_b.matmul(kv_fused, kv_cmpr, &mut rt.q8k_scratch, kv_lora_rank, kv_fused_dim, 1)
+                wkv_b
+                    .matmul(
+                        kv_fused,
+                        kv_cmpr,
+                        &mut rt.q8k_scratch,
+                        kv_lora_rank,
+                        kv_fused_dim,
+                        1,
+                    )
                     .map_err(|e| format!("K3 MLA wkv_b: {e}"))?;
                 kernels::k3_mla_absorbed_attn_fused(
                     attn, q_full, kv_fused, k_pe, n_head, qk_nope, qk_rope, v_mla, scale,
@@ -629,20 +647,19 @@ impl Model {
         }
 
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-            let sync_result: super::Result = kernels::sync().map_err(|e| {
-                format!("K3 MLA absorbed-attention sync: {e}").into()
-            });
+            let sync_result: super::Result =
+                kernels::sync().map_err(|e| format!("K3 MLA absorbed-attention sync: {e}").into());
             sync_result?;
         }
 
         // 6. Output gate: gate = sigmoid(x @ wqkv_gate)  (wqkv_gate is K3DenseWeight)
-        mla_wqkv_gate.matmul(gate, x, &mut rt.q8k_scratch, n_embd, gate_out, 1)
+        mla_wqkv_gate
+            .matmul(gate, x, &mut rt.q8k_scratch, n_embd, gate_out, 1)
             .map_err(|e| format!("K3 MLA gate: {e}"))?;
         kernels::k3_sigmoid_inplace(gate, gate_out)?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-            let sync_result: super::Result = kernels::sync().map_err(|e| {
-                format!("K3 MLA gate sigmoid sync: {e}").into()
-            });
+            let sync_result: super::Result =
+                kernels::sync().map_err(|e| format!("K3 MLA gate sigmoid sync: {e}").into());
             sync_result?;
         }
 
@@ -650,14 +667,14 @@ impl Model {
         kernels::copy_d2d(gated, 0, attn, 0, (o_proj_in as usize) * 4)?;
         kernels::k3_mul_inplace(gated, gate, o_proj_in)?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-            let sync_result: super::Result = kernels::sync().map_err(|e| {
-                format!("K3 MLA gate multiply sync: {e}").into()
-            });
+            let sync_result: super::Result =
+                kernels::sync().map_err(|e| format!("K3 MLA gate multiply sync: {e}").into());
             sync_result?;
         }
         // 8. o_proj: out = gated @ wo  (K3DenseWeight dispatch)
         let out = &mut rt.attn_out; // reuse attn_out for final output
-        mla_wo.matmul(out, gated, &mut rt.q8k_scratch, o_proj_in, n_embd, 1)
+        mla_wo
+            .matmul(out, gated, &mut rt.q8k_scratch, o_proj_in, n_embd, 1)
             .map_err(|e| format!("K3 MLA output: {e}"))?;
 
         Ok(())
@@ -972,13 +989,7 @@ impl Model {
         rt.kda_g_raw.write(0, kernels::as_bytes(&g_raw_host))?;
 
         // 5. Beta: sigmoid(x @ W_beta)  [n_embd -> n_head]
-        ssm_beta.matmul_q8k(
-            &mut rt.kda_gate_logits,
-            &rt.q8k_scratch,
-            n_embd,
-            n_head,
-            1,
-        )?;
+        ssm_beta.matmul_q8k(&mut rt.kda_gate_logits, &rt.q8k_scratch, n_embd, n_head, 1)?;
         let mut beta_host = rt.kda_gate_logits.read_f32(n_head as usize)?;
         for v in beta_host.iter_mut() {
             *v = 1.0 / (1.0 + (-*v).exp());
@@ -1000,25 +1011,17 @@ impl Model {
             kda_hd,
         )?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-            let sync_result: super::Result = kernels::sync().map_err(|e| {
-                format!("K3 layer {il} KDA delta-step sync: {e}").into()
-            });
+            let sync_result: super::Result = kernels::sync()
+                .map_err(|e| format!("K3 layer {il} KDA delta-step sync: {e}").into());
             sync_result?;
         }
 
         // 7. Output gate: g2 = sigmoid(x @ W_gate)
-        wqkv_gate.matmul_q8k(
-            &mut rt.kda_gate_logits,
-            &rt.q8k_scratch,
-            n_embd,
-            d_inner,
-            1,
-        )?;
+        wqkv_gate.matmul_q8k(&mut rt.kda_gate_logits, &rt.q8k_scratch, n_embd, d_inner, 1)?;
         kernels::k3_sigmoid_inplace(&mut rt.kda_gate_logits, d_inner)?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-            let sync_result: super::Result = kernels::sync().map_err(|e| {
-                format!("K3 layer {il} KDA gate sigmoid sync: {e}").into()
-            });
+            let sync_result: super::Result = kernels::sync()
+                .map_err(|e| format!("K3 layer {il} KDA gate sigmoid sync: {e}").into());
             sync_result?;
         }
 
@@ -1051,9 +1054,8 @@ impl Model {
             )?;
         }
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-            let sync_result: super::Result = kernels::sync().map_err(|e| {
-                format!("K3 layer {il} KDA output norm sync: {e}").into()
-            });
+            let sync_result: super::Result = kernels::sync()
+                .map_err(|e| format!("K3 layer {il} KDA output norm sync: {e}").into());
             sync_result?;
         }
 
@@ -1067,14 +1069,20 @@ impl Model {
         )?;
         kernels::k3_mul_inplace(&mut rt.kda_gated, &rt.kda_gate_logits, d_inner)?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-            let sync_result: super::Result = kernels::sync().map_err(|e| {
-                format!("K3 layer {il} KDA gate multiply sync: {e}").into()
-            });
+            let sync_result: super::Result = kernels::sync()
+                .map_err(|e| format!("K3 layer {il} KDA gate multiply sync: {e}").into());
             sync_result?;
         }
 
         // 10. o_proj: out = gated @ W_o  (K3DenseWeight dispatch)
-        wo.matmul(&mut rt.attn_out, &rt.kda_gated, &mut rt.q8k_scratch, d_inner, n_embd, 1)?;
+        wo.matmul(
+            &mut rt.attn_out,
+            &rt.kda_gated,
+            &mut rt.q8k_scratch,
+            d_inner,
+            n_embd,
+            1,
+        )?;
 
         Ok(())
     }
@@ -1103,13 +1111,7 @@ impl Model {
         // Gate and up consume the same activation: quantize once and reuse.
         kernels::quantize_q8_k(&mut rt.q8k_scratch, x, n_embd, 1)?;
         // gate = x @ W_gate  (K3DenseWeight dispatch)
-        ffn_gate.matmul_q8k(
-            &mut rt.dense_gate,
-            &rt.q8k_scratch,
-            n_embd,
-            n_ff_dense,
-            1,
-        )?;
+        ffn_gate.matmul_q8k(&mut rt.dense_gate, &rt.q8k_scratch, n_embd, n_ff_dense, 1)?;
         // up = x @ W_up  (K3DenseWeight dispatch)
         ffn_up.matmul_q8k(&mut rt.dense_up, &rt.q8k_scratch, n_embd, n_ff_dense, 1)?;
         // mid = SiTU_Gate(gate) * SiTU_Linear(up)
@@ -1210,11 +1212,25 @@ impl Model {
         // Keep the first correctness path on host, but do not reinterpret all
         // slabs as Q8_0.
         // 1. Latent projection: latent = x @ W_latent_down  [n_embd -> moe_latent]
-        ffn_latent_down.matmul(&mut rt.latent, x, &mut rt.q8k_scratch, n_embd, moe_latent, 1)?;
+        ffn_latent_down.matmul(
+            &mut rt.latent,
+            x,
+            &mut rt.q8k_scratch,
+            n_embd,
+            moe_latent,
+            1,
+        )?;
 
         // 2. Router: logits = x @ W_gate_inp  [n_embd -> n_expert]
         let router_t0 = std::time::Instant::now();
-        ffn_gate_inp.matmul(&mut rt.router_logits, x, &mut rt.q8k_scratch, n_embd, n_expert, 1)?;
+        ffn_gate_inp.matmul(
+            &mut rt.router_logits,
+            x,
+            &mut rt.q8k_scratch,
+            n_embd,
+            n_expert,
+            1,
+        )?;
 
         // 3. Router select: sigmoid scores, top-k, renormalize
         // Use the K3-specific router which supports up to 896 experts
@@ -1269,7 +1285,9 @@ impl Model {
 
         // Build the list of distinct expert offsets and resolve through
         // the cache/tier system.  This is shared by both GPU and host paths.
-        let mut distinct: Vec<i32> = selected.iter().copied()
+        let mut distinct: Vec<i32> = selected
+            .iter()
+            .copied()
             .filter(|&e| e >= 0 && (e as u32) < n_expert)
             .collect();
         distinct.sort_unstable();
@@ -1280,7 +1298,10 @@ impl Model {
             let ei = e as u64;
             for (t, le) in [(ffn_gate_exps, ei), (ffn_up_exps, ei), (ffn_down_exps, ei)] {
                 let off = t.abs_offset + le * t.expert_bytes;
-                wants.push(StreamRead { offset: off, len: t.expert_bytes });
+                wants.push(StreamRead {
+                    offset: off,
+                    len: t.expert_bytes,
+                });
             }
         }
         wants.dedup_by_key(|r| r.offset);
@@ -1288,16 +1309,26 @@ impl Model {
         // Resolve: cache hits return immediately, misses go through io_uring.
         // For the host path, we collect resolved bytes into a HashMap.
         // For the GPU path, we upload to staging and track device pointers.
-        let mut resolved_host: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
-        let mut resolved_gpu: std::collections::HashMap<u64, *const std::ffi::c_void> = std::collections::HashMap::new();
+        let mut resolved_host: std::collections::HashMap<u64, Vec<u8>> =
+            std::collections::HashMap::new();
+        let mut resolved_gpu: std::collections::HashMap<u64, *const std::ffi::c_void> =
+            std::collections::HashMap::new();
 
-        let store_before = (store.hits, store.misses, store.io_bytes, store.io_reads, store.io_max_read, store.io_wait);
+        let store_before = (
+            store.hits,
+            store.misses,
+            store.io_bytes,
+            store.io_reads,
+            store.io_max_read,
+            store.io_wait,
+        );
         let dev_before = (dev_cache.hits, dev_cache.misses);
         let resolve_t0 = std::time::Instant::now();
         let mut resolved_h2d_bytes = 0u64;
         let mut resolved_h2d_time = std::time::Duration::ZERO;
         if use_gpu {
-            let mut stage_base: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+            let mut stage_base: std::collections::HashMap<u64, usize> =
+                std::collections::HashMap::new();
             let mut stage_len = 0usize;
             for r in &wants {
                 stage_base.insert(r.offset, stage_len);
@@ -1308,7 +1339,8 @@ impl Model {
                     "K3 GPU MoE staging too small: need {} bytes, have {}",
                     stage_len,
                     staging.bytes()
-                ).into());
+                )
+                .into());
             }
             store.ensure_with(&wants, |off, payload| {
                 let base = stage_base[&off];
@@ -1332,34 +1364,66 @@ impl Model {
             p.cache += resolve_t0.elapsed().saturating_sub(p.storage);
             p.h2d_bytes = p.h2d_bytes.saturating_add(resolved_h2d_bytes);
             p.h2d += resolved_h2d_time;
-            p.storage_bytes = p.storage_bytes.saturating_add(store.io_bytes.saturating_sub(store_before.2));
-            p.storage_reads = p.storage_reads.saturating_add(store.io_reads.saturating_sub(store_before.3));
-            p.storage_max_read = p.storage_max_read.max(store.io_max_read.saturating_sub(store_before.4));
-            p.host_cache_hits = p.host_cache_hits.saturating_add(store.hits.saturating_sub(store_before.0));
-            p.host_cache_misses = p.host_cache_misses.saturating_add(store.misses.saturating_sub(store_before.1));
-            p.device_cache_hits = p.device_cache_hits.saturating_add(dev_cache.hits.saturating_sub(dev_before.0));
-            p.device_cache_misses = p.device_cache_misses.saturating_add(dev_cache.misses.saturating_sub(dev_before.1));
+            p.storage_bytes = p
+                .storage_bytes
+                .saturating_add(store.io_bytes.saturating_sub(store_before.2));
+            p.storage_reads = p
+                .storage_reads
+                .saturating_add(store.io_reads.saturating_sub(store_before.3));
+            p.storage_max_read = p
+                .storage_max_read
+                .max(store.io_max_read.saturating_sub(store_before.4));
+            p.host_cache_hits = p
+                .host_cache_hits
+                .saturating_add(store.hits.saturating_sub(store_before.0));
+            p.host_cache_misses = p
+                .host_cache_misses
+                .saturating_add(store.misses.saturating_sub(store_before.1));
+            p.device_cache_hits = p
+                .device_cache_hits
+                .saturating_add(dev_cache.hits.saturating_sub(dev_before.0));
+            p.device_cache_misses = p
+                .device_cache_misses
+                .saturating_add(dev_cache.misses.saturating_sub(dev_before.1));
             p.expert_requests = p.expert_requests.saturating_add(selected.len() as u64);
             p.unique_experts = p.unique_experts.saturating_add(distinct.len() as u64);
-            p.repeated_experts = p.repeated_experts.saturating_add(selected.len().saturating_sub(distinct.len()) as u64);
+            p.repeated_experts = p
+                .repeated_experts
+                .saturating_add(selected.len().saturating_sub(distinct.len()) as u64);
         }
 
         if use_gpu {
             // ── GPU dispatch path (Q2_K/Q3_K only) ──────────────────────────
             self.k3_gpu_moe_compute(
-                rt, &selected, &weights, &resolved_gpu,
+                rt,
+                &selected,
+                &weights,
+                &resolved_gpu,
                 staging,
-                ffn_gate_exps, ffn_up_exps, ffn_down_exps,
-                n_expert, n_expert_used, moe_latent, n_ff_exp,
+                ffn_gate_exps,
+                ffn_up_exps,
+                ffn_down_exps,
+                n_expert,
+                n_expert_used,
+                moe_latent,
+                n_ff_exp,
             )?;
         } else {
             // ── Host fallback path (all quant types) ────────────────────────
             // Resolve slabs through the cache/tier system, then dequant and
             // compute on host.  This is the correctness reference.
             self.k3_host_moe_compute(
-                rt, &selected, &weights, &resolved_host,
-                ffn_gate_exps, ffn_up_exps, ffn_down_exps,
-                n_expert, n_expert_used, moe_latent, n_ff_exp,
+                rt,
+                &selected,
+                &weights,
+                &resolved_host,
+                ffn_gate_exps,
+                ffn_up_exps,
+                ffn_down_exps,
+                n_expert,
+                n_expert_used,
+                moe_latent,
+                n_ff_exp,
                 layer_prof.as_deref_mut(),
             )?;
         }
@@ -1403,7 +1467,14 @@ impl Model {
             1,
         )?;
         // up = x @ W_up_sh
-        ffn_up_shexp.matmul(&mut rt.shexp_up, x, &mut rt.q8k_scratch, n_embd, shexp_width, 1)?;
+        ffn_up_shexp.matmul(
+            &mut rt.shexp_up,
+            x,
+            &mut rt.q8k_scratch,
+            n_embd,
+            shexp_width,
+            1,
+        )?;
         // mid = SiTU_Gate(gate) * SiTU_Linear(up)
         kernels::k3_situ_glu(
             &mut rt.shexp_mid,
@@ -1467,11 +1538,14 @@ impl Model {
             let up_off = ffn_up_exps.abs_offset + ei * ffn_up_exps.expert_bytes;
             let down_off = ffn_down_exps.abs_offset + ei * ffn_down_exps.expert_bytes;
 
-            let gate_buf = resolved.get(&gate_off)
+            let gate_buf = resolved
+                .get(&gate_off)
                 .ok_or_else(|| format!("K3 host MoE: gate slab {gate_off} not resolved"))?;
-            let up_buf = resolved.get(&up_off)
+            let up_buf = resolved
+                .get(&up_off)
                 .ok_or_else(|| format!("K3 host MoE: up slab {up_off} not resolved"))?;
-            let down_buf = resolved.get(&down_off)
+            let down_buf = resolved
+                .get(&down_off)
                 .ok_or_else(|| format!("K3 host MoE: down slab {down_off} not resolved"))?;
 
             let dequant_t0 = std::time::Instant::now();
@@ -1494,7 +1568,10 @@ impl Model {
                 p.cpu_expert_dequant += dequant_t0.elapsed();
                 p.cpu_expert_matrices += 3;
                 p.cpu_expert_weight_bytes = p.cpu_expert_weight_bytes.saturating_add(
-                    ffn_gate_exps.expert_bytes + ffn_up_exps.expert_bytes + ffn_down_exps.expert_bytes);
+                    ffn_gate_exps.expert_bytes
+                        + ffn_up_exps.expert_bytes
+                        + ffn_down_exps.expert_bytes,
+                );
                 p.cpu_threads = 1;
             }
 
@@ -1586,9 +1663,10 @@ impl Model {
         moe_latent: u32,
         n_ff_exp: u32,
     ) -> Result {
-        let s = self.shape;
-
-        // Build ExpertPtrs array for the selected experts
+        // Resolve every selected slot independently.  The host reference applies
+        // the route weight after the down projection; folding it into `mid`
+        // before Q8_K quantization changes the activation scale and is not
+        // mathematically equivalent.
         let mut ptrs = Vec::with_capacity(selected.len());
         for &e in selected {
             if e < 0 || e as u32 >= n_expert {
@@ -1600,86 +1678,131 @@ impl Model {
             let up_off = ffn_up_exps.abs_offset + ei * ffn_up_exps.expert_bytes;
             let down_off = ffn_down_exps.abs_offset + ei * ffn_down_exps.expert_bytes;
             ptrs.push(ExpertPtrs {
-                gate: resolved[&gate_off],
-                up: resolved[&up_off],
-                down: resolved[&down_off],
+                gate: *resolved.get(&gate_off).ok_or_else(|| {
+                    format!("K3 CUDA MoE: missing staged gate for expert {e} at {gate_off}")
+                })?,
+                up: *resolved.get(&up_off).ok_or_else(|| {
+                    format!("K3 CUDA MoE: missing staged up for expert {e} at {up_off}")
+                })?,
+                down: *resolved.get(&down_off).ok_or_else(|| {
+                    format!("K3 CUDA MoE: missing staged down for expert {e} at {down_off}")
+                })?,
             });
         }
 
-        // Write ExpertPtrs and weights to device
-        let mut ptrs_buf = DeviceBuf::alloc(ptrs.len() * std::mem::size_of::<ExpertPtrs>())?;
-        ptrs_buf.write(0, kernels::as_bytes(&ptrs))?;
-        let mut weights_buf = DeviceBuf::alloc(weights.len() * 4)?;
-        weights_buf.write(0, kernels::as_bytes(weights))?;
+        if selected.len() != n_expert_used as usize || weights.len() != selected.len() {
+            return Err(format!(
+                "K3 CUDA MoE: routing slots/weights mismatch: ids={}, weights={}, expected={n_expert_used}",
+                selected.len(), weights.len()
+            ).into());
+        }
+        if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+            for (slot, (&expert, &ptr)) in selected.iter().zip(&ptrs).enumerate() {
+                let ei = expert as u64;
+                let gate_off = ffn_gate_exps.abs_offset + ei * ffn_gate_exps.expert_bytes;
+                let up_off = ffn_up_exps.abs_offset + ei * ffn_up_exps.expert_bytes;
+                let down_off = ffn_down_exps.abs_offset + ei * ffn_down_exps.expert_bytes;
+                eprintln!(
+                    "pulsar: K3 route slot={slot} global_id={expert} weight={:.9} local_slot={slot} gate_offset={gate_off} up_offset={up_off} down_offset={down_off} ptrs=({}, {}, {})",
+                    weights[slot],
+                    !ptr.gate.is_null(),
+                    !ptr.up.is_null(),
+                    !ptr.down.is_null(),
+                );
+            }
+        }
+
+        // The per-slot call is intentional: it keeps each expert's Q8_K
+        // activation independent, then applies its route weight to the down
+        // result just like the CPU reference.
+        let mut ptr_buf = DeviceBuf::alloc(std::mem::size_of::<ExpertPtrs>())?;
+        let mut one_weight_buf = DeviceBuf::alloc(4)?;
 
         // Quantize latent activation to q8_K using rt.q8k_scratch
-        let xq_bytes = (moe_latent as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        let xq_bytes =
+            (moe_latent as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
         if rt.q8k_scratch.bytes() < xq_bytes {
             rt.q8k_scratch = DeviceBuf::alloc(xq_bytes)?;
         }
         kernels::quantize_q8_k(&mut rt.q8k_scratch, &rt.latent, moe_latent, 1)?;
+        if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+            let original = rt.latent.read_f32(moe_latent as usize)?;
+            let mut qbytes = vec![0u8; xq_bytes];
+            rt.q8k_scratch.read(0, &mut qbytes)?;
+            k3_report_q8_input(&original, &qbytes, moe_latent);
+        }
 
-        // moe_pair_swiglu: mid = Σ w_e * SiTU(gate_e @ xq, up_e @ xq).
+        // moe_pair_swiglu: mid = SiTU(gate_e @ xq, up_e @ xq).
         let mid_dim = n_ff_exp;
-        let n_used = n_expert_used;
+        let n_used = 1u32;
         let n_tok = 1u32;
         let row_bytes = ffn_gate_exps.row_bytes;
         let quant = ffn_gate_exps.quant;
         let act_op = 4u32; // K3 SiTU-GLU (beta=4, linear_beta=25)
+        if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+            eprintln!(
+                "pulsar: K3 expert layout in_dim={} mid_dim={} out_dim={} gate(up) quant={} row_bytes={} down quant={} row_bytes={}",
+                moe_latent, n_ff_exp, moe_latent, quant, row_bytes,
+                ffn_down_exps.quant, ffn_down_exps.row_bytes
+            );
+        }
 
-        let mid_bytes = (n_tok as usize) * (n_used as usize) * (mid_dim as usize) * 4;
+        let mid_bytes = (mid_dim as usize) * 4;
         if rt.expert_mid.bytes() < mid_bytes {
             rt.expert_mid = DeviceBuf::alloc(mid_bytes)?;
         }
 
-        kernels::moe_pair_swiglu(
-            &mut rt.expert_mid,
-            &ptrs_buf,
-            &weights_buf,
-            &rt.q8k_scratch,
-            moe_latent,
-            mid_dim,
-            n_used,
-            n_tok,
-            row_bytes,
-            quant,
-            act_op,
-        )?;
-
-        // Quantize mid to q8_K for moe_down using rt.expert_staging
-        let midq_bytes = (n_tok as usize * n_used as usize)
-            .saturating_mul(mid_dim as usize)
-            .div_ceil(kernels::Q8_K_BLOCK_ELEMS)
-            * kernels::Q8_K_BLOCK_BYTES;
-        if rt.expert_staging.bytes() < midq_bytes + 4096 {
-            let old = rt.expert_staging.bytes();
-            rt.expert_staging = DeviceBuf::alloc(old.max(midq_bytes + 4096))?;
+        let midq_bytes =
+            (mid_dim as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        if rt.expert_staging.bytes() < midq_bytes {
+            rt.expert_staging = DeviceBuf::alloc(midq_bytes)?;
         }
-        kernels::quantize_q8_k(&mut rt.expert_staging, &rt.expert_mid, mid_dim, n_tok * n_used)?;
-
-        // moe_down: out = mid @ W_down
         let out_bytes = (n_tok as usize) * (moe_latent as usize) * 4;
         if rt.expert_down.bytes() < out_bytes {
             rt.expert_down = DeviceBuf::alloc(out_bytes)?;
         }
 
-        kernels::moe_down(
-            &mut rt.expert_down,
-            &ptrs_buf,
-            &rt.expert_staging,
-            mid_dim,
-            moe_latent,
-            n_used,
-            n_tok,
-            ffn_down_exps.row_bytes,
-            ffn_down_exps.quant,
-        )?;
-
-        // Copy the GPU result to latent_normed for the latent norm/up steps
-        kernels::copy_d2d(&mut rt.latent_normed, 0, &rt.expert_down, 0, out_bytes)?;
-        // Reuse the single packed staging slot only after all expert reads
-        // have completed.
-        kernels::sync()?;
+        let mut moe_acc = vec![0.0f32; moe_latent as usize];
+        for (slot, (&route, &weight)) in ptrs.iter().zip(weights.iter()).enumerate() {
+            if route.gate.is_null() || route.up.is_null() || route.down.is_null() {
+                continue;
+            }
+            ptr_buf.write(0, kernels::as_bytes(std::slice::from_ref(&route)))?;
+            one_weight_buf.write(0, kernels::as_bytes(&[1.0f32]))?;
+            kernels::moe_pair_swiglu(
+                &mut rt.expert_mid,
+                &ptr_buf,
+                &one_weight_buf,
+                &rt.q8k_scratch,
+                moe_latent,
+                mid_dim,
+                n_used,
+                n_tok,
+                row_bytes,
+                quant,
+                act_op,
+            )?;
+            kernels::quantize_q8_k(&mut rt.expert_staging, &rt.expert_mid, mid_dim, 1)?;
+            kernels::moe_down(
+                &mut rt.expert_down,
+                &ptr_buf,
+                &rt.expert_staging,
+                mid_dim,
+                moe_latent,
+                n_used,
+                n_tok,
+                ffn_down_exps.row_bytes,
+                ffn_down_exps.quant,
+            )?;
+            let expert_out = rt.expert_down.read_f32(moe_latent as usize)?;
+            for (dst, src) in moe_acc.iter_mut().zip(expert_out) {
+                *dst += weight * src;
+            }
+            if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+                eprintln!("pulsar: K3 CUDA expert slot {slot} route weight {weight:.9}");
+            }
+        }
+        rt.latent_normed.write(0, kernels::as_bytes(&moe_acc))?;
 
         Ok(())
     }
@@ -1737,7 +1860,8 @@ impl Model {
                 if !b.is_pinned() && b.device() != self.primary_device {
                     return Err(format!(
                         "K3 device validation failed: {name} is on CUDA {}, expected CUDA {}",
-                        b.device(), self.primary_device
+                        b.device(),
+                        self.primary_device
                     )
                     .into());
                 }
@@ -1754,8 +1878,20 @@ impl Model {
                 Ok(())
             };
             check("cur", &st.cur)?;
-            check("dense weights", k3w.ffn_gate.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm))?;
-            check("router", k3w.ffn_gate_inp.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm))?;
+            check(
+                "dense weights",
+                k3w.ffn_gate
+                    .as_ref()
+                    .map(|w| &w.buf)
+                    .unwrap_or(&k3w.attn_norm),
+            )?;
+            check(
+                "router",
+                k3w.ffn_gate_inp
+                    .as_ref()
+                    .map(|w| &w.buf)
+                    .unwrap_or(&k3w.attn_norm),
+            )?;
             check("KDA/attention", &k3w.attn_norm)?;
             check("expert staging", &st.staging)?;
             check_dev("expert device cache", st.dev_cache.device())?;
@@ -1799,7 +1935,8 @@ impl Model {
         let token_t0 = std::time::Instant::now();
         let token_index = pos0 as u64;
         let profiling = super::Prof::enabled();
-        st.prof.begin_k3_token(token_index, if pos0 == 0 { "prefill" } else { "decode" });
+        st.prof
+            .begin_k3_token(token_index, if pos0 == 0 { "prefill" } else { "decode" });
         let token_i32: Vec<i32> = vec![tokens[0] as i32];
         st.tok.write(0, kernels::as_bytes(&token_i32))?;
         kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, n_embd, s.n_vocab, 1)?;
@@ -1809,7 +1946,11 @@ impl Model {
             let layer_t0 = std::time::Instant::now();
             let mut layer_prof = super::K3LayerProfile {
                 index: il,
-                kind: if self.k3_layer_kinds[il] == K3LayerKind::Kda { "KDA" } else { "MLA" },
+                kind: if self.k3_layer_kinds[il] == K3LayerKind::Kda {
+                    "KDA"
+                } else {
+                    "MLA"
+                },
                 ..Default::default()
             };
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
@@ -1908,7 +2049,11 @@ impl Model {
             }
             let attention_wall = attention_t0.elapsed();
             let attention_gpu = attention_gpu_timer
-                .map(|timer| timer.stop_ms().map(|ms| std::time::Duration::from_secs_f64(ms as f64 / 1000.0)))
+                .map(|timer| {
+                    timer
+                        .stop_ms()
+                        .map(|ms| std::time::Duration::from_secs_f64(ms as f64 / 1000.0))
+                })
                 .transpose()?
                 .unwrap_or(attention_wall);
             if k3w.kind == K3LayerKind::Kda {
@@ -1918,9 +2063,8 @@ impl Model {
             }
 
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-                let sync_result: super::Result = kernels::sync().map_err(|e| {
-                    format!("K3 layer {il} attention block sync: {e}").into()
-                });
+                let sync_result: super::Result = kernels::sync()
+                    .map_err(|e| format!("K3 layer {il} attention block sync: {e}").into());
                 sync_result?;
             }
 
@@ -1987,19 +2131,35 @@ impl Model {
             // prefix += ffn_out
             kernels::add_assign(&mut st.cur, &rt.ffn_out, n_embd)?;
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-                let sync_result: super::Result = kernels::sync().map_err(|e| {
-                    format!("K3 layer {il} end sync: {e}").into()
-                });
+                let sync_result: super::Result =
+                    kernels::sync().map_err(|e| format!("K3 layer {il} end sync: {e}").into());
                 sync_result?;
             }
             if k3_timing {
-                eprintln!("pulsar: K3 layer {il} {:.3}s", layer_t0.elapsed().as_secs_f32());
+                eprintln!(
+                    "pulsar: K3 layer {il} {:.3}s",
+                    layer_t0.elapsed().as_secs_f32()
+                );
+            }
+            if let Ok(target) = std::env::var("PULSAR_K3_COMPARE_LAYER") {
+                if target.parse::<usize>().ok() == Some(il) {
+                    eprintln!("pulsar: K3 differential boundary reached at layer {il}");
+                    if std::env::var_os("PULSAR_K3_COMPARE_STOP").is_some() {
+                        st.prof
+                            .finish_k3_token(token_t0.elapsed(), std::time::Duration::ZERO);
+                        return Ok(None);
+                    }
+                }
             }
             if profiling {
                 layer_prof.total = layer_t0.elapsed();
                 let classified = layer_prof.input_residual_norm
-                    + layer_prof.kda_gpu + layer_prof.mla_gpu + layer_prof.dense_gpu
-                    + layer_prof.moe_gpu + layer_prof.cpu_routing + layer_prof.output_residual;
+                    + layer_prof.kda_gpu
+                    + layer_prof.mla_gpu
+                    + layer_prof.dense_gpu
+                    + layer_prof.moe_gpu
+                    + layer_prof.cpu_routing
+                    + layer_prof.output_residual;
                 layer_prof.unclassified = layer_prof.total.saturating_sub(classified);
                 st.prof.push_k3_layer(layer_prof);
             }
@@ -2014,7 +2174,8 @@ impl Model {
 
         // ── Output norm + head ────────────────────────────────────────────
         if rows == 0 {
-            st.prof.finish_k3_token(token_t0.elapsed(), std::time::Duration::ZERO);
+            st.prof
+                .finish_k3_token(token_t0.elapsed(), std::time::Duration::ZERO);
             return Ok(None);
         }
         let k = rows.min(1);
@@ -2024,7 +2185,8 @@ impl Model {
         kernels::sync()?;
         let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
         st.prof.tail += t_tail.elapsed();
-        st.prof.finish_k3_token(token_t0.elapsed(), t_tail.elapsed());
+        st.prof
+            .finish_k3_token(token_t0.elapsed(), t_tail.elapsed());
         Ok(Some(out))
     }
 }
@@ -2055,6 +2217,48 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+fn k3_report_q8_input(original: &[f32], encoded: &[u8], n: u32) {
+    let blocks = (n as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS);
+    let padded = blocks * kernels::Q8_K_BLOCK_ELEMS - n as usize;
+    let mut reconstructed = Vec::with_capacity(original.len());
+    let mut saturated = 0usize;
+    for b in 0..blocks {
+        let base = b * kernels::Q8_K_BLOCK_BYTES;
+        let d = f32::from_le_bytes(encoded[base..base + 4].try_into().unwrap());
+        for i in 0..kernels::Q8_K_BLOCK_ELEMS {
+            let q = encoded[base + 4 + i] as i8;
+            saturated += usize::from(q == i8::MAX || q == i8::MIN);
+            reconstructed.push(d * q as f32);
+        }
+    }
+    reconstructed.truncate(original.len());
+    let mut max = 0.0f32;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut nx = 0.0f64;
+    let mut ny = 0.0f64;
+    for (&x, &y) in original.iter().zip(&reconstructed) {
+        let d = (x - y).abs();
+        max = max.max(d);
+        sum += d as f64;
+        sum_sq += (x - y) as f64 * (x - y) as f64;
+        dot += x as f64 * y as f64;
+        nx += x as f64 * x as f64;
+        ny += y as f64 * y as f64;
+    }
+    let len = original.len() as f64;
+    eprintln!(
+        "pulsar: K3 F32->Q8_K input max={max:.6e} mean={:.6e} rms={:.6e} cosine={:.9} norm_ratio={:.9} saturated={} padded={}",
+        sum / len,
+        (sum_sq / len).sqrt(),
+        dot / (nx.sqrt() * ny.sqrt()).max(f64::MIN_POSITIVE),
+        (ny / nx.max(f64::MIN_POSITIVE)).sqrt(),
+        saturated,
+        padded,
+    );
+}
+
 // ── K3 typed weight representation ─────────────────────────────────────────
 
 /// Source quantization metadata for a K3 dense weight matrix.
@@ -2075,10 +2279,7 @@ impl K3WeightQuant {
     /// Returns `true` when the weight can be consumed directly by
     /// `kernels::matmul_kq` (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS).
     pub fn is_direct_kq(&self) -> bool {
-        matches!(
-            self.quant,
-            kernels::QUANT_Q2_K | kernels::QUANT_Q3_K
-        )
+        matches!(self.quant, kernels::QUANT_Q2_K | kernels::QUANT_Q3_K)
     }
 
     /// Returns `true` when the weight is Q8_0 (use `kernels::matmul_q8_0`).
@@ -2099,7 +2300,10 @@ impl K3WeightQuant {
             T::Q8_0 => (kernels::QUANT_Q8_0, T::Q8_0.row_bytes(n_elems)),
             _ => return None,
         };
-        Some(K3WeightQuant { quant, row_bytes: row_bytes? })
+        Some(K3WeightQuant {
+            quant,
+            row_bytes: row_bytes?,
+        })
     }
 }
 
@@ -2147,7 +2351,13 @@ impl K3DenseWeight {
             self.quant.row_bytes,
             self.quant.quant,
         )
-        .map_err(|e| format!("K3 matmul_kq prequantized (quant={}): {e}", self.quant.quant).into())
+        .map_err(|e| {
+            format!(
+                "K3 matmul_kq prequantized (quant={}): {e}",
+                self.quant.quant
+            )
+            .into()
+        })
     }
 
     /// Convenience: dispatch the correct matmul for this weight.
@@ -2177,16 +2387,19 @@ impl K3DenseWeight {
             }
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
                 let sync_result: super::Result = kernels::sync().map_err(|e| {
-                    format!("K3 matmul pre-sync (quant={} in_dim={} out_dim={}): {e}", self.quant.quant, in_dim, out_dim).into()
+                    format!(
+                        "K3 matmul pre-sync (quant={} in_dim={} out_dim={}): {e}",
+                        self.quant.quant, in_dim, out_dim
+                    )
+                    .into()
                 });
                 sync_result?;
             }
             // Quantize activation f32 → Q8_K
             kernels::quantize_q8_k(q8k_scratch, x, in_dim, n_tok)?;
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
-                let sync_result: super::Result = kernels::sync().map_err(|e| {
-                    format!("K3 quantize_q8_k sync (in_dim={}): {e}", in_dim).into()
-                });
+                let sync_result: super::Result = kernels::sync()
+                    .map_err(|e| format!("K3 quantize_q8_k sync (in_dim={}): {e}", in_dim).into());
                 sync_result?;
             }
             // Direct K-quant matmul
@@ -2261,8 +2474,7 @@ mod tests {
     /// RED: verify K3WeightQuant::from_gguf for Q2_K.
     #[test]
     fn test_k3_weight_quant_from_gguf_q2k() {
-        let q = K3WeightQuant::from_gguf(gguf::TensorType::Q2K, 3584)
-            .expect("Q2_K from_gguf");
+        let q = K3WeightQuant::from_gguf(gguf::TensorType::Q2K, 3584).expect("Q2_K from_gguf");
         assert_eq!(q.quant, kernels::QUANT_Q2_K);
         assert_eq!(q.row_bytes, 1176);
     }
@@ -2270,8 +2482,7 @@ mod tests {
     /// RED: verify K3WeightQuant::from_gguf for Q3_K.
     #[test]
     fn test_k3_weight_quant_from_gguf_q3k() {
-        let q = K3WeightQuant::from_gguf(gguf::TensorType::Q3K, 3584)
-            .expect("Q3_K from_gguf");
+        let q = K3WeightQuant::from_gguf(gguf::TensorType::Q3K, 3584).expect("Q3_K from_gguf");
         assert_eq!(q.quant, kernels::QUANT_Q3_K);
         assert_eq!(q.row_bytes, 14 * 110);
     }
@@ -2279,8 +2490,7 @@ mod tests {
     /// RED: verify K3WeightQuant::from_gguf for Q8_0.
     #[test]
     fn test_k3_weight_quant_from_gguf_q8_0() {
-        let q = K3WeightQuant::from_gguf(gguf::TensorType::Q8_0, 7168)
-            .expect("Q8_0 from_gguf");
+        let q = K3WeightQuant::from_gguf(gguf::TensorType::Q8_0, 7168).expect("Q8_0 from_gguf");
         assert_eq!(q.quant, kernels::QUANT_Q8_0);
         assert_eq!(q.row_bytes, 7168u64.div_ceil(32) * 34);
     }
@@ -2415,7 +2625,9 @@ mod tests {
         assert_eq!(bs, 256, "Q2_K block size");
         assert_eq!(bb, 84, "Q2_K block bytes");
         // Verify row_bytes for a typical expert slab width
-        let row = TensorType::Q2K.row_bytes(3072).expect("Q2_K row bytes for n_ff_exp");
+        let row = TensorType::Q2K
+            .row_bytes(3072)
+            .expect("Q2_K row bytes for n_ff_exp");
         assert_eq!(row, 3072u64.div_ceil(256) * 84);
         assert_eq!(row, 12 * 84);
         assert_eq!(row, 1008);
@@ -2475,7 +2687,9 @@ mod tests {
         let total = expert_bytes * n_expert;
         assert_eq!(total, 3_612_672 * 896);
         assert_eq!(total, 3_236_954_112);
-        println!("✅ Q2_K expert slab: {row_bytes} row_bytes, {expert_bytes} per expert, {total} total");
+        println!(
+            "✅ Q2_K expert slab: {row_bytes} row_bytes, {expert_bytes} per expert, {total} total"
+        );
     }
 
     #[test]
@@ -2795,7 +3009,9 @@ mod tests {
         let n_expert: u64 = 896;
 
         // Q2_K row_bytes for moe_latent elements
-        let row_bytes = TensorType::Q2K.row_bytes(moe_latent).expect("Q2_K row_bytes");
+        let row_bytes = TensorType::Q2K
+            .row_bytes(moe_latent)
+            .expect("Q2_K row_bytes");
         assert_eq!(row_bytes, 1176, "Q2_K row_bytes for moe_latent=3584");
 
         // Per-expert slab size: rows * row_bytes
@@ -2862,7 +3078,8 @@ mod tests {
     fn test_k3_moe_dispatch_selection() {
         // GPU-eligible quants
         assert!(
-            kernels::QUANT_Q2_K == kernels::QUANT_Q2_K || kernels::QUANT_Q3_K == kernels::QUANT_Q3_K,
+            kernels::QUANT_Q2_K == kernels::QUANT_Q2_K
+                || kernels::QUANT_Q3_K == kernels::QUANT_Q3_K,
             "Q2_K and Q3_K are GPU-eligible"
         );
 
