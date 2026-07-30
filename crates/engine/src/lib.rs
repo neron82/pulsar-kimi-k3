@@ -853,6 +853,18 @@ mod real {
         pub router_gpu: std::time::Duration,
         pub router_sync: std::time::Duration,
         pub cpu_routing: std::time::Duration,
+        pub cpu_expert_dequant: std::time::Duration,
+        pub cpu_expert_gate: std::time::Duration,
+        pub cpu_expert_up: std::time::Duration,
+        pub cpu_expert_activation: std::time::Duration,
+        pub cpu_expert_down: std::time::Duration,
+        pub cpu_expert_accumulation: std::time::Duration,
+        pub cpu_latent_norm: std::time::Duration,
+        pub cpu_miscellaneous: std::time::Duration,
+        pub cpu_expert_evaluations: u64,
+        pub cpu_expert_matrices: u64,
+        pub cpu_expert_weight_bytes: u64,
+        pub cpu_threads: u32,
         pub expert_resolution: std::time::Duration,
         pub cache: std::time::Duration,
         pub storage: std::time::Duration,
@@ -951,6 +963,10 @@ mod real {
                 let mut resolve = std::time::Duration::ZERO;
                 let mut storage = std::time::Duration::ZERO;
                 let mut cpu = std::time::Duration::ZERO;
+                let mut cpu_math = std::time::Duration::ZERO;
+                let mut expert_evals = 0u64;
+                let mut expert_matrices = 0u64;
+                let mut expert_bytes = 0u64;
                 let mut storage_bytes = 0u64;
                 let mut storage_reads = 0u64;
                 let mut h2d = 0u64;
@@ -965,6 +981,12 @@ mod real {
                     resolve += l.expert_resolution;
                     storage += l.storage;
                     cpu += l.cpu_routing;
+                    cpu_math += l.cpu_expert_dequant + l.cpu_expert_gate + l.cpu_expert_up
+                        + l.cpu_expert_activation + l.cpu_expert_down + l.cpu_expert_accumulation
+                        + l.cpu_latent_norm + l.cpu_miscellaneous;
+                    expert_evals += l.cpu_expert_evaluations;
+                    expert_matrices += l.cpu_expert_matrices;
+                    expert_bytes = expert_bytes.saturating_add(l.cpu_expert_weight_bytes);
                     storage_bytes = storage_bytes.saturating_add(l.storage_bytes);
                     storage_reads = storage_reads.saturating_add(l.storage_reads);
                     h2d = h2d.saturating_add(l.h2d_bytes);
@@ -975,10 +997,10 @@ mod real {
                     device_misses = device_misses.saturating_add(l.device_cache_misses);
                 }
                 report.push_str(&format!(
-                    "\nK3 token {} [{}]: total {:.3}s, layers {:.3}s, output {:.3}s, unclassified {:.3}s\n  GPU activity {:.3}s, synchronization/readback {:.3}s, expert resolution {:.3}s (storage {:.3}s), CPU work {:.3}s\n  storage: {} bytes in {} reads; H2D {} bytes; D2H {} bytes; host cache {:.1}% ({} hits/{} misses); device cache {:.1}% ({} hits/{} misses)",
+                    "\nK3 token {} [{}]: total {:.3}s, layers {:.3}s, output {:.3}s, unclassified {:.3}s\n  GPU activity {:.3}s, synchronization/readback {:.3}s, expert resolution {:.3}s (storage {:.3}s), CPU work {:.3}s\n  CPU math categories {:.3}s; expert evals {}; matrices {}; weight bytes {}; storage: {} bytes in {} reads; H2D {} bytes; D2H {} bytes; host cache {:.1}% ({} hits/{} misses); device cache {:.1}% ({} hits/{} misses)",
                     token.index, token.phase, token.total.as_secs_f64(), token.layers.as_secs_f64(),
                     token.output.as_secs_f64(), token.unclassified.as_secs_f64(), gpu.as_secs_f64(),
-                    sync.as_secs_f64(), resolve.as_secs_f64(), storage.as_secs_f64(), cpu.as_secs_f64(), storage_bytes,
+                    sync.as_secs_f64(), resolve.as_secs_f64(), storage.as_secs_f64(), cpu.as_secs_f64(), cpu_math.as_secs_f64(), expert_evals, expert_matrices, expert_bytes, storage_bytes,
                     storage_reads, h2d, d2h, Self::hit_rate(host_hits, host_misses), host_hits,
                     host_misses, Self::hit_rate(device_hits, device_misses), device_hits, device_misses
                 ));
@@ -998,13 +1020,26 @@ mod real {
                 out.push_str(&format!("  layers total:     {:>10.3}s\n", token.layers.as_secs_f64()));
                 out.push_str(&format!("  output/lm-head:   {:>10.3}s\n", token.output.as_secs_f64()));
                 out.push_str(&format!("  unclassified:     {:>10.3}s\n", token.unclassified.as_secs_f64()));
+                let mut category_total = std::time::Duration::ZERO;
                 for l in &token.layers_detail {
-                    out.push_str(&format!("  Layer {} [{}] total {:.3}ms input {:.3}ms KDA {:.3}ms MLA {:.3}ms router {:.3}ms resolve {:.3}ms storage {:.3}ms H2D {:.3}ms MoE {:.3}ms residual {:.3}ms sync {:.3}ms unclassified {:.3}ms\n",
+                    category_total += l.cpu_expert_dequant + l.cpu_expert_gate + l.cpu_expert_up
+                        + l.cpu_expert_activation + l.cpu_expert_down + l.cpu_expert_accumulation
+                        + l.cpu_latent_norm + l.cpu_miscellaneous;
+                }
+                out.push_str(&format!("  CPU math categories: {:>10.3}s\n", category_total.as_secs_f64()));
+                for l in &token.layers_detail {
+                    out.push_str(&format!("  Layer {} [{}] total {:.3}ms input {:.3}ms KDA {:.3}ms MLA {:.3}ms router {:.3}ms resolve {:.3}ms storage {:.3}ms H2D {:.3}ms MoE {:.3}ms residual {:.3}ms sync {:.3}ms unclassified {:.3}ms\n    CPU dequant {:.3}ms gate {:.3}ms up {:.3}ms activation {:.3}ms down {:.3}ms accumulation {:.3}ms latent_norm {:.3}ms misc {:.3}ms; expert evals {} matrices {} weight_bytes {} threads {}\n",
                         l.index, l.kind, l.total.as_secs_f64()*1e3, l.input_residual_norm.as_secs_f64()*1e3,
                         l.kda_gpu.as_secs_f64()*1e3, l.mla_gpu.as_secs_f64()*1e3, l.router_gpu.as_secs_f64()*1e3,
                         l.expert_resolution.as_secs_f64()*1e3, l.storage.as_secs_f64()*1e3, l.h2d.as_secs_f64()*1e3,
                         l.moe_gpu.as_secs_f64()*1e3, l.output_residual.as_secs_f64()*1e3,
-                        l.synchronization.as_secs_f64()*1e3, l.unclassified.as_secs_f64()*1e3));
+                        l.synchronization.as_secs_f64()*1e3, l.unclassified.as_secs_f64()*1e3,
+                        l.cpu_expert_dequant.as_secs_f64()*1e3, l.cpu_expert_gate.as_secs_f64()*1e3,
+                        l.cpu_expert_up.as_secs_f64()*1e3, l.cpu_expert_activation.as_secs_f64()*1e3,
+                        l.cpu_expert_down.as_secs_f64()*1e3, l.cpu_expert_accumulation.as_secs_f64()*1e3,
+                        l.cpu_latent_norm.as_secs_f64()*1e3, l.cpu_miscellaneous.as_secs_f64()*1e3,
+                        l.cpu_expert_evaluations, l.cpu_expert_matrices,
+                        l.cpu_expert_weight_bytes, l.cpu_threads));
                 }
             }
             out

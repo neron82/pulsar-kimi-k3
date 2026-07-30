@@ -1364,10 +1364,12 @@ impl Model {
                 rt, &selected, &weights, &resolved_host,
                 ffn_gate_exps, ffn_up_exps, ffn_down_exps,
                 n_expert, n_expert_used, moe_latent, n_ff_exp,
+                layer_prof.as_deref_mut(),
             )?;
         }
 
         // 6. RMSNorm(moe_acc, latent_norm)
+        let latent_norm_t0 = std::time::Instant::now();
         let latent_norm_host = ffn_latent_norm.read_f32(moe_latent as usize)?;
         let moe_acc = rt.latent_normed.read_f32(moe_latent as usize)?;
         let mean_sq: f32 = moe_acc.iter().map(|v| v * v).sum::<f32>() / moe_latent as f32;
@@ -1375,6 +1377,10 @@ impl Model {
         let mut moe_normed = vec![0.0f32; moe_latent as usize];
         for i in 0..moe_latent as usize {
             moe_normed[i] = moe_acc[i] * inv_rms * latent_norm_host[i];
+        }
+        if let Some(p) = layer_prof.as_deref_mut() {
+            p.cpu_latent_norm += latent_norm_t0.elapsed();
+            p.cpu_threads = p.cpu_threads.max(1);
         }
 
         // 7. moe_out = moe_normed @ W_latent_up  [moe_latent -> n_embd]
@@ -1443,6 +1449,7 @@ impl Model {
         n_expert_used: u32,
         moe_latent: u32,
         n_ff_exp: u32,
+        mut layer_prof: Option<&mut super::K3LayerProfile>,
     ) -> Result {
         let s = self.shape;
 
@@ -1471,7 +1478,7 @@ impl Model {
             let down_buf = resolved.get(&down_off)
                 .ok_or_else(|| format!("K3 host MoE: down slab {down_off} not resolved"))?;
 
-            // Dequantize expert weights using the quant-aware path
+            let dequant_t0 = std::time::Instant::now();
             let gate_f32 = k3_dequant_expert_bytes(
                 gate_buf,
                 (moe_latent * n_ff_exp) as usize,
@@ -1487,25 +1494,41 @@ impl Model {
                 (n_ff_exp * moe_latent) as usize,
                 ffn_down_exps.quant,
             )?;
+            if let Some(p) = layer_prof.as_deref_mut() {
+                p.cpu_expert_dequant += dequant_t0.elapsed();
+                p.cpu_expert_matrices += 3;
+                p.cpu_expert_weight_bytes = p.cpu_expert_weight_bytes.saturating_add(
+                    ffn_gate_exps.expert_bytes + ffn_up_exps.expert_bytes + ffn_down_exps.expert_bytes);
+                p.cpu_threads = 1;
+            }
 
             // gate_out = latent @ W_gate_e  [moe_latent -> n_ff_exp]
             let mut gate_out = vec![0.0f32; n_ff_exp as usize];
+            let gate_t0 = std::time::Instant::now();
             for j in 0..n_ff_exp as usize {
                 for k in 0..moe_latent as usize {
                     gate_out[j] += latent_host[k] * gate_f32[j * moe_latent as usize + k];
                 }
             }
+            if let Some(p) = layer_prof.as_deref_mut() {
+                p.cpu_expert_gate += gate_t0.elapsed();
+            }
 
             // up_out = latent @ W_up_e  [moe_latent -> n_ff_exp]
             let mut up_out = vec![0.0f32; n_ff_exp as usize];
+            let up_t0 = std::time::Instant::now();
             for j in 0..n_ff_exp as usize {
                 for k in 0..moe_latent as usize {
                     up_out[j] += latent_host[k] * up_f32[j * moe_latent as usize + k];
                 }
             }
+            if let Some(p) = layer_prof.as_deref_mut() {
+                p.cpu_expert_up += up_t0.elapsed();
+            }
 
             // mid = SiTU_Gate(gate_out) * SiTU_Linear(up_out)
             let mut mid = vec![0.0f32; n_ff_exp as usize];
+            let activation_t0 = std::time::Instant::now();
             for j in 0..n_ff_exp as usize {
                 let g = gate_out[j];
                 let u = up_out[j];
@@ -1513,18 +1536,30 @@ impl Model {
                 let situ_linear = s.situ_linear_beta * (u / s.situ_linear_beta).tanh();
                 mid[j] = situ_gate * situ_linear;
             }
+            if let Some(p) = layer_prof.as_deref_mut() {
+                p.cpu_expert_activation += activation_t0.elapsed();
+            }
 
             // expert_out = mid @ W_down_e  [n_ff_exp -> moe_latent]
             let mut expert_out = vec![0.0f32; moe_latent as usize];
+            let down_t0 = std::time::Instant::now();
             for k in 0..moe_latent as usize {
                 for j in 0..n_ff_exp as usize {
                     expert_out[k] += mid[j] * down_f32[k * n_ff_exp as usize + j];
                 }
             }
+            if let Some(p) = layer_prof.as_deref_mut() {
+                p.cpu_expert_down += down_t0.elapsed();
+            }
 
             // Accumulate weighted expert output
+            let accumulation_t0 = std::time::Instant::now();
             for k in 0..moe_latent as usize {
                 moe_acc[k] += w_e * expert_out[k];
+            }
+            if let Some(p) = layer_prof.as_deref_mut() {
+                p.cpu_expert_accumulation += accumulation_t0.elapsed();
+                p.cpu_expert_evaluations += 1;
             }
         }
 
@@ -1938,6 +1973,16 @@ impl Model {
                     layer_prof.moe_gpu = ffn_t0.elapsed();
                 } else {
                     layer_prof.cpu_routing = ffn_t0.elapsed();
+                    let measured_cpu = layer_prof.cpu_expert_dequant
+                        + layer_prof.cpu_expert_gate
+                        + layer_prof.cpu_expert_up
+                        + layer_prof.cpu_expert_activation
+                        + layer_prof.cpu_expert_down
+                        + layer_prof.cpu_expert_accumulation
+                        + layer_prof.cpu_latent_norm;
+                    layer_prof.cpu_miscellaneous = layer_prof
+                        .cpu_routing
+                        .saturating_sub(layer_prof.expert_resolution + measured_cpu);
                 }
             }
 
