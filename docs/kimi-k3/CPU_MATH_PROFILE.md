@@ -1,7 +1,7 @@
 # K3 CPU Math Profile
 
-This report records the K3 host-execution investigation. It does not enable
-`PULSAR_K3_GPU_MOE` and does not change model math, placement, cache policy, or
+This report records the K3 host-execution investigation. It uses the default
+`PULSAR_K3_EXPERT_BACKEND=cpu` and does not change model math, placement, cache policy, or
 storage behavior.
 
 ## Measured Run
@@ -39,7 +39,7 @@ The complete path is in `crates/engine/src/real/kimi_k3.rs`:
 5. `latent_moe_forward` performs latent-down and router projection on CUDA,
    runs `k3_router_select` on CUDA, then reads 16 IDs and 16 weights to host.
 6. `StreamingStore::ensure_with` resolves three expert slabs per selected
-   expert. With `PULSAR_K3_GPU_MOE` absent, it fills `resolved_host` with
+   expert. With `PULSAR_K3_EXPERT_BACKEND=cpu`, it fills `resolved_host` with
    host byte vectors.
 7. `k3_host_moe_compute` calls `k3_dequant_expert_bytes` for gate, up, and
    down, then executes scalar Rust loops for gate, up, SiTU, down, and the
@@ -107,7 +107,7 @@ dominant CPU math. The measured thread field is 1 for every expert layer.
 The active branch is the `else` branch at `kimi_k3.rs:1323`: resolver payloads
 are copied into `resolved_host`, and `k3_host_moe_compute` consumes those
 vectors. The `staging.write` call that increments H2D bytes exists only in
-the `use_gpu` branch, which requires `PULSAR_K3_GPU_MOE` and a supported
+the `use_gpu` branch, which requires `PULSAR_K3_EXPERT_BACKEND=cuda` and a supported
 Q2_K/Q3_K layout. No host-mapped weights are passed to CUDA and no
 uninstrumented expert-weight transfer exists in this execution. The measured
 H2D zero is therefore genuine, not a missing counter.
@@ -125,32 +125,31 @@ The K3 packed expert slab geometry is three independent contiguous slabs
 addressed as `abs_offset + expert_id * expert_bytes`; that pointer contract is
 compatible with the CUDA kernels when each slab is staged in device memory.
 The current K3 format selection is Q2_K/Q3_K, so no unpack/repack is needed
-for the existing dot kernels. However, the existing kernel path is not a
-mathematical replacement for the host reference in this tree: its documented
-K3 path notes that the legacy activation implementation is approximate with
-respect to SiTU. It also requires valid device-resident pointers and performs
-single-token expert-list dispatch; it does not itself stream storage.
+for the existing dot kernels. `act_op=4` implements the exact K3 SiTU formula
+with beta 4 and linear beta 25. The kernels require device-resident pointers
+and perform single-token expert-list dispatch; the engine resolves packed slabs,
+copies them to one staging slot, and synchronizes before reuse.
 
 ## VRAM Staging
 
-The profiler measured one selected gate/up/down triple as **191,299,584
-bytes** (182.4 MiB). Therefore the minimum packed expert storage is:
+Tensor metadata and `ExpertTensor::new` verify Q2_K gate/up and Q3_K down
+slabs. One expert triple is **11,956,224 bytes** (11.41 MiB):
+`3,612,672 + 3,612,672 + 4,730,880`. Therefore the minimum packed expert
+storage is:
 
 | staging choice | bytes | GiB |
 |---|---:|---:|
-| one selected expert triple | 191,299,584 | 0.178 |
-| all 16 selected experts for one layer | 3,060,793,344 | 2.850 |
-| double-buffered 16-expert layer | 6,121,586,688 | 5.701 |
+| one selected expert triple | 11,956,224 | 0.011 |
+| 16 selected experts for one layer, one staging slot | 191,299,584 | 0.178 |
+| two staging slots | 382,599,168 | 0.356 |
 
-The one-token CUDA scratch minimum from repository constants is approximately
-70 KiB: Q8_K latent activation 4,088 bytes, 16-expert mid Q8_K scratch
-56,064 bytes, output 14,336 bytes, plus pointer/weight arrays and the current
-4,096-byte staging slack. This is negligible beside packed expert storage.
-Adding a conservative 1 GiB CUDA runtime and allocation headroom gives about
-3.85 GiB for one-layer 16-expert staging, or about 6.70 GiB for double
-buffering, before other persistent model/runtime allocations. A 24 GiB RTX
-3090 has sufficient capacity for the minimum staging choices, but this is a
-capacity calculation only, not an implementation recommendation.
+The one-token GPU dispatch scratch is approximately 265 KiB: Q8_K latent
+activation 4,088 bytes, 16-expert float mid scratch 196,608 bytes, Q8_K mid
+scratch 56,064 bytes, output 14,336 bytes, plus pointer/weight arrays. The
+runtime also owns small reusable expert-output buffers. The implementation
+allocates one
+191,299,584-byte packed staging slot plus this reusable scratch; it does not
+allocate a second slot or storage for all model experts.
 
 With no device expert cache and one layer at a time, moving the current
 selection to GPU would transfer approximately **17.60 GB of packed expert
@@ -160,10 +159,11 @@ phase, consistent with this order of magnitude.
 
 ## Scope And Verification
 
-Changed files are `crates/engine/src/lib.rs`,
-`crates/engine/src/real/kimi_k3.rs`, and this document. No CUDA kernel,
-mathematics, cache policy, residency, storage layout, batching, prefetching,
-or scheduling was changed.
+The selectable backend is `PULSAR_K3_EXPERT_BACKEND=cpu|cuda`; CPU is the
+default and remains the reference. CUDA uses `moe_pair_swiglu` and `moe_down`
+with Q8_K activations, `ExpertPtrs`, and `act_op=4`. Existing CUDA selftests
+cover Q2_K, Q3_K, routing, and SiTU activation; a real-model CPU/CUDA token
+comparison is required before changing the default.
 
 `cargo build --release -p engine`, `cargo test -p engine` (44 tests), and
 `git diff --check` passed. The profile run completed on the requested RTX

@@ -24,6 +24,16 @@ use stream::Read as StreamRead;
 
 use super::StreamingStore;
 
+/// Select the K3 routed-expert implementation. CPU remains the default until
+/// the CUDA path has been validated against the host reference.
+fn k3_expert_backend() -> &'static str {
+    match std::env::var("PULSAR_K3_EXPERT_BACKEND").as_deref() {
+        Ok("cuda") => "cuda",
+        Ok("cpu") | Err(_) => "cpu",
+        _ => "cpu",
+    }
+}
+
 // ── K3 contract constants (from the reference model) ──────────────────────
 // These are the canonical K3 values; the gguf metadata is the source of truth.
 // Documented here for reference during Phase 2 forward implementation.
@@ -1128,7 +1138,7 @@ impl Model {
     ///
     /// Uses the generic cache/tier resolve path (StreamingStore, DeviceSlabCache,
     /// ExpertTier) to fetch expert slabs instead of synchronous VFile reads.
-    /// For Q2_K/Q3_K triples, when PULSAR_K3_GPU_MOE=1, dispatches to the existing
+    /// For Q2_K/Q3_K triples, when PULSAR_K3_EXPERT_BACKEND=cuda, dispatches to the existing
     /// moe_pair_swiglu/moe_down CUDA kernels with act_op=4 (K3 SiTU-GLU,
     /// beta=4 and linear_beta=25). Otherwise falls back to the host
     /// dequant+CPU matmul path for correctness.
@@ -1249,8 +1259,13 @@ impl Model {
             && (ffn_down_exps.quant == kernels::QUANT_Q2_K
                 || ffn_down_exps.quant == kernels::QUANT_Q3_K);
         let use_gpu = gpu_ok
-            && std::env::var_os("PULSAR_K3_GPU_MOE").is_some()
+            && k3_expert_backend() == "cuda"
             && ffn_gate_exps.row_bytes == ffn_up_exps.row_bytes;
+        if k3_expert_backend() == "cuda" && !use_gpu {
+            eprintln!(
+                "pulsar: K3 CUDA expert backend requested but this layer's expert layout is unsupported; using CPU reference"
+            );
+        }
 
         // Build the list of distinct expert offsets and resolve through
         // the cache/tier system.  This is shared by both GPU and host paths.
@@ -1282,20 +1297,11 @@ impl Model {
         let mut resolved_h2d_bytes = 0u64;
         let mut resolved_h2d_time = std::time::Duration::ZERO;
         if use_gpu {
-            // GPU path: reuse the persistent VRAM hot-set and stream only
-            // misses through State::staging. Cached pointers remain valid
-            // across layers/tokens; staging is reserved for cold slabs.
-            let mut missing = Vec::new();
             let mut stage_base: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
             let mut stage_len = 0usize;
             for r in &wants {
-                if let Some(ptr) = dev_cache.get(r.offset, r.len) {
-                    resolved_gpu.insert(r.offset, ptr);
-                } else {
-                    stage_base.insert(r.offset, stage_len);
-                    stage_len += r.len as usize;
-                    missing.push(*r);
-                }
+                stage_base.insert(r.offset, stage_len);
+                stage_len += r.len as usize;
             }
             if stage_len > staging.bytes() {
                 return Err(format!(
@@ -1304,22 +1310,15 @@ impl Model {
                     staging.bytes()
                 ).into());
             }
-            if !missing.is_empty() {
-                let in_use: Vec<u64> = wants.iter().map(|r| r.offset).collect();
-                store.ensure_with(&missing, |off, payload| {
-                    if let Some(ptr) = dev_cache.maybe_insert(off, payload, &in_use)? {
-                        resolved_gpu.insert(off, ptr);
-                    } else {
-                        let base = stage_base[&off];
-                        let h2d_t0 = std::time::Instant::now();
-                        staging.write(base, payload)?;
-                        resolved_h2d_time += h2d_t0.elapsed();
-                        resolved_h2d_bytes = resolved_h2d_bytes.saturating_add(payload.len() as u64);
-                        resolved_gpu.insert(off, staging.ptr_at(base));
-                    }
-                    Ok(())
-                })?;
-            }
+            store.ensure_with(&wants, |off, payload| {
+                let base = stage_base[&off];
+                let h2d_t0 = std::time::Instant::now();
+                staging.write(base, payload)?;
+                resolved_h2d_time += h2d_t0.elapsed();
+                resolved_h2d_bytes = resolved_h2d_bytes.saturating_add(payload.len() as u64);
+                resolved_gpu.insert(off, staging.ptr_at(base));
+                Ok(())
+            })?;
         } else {
             // Host path: collect resolved bytes
             store.ensure_with(&wants, |off, payload| {
@@ -1347,9 +1346,6 @@ impl Model {
 
         if use_gpu {
             // ── GPU dispatch path (Q2_K/Q3_K only) ──────────────────────────
-            // NOTE: The existing moe_pair_swiglu kernel uses act_op=0 (silu),
-            // not SiTU.  This is APPROXIMATE — the host path is the correctness
-            // reference.  A future lane should add a SiTU act_op to the kernel.
             self.k3_gpu_moe_compute(
                 rt, &selected, &weights, &resolved_gpu,
                 staging,
@@ -1574,9 +1570,6 @@ impl Model {
     /// Builds ExpertPtrs from pre-resolved device pointers and dispatches to
     /// moe_pair_swiglu/moe_down.
     ///
-    /// NOTE: The existing moe_pair_swiglu kernel uses act_op=0 (silu), not
-    /// SiTU.  This is APPROXIMATE — the host path is the correctness reference.
-    /// A future lane should add a SiTU act_op to the kernel.
     #[allow(clippy::too_many_arguments)]
     fn k3_gpu_moe_compute(
         &self,
@@ -1626,8 +1619,7 @@ impl Model {
         }
         kernels::quantize_q8_k(&mut rt.q8k_scratch, &rt.latent, moe_latent, 1)?;
 
-        // moe_pair_swiglu: mid = Σ w_e * act(gate_e @ xq) * (up_e @ xq)
-        // NOTE: act_op=0 is silu, NOT SiTU.  This is APPROXIMATE.
+        // moe_pair_swiglu: mid = Σ w_e * SiTU(gate_e @ xq, up_e @ xq).
         let mid_dim = n_ff_exp;
         let n_used = n_expert_used;
         let n_tok = 1u32;
@@ -1685,6 +1677,9 @@ impl Model {
 
         // Copy the GPU result to latent_normed for the latent norm/up steps
         kernels::copy_d2d(&mut rt.latent_normed, 0, &rt.expert_down, 0, out_bytes)?;
+        // Reuse the single packed staging slot only after all expert reads
+        // have completed.
+        kernels::sync()?;
 
         Ok(())
     }
@@ -1768,14 +1763,16 @@ impl Model {
             check("output projection / LM head", &self.output)?;
             check("logits", &st.logits)?;
             eprintln!(
-                "K3 allocation/execution summary:\n  K3 primary compute device: CUDA {}\n  K3 expert-streaming device: {}\n  K3 dense weights: {}\n  K3 router: {}\n  K3 KDA: {}\n  K3 attention: {}\n  K3 expert staging buffers: {}\n  K3 expert device cache: {}\n  K3 MoE compute: {}\n  K3 output projection / LM head: {}\n  K3 logits buffers: {}",
+                "K3 allocation/execution summary:\n  K3 primary compute device: CUDA {}\n  K3 expert backend: {}\n  K3 expert-streaming device: {}\n  K3 dense weights: {}\n  K3 router: {}\n  K3 KDA: {}\n  K3 attention: {}\n  K3 expert staging buffers: {} ({} bytes)\n  K3 expert device cache: {}\n  K3 MoE compute: {}\n  K3 output projection / LM head: {}\n  K3 logits buffers: {}",
                 self.primary_device,
+                k3_expert_backend(),
                 device(&st.staging),
                 device(k3w.ffn_gate.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm)),
                 device(k3w.ffn_gate_inp.as_ref().map(|w| &w.buf).unwrap_or(&k3w.attn_norm)),
                 device(&k3w.attn_norm),
                 device(&k3w.attn_norm),
                 device(&st.staging),
+                st.staging.bytes(),
                 if st.dev_cache.device() < 0 {
                     "host-pinned/UVA".to_string()
                 } else {
@@ -1969,7 +1966,7 @@ impl Model {
                     k3w,
                     Some(&mut layer_prof),
                 )?;
-                if std::env::var_os("PULSAR_K3_GPU_MOE").is_some() {
+                if k3_expert_backend() == "cuda" {
                     layer_prof.moe_gpu = ffn_t0.elapsed();
                 } else {
                     layer_prof.cpu_routing = ffn_t0.elapsed();

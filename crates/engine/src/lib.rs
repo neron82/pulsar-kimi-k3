@@ -4548,8 +4548,33 @@ mod real {
                         c.max(1)
                     };
                     // decode floor: one layer's slot resolve always fits
-                    let staging_bytes = stage_worst(chunk).max(n_used * 3 * max_slab);
-                    let gpu_moe = std::env::var_os("PULSAR_K3_GPU_MOE").is_some();
+                    let gpu_moe = s.family == Family::KimiK3
+                        && std::env::var("PULSAR_K3_EXPERT_BACKEND").ok().as_deref() == Some("cuda");
+                    // The initial K3 CUDA backend is synchronous and reuses one
+                    // layer-sized packed staging slot. It does not reserve a
+                    // prefetch window or the complete expert bank.
+                    let k3_staging = if gpu_moe {
+                        m.layers
+                            .iter()
+                            .filter_map(|l| match &l.attn {
+                                Attn::KimiK3(k3) => Some(
+                                    k3.ffn_gate_exps.as_ref()?.expert_bytes
+                                        + k3.ffn_up_exps.as_ref()?.expert_bytes
+                                        + k3.ffn_down_exps.as_ref()?.expert_bytes,
+                                ),
+                                _ => None,
+                            })
+                            .max()
+                            .unwrap_or(0) as usize
+                            * s.n_expert_used as usize
+                    } else {
+                        0
+                    };
+                    let staging_bytes = if gpu_moe {
+                        k3_staging
+                    } else {
+                        stage_worst(chunk).max(n_used * 3 * max_slab)
+                    };
                     let (dev_bytes, staging_bytes) = if !gpu_moe {
                         (0, 1)
                     } else {
@@ -4565,7 +4590,14 @@ mod real {
                                 reserve as f64 / (1 << 20) as f64,
                             ).into());
                         }
-                        (requested.max(1), staging_bytes)
+                        // K3 intentionally bypasses the persistent device
+                        // expert cache: each layer is copied to this slot.
+                        let cache_bytes = if s.family == Family::KimiK3 {
+                            0
+                        } else {
+                            requested.max(1)
+                        };
+                        (cache_bytes, staging_bytes)
                     };
                     st.dev_cache = DeviceSlabCache::new(dev_bytes, max_slab)?;
                     st.staging = DeviceBuf::alloc_named(
