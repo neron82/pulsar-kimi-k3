@@ -10,7 +10,9 @@ use quant::cpu_dot::{quantize_row_q8_k, vec_dot_iq2_xxs_q8_k, IQ2_XXS_BLOCK_BYTE
 fn main() {
     let mut args = std::env::args().skip(1);
     let threads: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8),
     );
     let gb: f64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(2.0);
     let passes: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1);
@@ -22,7 +24,10 @@ fn main() {
     let total_bytes = n_rows * row_bytes;
     eprintln!(
         "cpu-tier-bench: {} rows x {} cols ({:.2} GB working set), {} threads",
-        n_rows, n_cols, total_bytes as f64 / 1e9, threads
+        n_rows,
+        n_cols,
+        total_bytes as f64 / 1e9,
+        threads
     );
 
     // decode never validates encoder invariants, so random bytes are a
@@ -35,7 +40,9 @@ fn main() {
     }
     // keep stored 4-bit scales small so f16 d stays sane: not needed for
     // speed, but keeps outputs finite for the checksum
-    let act: Vec<f32> = (0..n_cols).map(|i| ((i % 97) as f32 - 48.0) / 48.0).collect();
+    let act: Vec<f32> = (0..n_cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+        .collect();
     let xq = quantize_row_q8_k(&act);
 
     let t0 = std::time::Instant::now();

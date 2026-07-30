@@ -29,6 +29,7 @@ use super::StreamingStore;
 fn k3_expert_backend() -> &'static str {
     match std::env::var("PULSAR_K3_EXPERT_BACKEND").as_deref() {
         Ok("cuda") => "cuda",
+        Ok("cpu-q8") => "cpu-q8",
         Ok("cpu") | Err(_) => "cpu",
         _ => "cpu",
     }
@@ -1416,6 +1417,21 @@ impl Model {
                 moe_latent,
                 n_ff_exp,
             )?;
+        } else if k3_expert_backend() == "cpu-q8" {
+            self.k3_cpu_q8_moe_compute(
+                rt,
+                &selected,
+                &weights,
+                &resolved_host,
+                ffn_gate_exps,
+                ffn_up_exps,
+                ffn_down_exps,
+                n_expert,
+                n_expert_used,
+                moe_latent,
+                n_ff_exp,
+                layer_prof.as_deref_mut(),
+            )?;
         } else {
             // ── Host fallback path (all quant types) ────────────────────────
             // Resolve slabs through the cache/tier system, then dequant and
@@ -1647,6 +1663,93 @@ impl Model {
         // Write moe_acc to device for the latent norm/up steps
         rt.latent_normed.write(0, kernels::as_bytes(&moe_acc))?;
 
+        Ok(())
+    }
+
+    /// CPU reference with the same two Q8_K activation boundaries as CUDA.
+    /// Weight bytes remain packed and are consumed by the existing CPU K-quant
+    /// dot routines; route weights are deliberately applied after down.
+    #[allow(clippy::too_many_arguments)]
+    fn k3_cpu_q8_moe_compute(
+        &self,
+        rt: &mut KimiK3Rt,
+        selected: &[i32],
+        weights: &[f32],
+        resolved: &std::collections::HashMap<u64, Vec<u8>>,
+        ffn_gate_exps: &super::ExpertTensor,
+        ffn_up_exps: &super::ExpertTensor,
+        ffn_down_exps: &super::ExpertTensor,
+        n_expert: u32,
+        n_expert_used: u32,
+        moe_latent: u32,
+        n_ff_exp: u32,
+        mut layer_prof: Option<&mut super::K3LayerProfile>,
+    ) -> Result {
+        let gate_up_q2 =
+            ffn_gate_exps.quant == kernels::QUANT_Q2_K && ffn_up_exps.quant == kernels::QUANT_Q2_K;
+        let gate_up_q3 =
+            ffn_gate_exps.quant == kernels::QUANT_Q3_K && ffn_up_exps.quant == kernels::QUANT_Q3_K;
+        let down_supported = matches!(
+            ffn_down_exps.quant,
+            kernels::QUANT_Q2_K | kernels::QUANT_Q3_K
+        );
+        if !(gate_up_q2 || gate_up_q3) || !down_supported {
+            return Err("K3 CPU-Q8 requires matching Q2_K or Q3_K expert weights".into());
+        }
+        let latent = rt.latent.read_f32(moe_latent as usize)?;
+        let input_q = quant::cpu_dot::quantize_row_q8_k(&latent);
+        let mut moe_acc = vec![0.0f32; moe_latent as usize];
+        let compute_t0 = std::time::Instant::now();
+
+        for si in 0..n_expert_used as usize {
+            let e = selected[si];
+            if e < 0 || e as u32 >= n_expert {
+                continue;
+            }
+            let ei = e as u64;
+            let gate_off = ffn_gate_exps.abs_offset + ei * ffn_gate_exps.expert_bytes;
+            let up_off = ffn_up_exps.abs_offset + ei * ffn_up_exps.expert_bytes;
+            let down_off = ffn_down_exps.abs_offset + ei * ffn_down_exps.expert_bytes;
+            let gate = resolved
+                .get(&gate_off)
+                .ok_or("K3 CPU-Q8 gate slab missing")?;
+            let up = resolved.get(&up_off).ok_or("K3 CPU-Q8 up slab missing")?;
+            let down = resolved
+                .get(&down_off)
+                .ok_or("K3 CPU-Q8 down slab missing")?;
+
+            let mut gate_out = vec![0.0f32; n_ff_exp as usize];
+            let mut up_out = vec![0.0f32; n_ff_exp as usize];
+            for j in 0..n_ff_exp as usize {
+                let go = &gate[j * ffn_gate_exps.row_bytes as usize..];
+                let uo = &up[j * ffn_up_exps.row_bytes as usize..];
+                gate_out[j] = k3_q8_dot(ffn_gate_exps.quant, go, &input_q, moe_latent as usize)?;
+                up_out[j] = k3_q8_dot(ffn_up_exps.quant, uo, &input_q, moe_latent as usize)?;
+            }
+
+            let mut mid = vec![0.0f32; n_ff_exp as usize];
+            for j in 0..n_ff_exp as usize {
+                let g = gate_out[j];
+                let u = up_out[j];
+                mid[j] = self.shape.situ_beta * (g / self.shape.situ_beta).tanh()
+                    / (1.0 + (-g).exp())
+                    * (self.shape.situ_linear_beta * (u / self.shape.situ_linear_beta).tanh());
+            }
+            let mid_q = quant::cpu_dot::quantize_row_q8_k(&mid);
+            let mut expert_out = vec![0.0f32; moe_latent as usize];
+            for k in 0..moe_latent as usize {
+                let row = &down[k * ffn_down_exps.row_bytes as usize..];
+                expert_out[k] = k3_q8_dot(ffn_down_exps.quant, row, &mid_q, n_ff_exp as usize)?;
+                moe_acc[k] += weights[si] * expert_out[k];
+            }
+        }
+        if let Some(p) = layer_prof.as_deref_mut() {
+            p.cpu_expert_matrices += (n_expert_used * 3) as u64;
+            p.cpu_expert_evaluations += n_expert_used as u64;
+            p.cpu_expert_gate += compute_t0.elapsed();
+            p.cpu_threads = 1;
+        }
+        rt.latent_normed.write(0, kernels::as_bytes(&moe_acc))?;
         Ok(())
     }
 
@@ -2216,6 +2319,14 @@ impl Model {
                     k3w,
                     Some(&mut layer_prof),
                 )?;
+                k3_dump_device(
+                    pos0,
+                    "moe",
+                    il,
+                    "routed_moe",
+                    &rt.latent_normed,
+                    s.moe_latent_size,
+                )?;
                 if k3_expert_backend() == "cuda" {
                     layer_prof.moe_gpu = ffn_t0.elapsed();
                 } else {
@@ -2236,6 +2347,36 @@ impl Model {
             // ── Residual update (FFN) ────────────────────────────────────
             // prefix += ffn_out
             kernels::add_assign(&mut st.cur, &rt.ffn_out, n_embd)?;
+            k3_dump_device(pos0, "layer", il, "hidden", &st.cur, n_embd)?;
+            if self.k3_layer_kinds[il] == K3LayerKind::Kda {
+                for (which, state) in rt.conv_states[il].iter().enumerate() {
+                    k3_dump_device(
+                        pos0,
+                        "state",
+                        il,
+                        &format!("conv_{which}"),
+                        state,
+                        (state.bytes() / 4) as u32,
+                    )?;
+                }
+                let state = &rt.ssm_states[il];
+                k3_dump_device(
+                    pos0,
+                    "state",
+                    il,
+                    "kda_ssm",
+                    state,
+                    (state.bytes() / 4) as u32,
+                )?;
+            }
+            k3_dump_device(
+                pos0,
+                "state",
+                il,
+                "attn_res_bank",
+                &rt.res_bank,
+                rt.res_bank_len.saturating_mul(n_embd),
+            )?;
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
                 let sync_result: super::Result =
                     kernels::sync().map_err(|e| format!("K3 layer {il} end sync: {e}").into());
@@ -2286,9 +2427,11 @@ impl Model {
         }
         let k = rows.min(1);
         let t_tail = std::time::Instant::now();
+        k3_dump_device(pos0, "final", 0, "hidden", &st.cur, n_embd)?;
         kernels::rms_norm(&mut st.normed, &st.cur, &self.output_norm, n_embd, k, eps)?;
         self.head_logits(st, k)?;
         kernels::sync()?;
+        k3_dump_device(pos0, "final", 0, "logits", &st.logits, s.n_vocab)?;
         let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
         st.prof.tail += t_tail.elapsed();
         st.prof
@@ -2377,6 +2520,40 @@ fn k3_reconstruct_q8(encoded: &[u8], n: u32) -> Vec<f32> {
     }
     out.truncate(n as usize);
     out
+}
+
+fn k3_q8_dot(quant: u32, row: &[u8], x: &quant::cpu_dot::Q8KRow, n: usize) -> Result<f32> {
+    Ok(match quant {
+        kernels::QUANT_Q2_K => quant::cpu_dot::vec_dot_q2_k_q8_k(row, x, n),
+        kernels::QUANT_Q3_K => quant::cpu_dot::vec_dot_q3_k_q8_k(row, x, n),
+        _ => return Err(format!("K3 CPU-Q8 unsupported expert quant {quant}").into()),
+    })
+}
+
+/// Opt-in raw snapshots for the three-run K3 comparison harness. Files are
+/// backend-scoped so separate CPU-F32, CPU-Q8, and CUDA runs can be compared
+/// without changing the forward computation or logging full vectors.
+fn k3_dump_device(
+    step: u32,
+    kind: &str,
+    layer: usize,
+    name: &str,
+    buf: &DeviceBuf,
+    n: u32,
+) -> Result {
+    if step != 0 {
+        return Ok(());
+    }
+    let Some(root) = std::env::var_os("PULSAR_K3_COMPARE_DIR") else {
+        return Ok(());
+    };
+    let backend = k3_expert_backend();
+    let dir = std::path::PathBuf::from(root).join(backend);
+    std::fs::create_dir_all(&dir)?;
+    let values = buf.read_f32(n as usize)?;
+    let path = dir.join(format!("{kind}_{layer:03}_{name}.f32"));
+    std::fs::write(path, kernels::as_bytes(&values))?;
+    Ok(())
 }
 
 fn k3_report_vector(label: &str, cpu: &[f32], cuda: &[f32]) {

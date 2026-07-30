@@ -87,7 +87,11 @@ pub fn tables() -> &'static Iq2Tables {
             dist.clear();
             for (j, &g) in grid.iter().enumerate() {
                 let pg = grid_bytes(g);
-                let d2: i32 = pg.iter().zip(&pos).map(|(&a, &b)| (a as i32 - b) * (a as i32 - b)).sum();
+                let d2: i32 = pg
+                    .iter()
+                    .zip(&pos)
+                    .map(|(&a, &b)| (a as i32 - b) * (a as i32 - b))
+                    .sum();
                 dist.push((d2, j));
             }
             dist.sort_unstable();
@@ -110,7 +114,11 @@ pub fn tables() -> &'static Iq2Tables {
             neighbours[start] = n;
             kmap[i] = -((start + 1) as i32);
         }
-        Iq2Tables { grid, kmap, neighbours }
+        Iq2Tables {
+            grid,
+            kmap,
+            neighbours,
+        }
     })
 }
 
@@ -295,7 +303,8 @@ pub fn quantize_row_iq2_xxs(x: &[f32], qw: &[f32], out: &mut Vec<u8>) {
                 let this_scale = 1.0 / id;
                 for k in 0..4 {
                     for i in 0..8 {
-                        let l = nearest_int(0.5 * (id * xval[8 * k + i] - 1.0)).clamp(0, K_MAX_Q - 1);
+                        let l =
+                            nearest_int(0.5 * (id * xval[8 * k + i] - 1.0)).clamp(0, K_MAX_Q - 1);
                         laux[8 * k + i] = l as i8;
                     }
                     let mut u = 0u16;
@@ -332,7 +341,8 @@ pub fn quantize_row_iq2_xxs(x: &[f32], qw: &[f32], out: &mut Vec<u8>) {
                 for k in 0..4 {
                     let mut u = 0u16;
                     for i in 0..8 {
-                        let l = nearest_int(0.5 * (id * xval[8 * k + i] - 1.0)).clamp(0, K_MAX_Q - 1);
+                        let l =
+                            nearest_int(0.5 * (id * xval[8 * k + i] - 1.0)).clamp(0, K_MAX_Q - 1);
                         u |= (l as u16) << (2 * i);
                     }
                     let gi = t.kmap[u as usize];
@@ -406,34 +416,44 @@ pub fn quantize_row_iq2_xxs(x: &[f32], qw: &[f32], out: &mut Vec<u8>) {
 /// llama.cpp legacy imatrix .dat: i32 n_entries, then per entry
 /// (i32 name_len, name, i32 ncall, i32 nval, f32 x nval). Values are used
 /// as relative weights, so the ncall normalization is irrelevant here.
-pub fn read_imatrix(path: &std::path::Path) -> Result<std::collections::HashMap<String, Vec<f32>>, String> {
+pub fn read_imatrix(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, Vec<f32>>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut at = 0usize;
     let i32_at = |at: &mut usize| -> Result<i32, String> {
         let v = i32::from_le_bytes(
-            bytes.get(*at..*at + 4).ok_or("imatrix truncated")?.try_into().unwrap(),
+            bytes
+                .get(*at..*at + 4)
+                .ok_or("imatrix truncated")?
+                .try_into()
+                .unwrap(),
         );
         *at += 4;
         Ok(v)
     };
     let n = i32_at(&mut at)?;
     if !(0..1_000_000).contains(&n) {
-        return Err(format!("implausible imatrix entry count {n} (gguf-format imatrix? use the legacy .dat)"));
+        return Err(format!(
+            "implausible imatrix entry count {n} (gguf-format imatrix? use the legacy .dat)"
+        ));
     }
     let mut map = std::collections::HashMap::with_capacity(n as usize);
     for _ in 0..n {
         let len = i32_at(&mut at)? as usize;
-        let name = String::from_utf8(
-            bytes.get(at..at + len).ok_or("imatrix truncated")?.to_vec(),
-        )
-        .map_err(|_| "imatrix name not utf-8")?;
+        let name = String::from_utf8(bytes.get(at..at + len).ok_or("imatrix truncated")?.to_vec())
+            .map_err(|_| "imatrix name not utf-8")?;
         at += len;
         let _ncall = i32_at(&mut at)?;
         let nval = i32_at(&mut at)? as usize;
         let mut vals = Vec::with_capacity(nval);
         for _ in 0..nval {
             let v = f32::from_le_bytes(
-                bytes.get(at..at + 4).ok_or("imatrix truncated")?.try_into().unwrap(),
+                bytes
+                    .get(at..at + 4)
+                    .ok_or("imatrix truncated")?
+                    .try_into()
+                    .unwrap(),
             );
             at += 4;
             vals.push(v);
@@ -496,7 +516,9 @@ mod tests {
         assert_eq!(grid.len(), 256);
         // ksigns: value = index | parity(index) << 7 (the CUDA kernel
         // computes this on the fly; regenerate rather than parse)
-        let ksigns: Vec<u8> = (0u8..128).map(|i| i | (((i.count_ones() & 1) as u8) << 7)).collect();
+        let ksigns: Vec<u8> = (0u8..128)
+            .map(|i| i | (((i.count_ones() & 1) as u8) << 7))
+            .collect();
         (grid, ksigns)
     }
 
@@ -530,7 +552,9 @@ mod tests {
             s ^= s << 17;
             (s as f64 / u64::MAX as f64) as f32 - 0.5
         };
-        let x: Vec<f32> = (0..QK_K * 8).map(|_| (0..4).map(|_| next()).sum::<f32>() * 0.5).collect();
+        let x: Vec<f32> = (0..QK_K * 8)
+            .map(|_| (0..4).map(|_| next()).sum::<f32>() * 0.5)
+            .collect();
         let qw = vec![1.0f32; x.len()];
         let mut enc = Vec::new();
         quantize_row_iq2_xxs(&x, &qw, &mut enc);
@@ -538,7 +562,11 @@ mod tests {
         let mut dec = Vec::new();
         dequant_iq2_xxs(&enc, &mut dec);
         let rms: f32 = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
-        let err: f32 = (x.iter().zip(&dec).map(|(a, b)| (a - b) * (a - b)).sum::<f32>()
+        let err: f32 = (x
+            .iter()
+            .zip(&dec)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>()
             / x.len() as f32)
             .sqrt();
         let rel = err / rms;

@@ -95,10 +95,8 @@ impl Qwen35Rt {
             if (il + 1) % s.full_attn_interval == 0 {
                 states.push(None);
             } else {
-                let sbytes = s.ssm_v_heads as usize
-                    * s.ssm_state as usize
-                    * s.ssm_state as usize
-                    * 4;
+                let sbytes =
+                    s.ssm_v_heads as usize * s.ssm_state as usize * s.ssm_state as usize * 4;
                 let cbytes = (s.ssm_conv_k as usize - 1) * conv_dim * 4;
                 let mut st = GdnState {
                     s: DeviceBuf::alloc(sbytes)?,
@@ -226,15 +224,48 @@ impl Qwen35Rt {
                 return Err("qwen35 layer expected".into());
             };
             let gdn = w.gdn.as_ref().ok_or("gdn weights missing")?;
-            kernels::qwen35_conv_batch(&mut self.conv_out, sq, &gdn.conv, &mut g.conv, conv_dim, s.ssm_conv_k, accept_n)?;
-            kernels::qwen35_split_qkv(&mut self.gq, &mut self.gk, &mut self.gv, &self.conv_out, accept_n, key_dim, value_dim)?;
-            kernels::qwen35_l2_norm(&mut self.gq, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
-            kernels::qwen35_l2_norm(&mut self.gk, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
+            kernels::qwen35_conv_batch(
+                &mut self.conv_out,
+                sq,
+                &gdn.conv,
+                &mut g.conv,
+                conv_dim,
+                s.ssm_conv_k,
+                accept_n,
+            )?;
+            kernels::qwen35_split_qkv(
+                &mut self.gq,
+                &mut self.gk,
+                &mut self.gv,
+                &self.conv_out,
+                accept_n,
+                key_dim,
+                value_dim,
+            )?;
+            kernels::qwen35_l2_norm(
+                &mut self.gq,
+                accept_n * s.ssm_k_heads,
+                s.ssm_state,
+                s.rms_eps,
+            )?;
+            kernels::qwen35_l2_norm(
+                &mut self.gk,
+                accept_n * s.ssm_k_heads,
+                s.ssm_state,
+                s.rms_eps,
+            )?;
             kernels::qwen35_gdn_batch(
-                &mut self.gdn_o, &mut g.s, &self.gq, &self.gk, &self.gv,
+                &mut self.gdn_o,
+                &mut g.s,
+                &self.gq,
+                &self.gk,
+                &self.gv,
                 df.stash_g[il].as_ref().unwrap(),
                 df.stash_beta[il].as_ref().unwrap(),
-                s.ssm_v_heads, s.ssm_k_heads, s.ssm_state, accept_n,
+                s.ssm_v_heads,
+                s.ssm_k_heads,
+                s.ssm_state,
+                accept_n,
             )?;
         }
         Ok(())
@@ -293,7 +324,7 @@ pub struct DraftModel {
     // scratch
     feat_in: DeviceBuf, // [RING_CAP][n_capture*n_embd] window gather
     feat: DeviceBuf,    // [RING_CAP][n_embd] fused features
-    h: DeviceBuf,    // [16][n_embd] block hidden
+    h: DeviceBuf,       // [16][n_embd] block hidden
     hn: DeviceBuf,
     q: DeviceBuf,    // [16][n_head*dim]
     kcat: DeviceBuf, // [RING_CAP+16][n_kv*dim]
@@ -363,9 +394,11 @@ impl DraftModel {
             }
         };
         let layer_ids: Vec<usize> = match g.arch_meta("dflash.target_layer_ids") {
-            Some(gguf::Value::Array(a)) => {
-                a.iter().filter_map(gguf::Value::as_u64).map(|v| v as usize).collect()
-            }
+            Some(gguf::Value::Array(a)) => a
+                .iter()
+                .filter_map(gguf::Value::as_u64)
+                .map(|v| v as usize)
+                .collect(),
             _ => return Err("draft gguf missing dflash.target_layer_ids".into()),
         };
         if block_size > T_MAX {
@@ -426,7 +459,13 @@ impl DraftModel {
 /* ---- forward ------------------------------------------------------------- */
 
 impl Model {
-    pub(super) fn forward_qwen35(&self, st: &mut State, tokens: &[u32], pos0: u32, rows: u32) -> Result<Option<Vec<f32>>> {
+    pub(super) fn forward_qwen35(
+        &self,
+        st: &mut State,
+        tokens: &[u32],
+        pos0: u32,
+        rows: u32,
+    ) -> Result<Option<Vec<f32>>> {
         if tokens.is_empty() {
             return Err("empty batch".into());
         }
@@ -442,7 +481,14 @@ impl Model {
         r
     }
 
-    fn forward_qwen35_inner(&self, st: &mut State, rt: &mut Qwen35Rt, tokens: &[u32], pos0: u32, rows: u32) -> Result<Option<Vec<f32>>> {
+    fn forward_qwen35_inner(
+        &self,
+        st: &mut State,
+        rt: &mut Qwen35Rt,
+        tokens: &[u32],
+        pos0: u32,
+        rows: u32,
+    ) -> Result<Option<Vec<f32>>> {
         let s = self.shape;
         if pos0 == 0 {
             rt.reset()?;
@@ -455,7 +501,14 @@ impl Model {
             let t = chunk.len() as u32;
             let ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
             st.tok.write(0, kernels::as_bytes(&ids))?;
-            kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
+            kernels::embed_q8_0(
+                &mut st.cur,
+                &self.token_embd,
+                &st.tok,
+                s.n_embd,
+                s.n_vocab,
+                t,
+            )?;
             for (il, l) in self.layers.iter().enumerate() {
                 self.eval_qwen35_layer(st, rt, il, l, pos, t)?;
             }
@@ -470,14 +523,35 @@ impl Model {
         }
         let k = rows;
         let row = s.n_embd as usize * 4;
-        kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (last_t - k) as usize * row, k as usize * row)?;
-        kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
+        kernels::copy_d2d(
+            &mut st.last_row,
+            0,
+            &st.cur,
+            (last_t - k) as usize * row,
+            k as usize * row,
+        )?;
+        kernels::rms_norm(
+            &mut st.normed,
+            &st.last_row,
+            &self.output_norm,
+            s.n_embd,
+            k,
+            s.rms_eps,
+        )?;
         self.head_logits(st, k)?;
         kernels::sync()?;
         Ok(Some(st.logits.read_f32(k as usize * s.n_vocab as usize)?))
     }
 
-    fn eval_qwen35_layer(&self, st: &mut State, rt: &mut Qwen35Rt, il: usize, l: &LayerW, pos: u32, t: u32) -> Result {
+    fn eval_qwen35_layer(
+        &self,
+        st: &mut State,
+        rt: &mut Qwen35Rt,
+        il: usize,
+        l: &LayerW,
+        pos: u32,
+        t: u32,
+    ) -> Result {
         let s = self.shape;
         let eps = s.rms_eps;
         let Attn::Qwen35(w) = &l.attn else {
@@ -512,9 +586,30 @@ impl Model {
             kernels::matmul_q8_0(&mut rt.qkv, &gdn.wqkv, &st.normed, s.n_embd, conv_dim, t)?;
             kernels::matmul_q8_0(&mut rt.z, &gdn.wz, &st.normed, s.n_embd, value_dim, t)?;
             // g/beta coefficients fully on-device (no host readbacks)
-            kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
+            kernels::matmul_f32(
+                &mut rt.g,
+                &gdn.alpha_w,
+                &st.normed,
+                s.n_embd,
+                s.ssm_v_heads,
+                t,
+            )?;
+            kernels::matmul_f32(
+                &mut rt.beta,
+                &gdn.beta_w,
+                &st.normed,
+                s.n_embd,
+                s.ssm_v_heads,
+                t,
+            )?;
+            kernels::qwen35_gdn_coeffs(
+                &mut rt.g,
+                &mut rt.beta,
+                &gdn.a,
+                &gdn.dt_bias,
+                t,
+                s.ssm_v_heads,
+            )?;
 
             // fast-rollback stash: the raw qkv rows + final coeffs are
             // all a state-only replay needs
@@ -529,51 +624,196 @@ impl Model {
                 }
             }
             let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
-            kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, conv_dim, s.ssm_conv_k, t)?;
+            kernels::qwen35_conv_batch(
+                &mut rt.conv_out,
+                &rt.qkv,
+                &gdn.conv,
+                &mut gs.conv,
+                conv_dim,
+                s.ssm_conv_k,
+                t,
+            )?;
             // split [q|k|v] rows into contiguous batch buffers, one launch
-            kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, key_dim, value_dim)?;
+            kernels::qwen35_split_qkv(
+                &mut rt.gq,
+                &mut rt.gk,
+                &mut rt.gv,
+                &rt.conv_out,
+                t,
+                key_dim,
+                value_dim,
+            )?;
             kernels::qwen35_l2_norm(&mut rt.gq, t * s.ssm_k_heads, s.ssm_state, eps)?;
             kernels::qwen35_l2_norm(&mut rt.gk, t * s.ssm_k_heads, s.ssm_state, eps)?;
             kernels::qwen35_gdn_batch(
-                &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
-                s.ssm_v_heads, s.ssm_k_heads, s.ssm_state, t,
+                &mut rt.gdn_o,
+                &mut gs.s,
+                &rt.gq,
+                &rt.gk,
+                &rt.gv,
+                &rt.g,
+                &rt.beta,
+                s.ssm_v_heads,
+                s.ssm_k_heads,
+                s.ssm_state,
+                t,
             )?;
-            kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
-            kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
-            kernels::matmul_q8_0(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, value_dim, s.n_embd, t)?;
+            kernels::gqa_head_rms_norm(
+                &mut rt.gdn_o,
+                Some(&gdn.ssm_norm),
+                t * s.ssm_v_heads,
+                s.ssm_state,
+                eps,
+            )?;
+            kernels::swiglu(
+                &mut rt.gdn_tmp,
+                &rt.z,
+                &rt.gdn_o,
+                t * value_dim,
+                0.0,
+                1.0,
+                0,
+            )?;
+            kernels::matmul_q8_0(
+                &mut st.attn_out,
+                &gdn.ssm_out,
+                &rt.gdn_tmp,
+                value_dim,
+                s.n_embd,
+                t,
+            )?;
         } else if let Some(attn) = &w.attn {
             // ---- sigmoid-gated full attention (partial neox rope)
             let hd = s.head_dim;
-            kernels::matmul_q8_0(&mut rt.qfull, &attn.wq, &st.normed, s.n_embd, 2 * s.n_head * hd, t)?;
+            kernels::matmul_q8_0(
+                &mut rt.qfull,
+                &attn.wq,
+                &st.normed,
+                s.n_embd,
+                2 * s.n_head * hd,
+                t,
+            )?;
             // per-token rows are contiguous: treat (token, head) as one
             // flat head axis for the strided split
             kernels::qwen35_split_gate(&mut st.q, &mut rt.gate, &rt.qfull, t * s.n_head, hd)?;
-            kernels::matmul_q8_0(&mut st.k, &attn.wk, &st.normed, s.n_embd, s.n_head_kv * hd, t)?;
-            kernels::matmul_q8_0(&mut st.v, &attn.wv, &st.normed, s.n_embd, s.n_head_kv * hd, t)?;
+            kernels::matmul_q8_0(
+                &mut st.k,
+                &attn.wk,
+                &st.normed,
+                s.n_embd,
+                s.n_head_kv * hd,
+                t,
+            )?;
+            kernels::matmul_q8_0(
+                &mut st.v,
+                &attn.wv,
+                &st.normed,
+                s.n_embd,
+                s.n_head_kv * hd,
+                t,
+            )?;
             kernels::gqa_head_rms_norm(&mut st.q, Some(&attn.q_norm), t * s.n_head, hd, eps)?;
             kernels::gqa_head_rms_norm(&mut st.k, Some(&attn.k_norm), t * s.n_head_kv, hd, eps)?;
-            kernels::gqa_rope(&mut st.q, t, s.n_head, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-            kernels::gqa_rope(&mut st.k, t, s.n_head_kv, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-            kernels::gqa_kv_append(&mut st.kcache[il], &st.k, t, s.n_head_kv, hd, st.ctx, pos, 0)?;
-            kernels::gqa_kv_append(&mut st.vcache[il], &st.v, t, s.n_head_kv, hd, st.ctx, pos, 0)?;
+            kernels::gqa_rope(
+                &mut st.q,
+                t,
+                s.n_head,
+                hd,
+                s.rot_dim,
+                pos,
+                s.rope_freq_base,
+                None,
+            )?;
+            kernels::gqa_rope(
+                &mut st.k,
+                t,
+                s.n_head_kv,
+                hd,
+                s.rot_dim,
+                pos,
+                s.rope_freq_base,
+                None,
+            )?;
+            kernels::gqa_kv_append(
+                &mut st.kcache[il],
+                &st.k,
+                t,
+                s.n_head_kv,
+                hd,
+                st.ctx,
+                pos,
+                0,
+            )?;
+            kernels::gqa_kv_append(
+                &mut st.vcache[il],
+                &st.v,
+                t,
+                s.n_head_kv,
+                hd,
+                st.ctx,
+                pos,
+                0,
+            )?;
             kernels::gqa_attention_rel(
-                &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
-                t, s.n_head, s.n_head_kv, hd, st.ctx, pos,
-                1.0 / (hd as f32).sqrt(), 0, None, 0, 0,
+                &mut st.heads,
+                &st.q,
+                &st.kcache[il],
+                &st.vcache[il],
+                t,
+                s.n_head,
+                s.n_head_kv,
+                hd,
+                st.ctx,
+                pos,
+                1.0 / (hd as f32).sqrt(),
+                0,
+                None,
+                0,
+                0,
             )?;
             kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * s.n_head * hd)?;
-            kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &st.heads, s.n_head * hd, s.n_embd, t)?;
+            kernels::matmul_q8_0(
+                &mut st.attn_out,
+                &l.attn_output,
+                &st.heads,
+                s.n_head * hd,
+                s.n_embd,
+                t,
+            )?;
         } else {
             return Err("qwen35 layer with neither attn nor gdn".into());
         }
         kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, t * s.n_embd)?;
 
         // ---- MoE (pre-norm residual)
-        kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
-        let Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
+        kernels::rms_norm(
+            &mut st.normed,
+            &st.after_attn,
+            &l.ffn_norm,
+            s.n_embd,
+            t,
+            eps,
+        )?;
+        let Ffn::Moe {
+            gate_inp,
+            probs_b,
+            shexp,
+            gate_exps,
+            up_exps,
+            down_exps,
+            ..
+        } = &l.ffn
+        else {
             return Err("qwen35 layer without MoE ffn".into());
         };
-        kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, t)?;
+        kernels::matmul_f32(
+            &mut st.router_logits,
+            gate_inp,
+            &st.normed,
+            s.n_embd,
+            s.n_expert,
+            t,
+        )?;
         kernels::router_select(
             &mut st.router_selected,
             &mut st.router_weights,
@@ -589,7 +829,15 @@ impl Model {
         if let Some((sg, su, sd)) = shexp {
             kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, s.n_ff_exp, t)?;
             kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, s.n_ff_exp, t)?;
-            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
+            kernels::swiglu(
+                &mut st.ffn_mid,
+                &st.gate_act,
+                &st.up_act,
+                t * s.n_ff_exp,
+                0.0,
+                1.0,
+                0,
+            )?;
             kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, s.n_ff_exp, s.n_embd, t)?;
             kernels::matmul_f32(&mut rt.shg, &w.shexp_gate, &st.normed, s.n_embd, 1, t)?;
             kernels::qwen35_row_sigmoid_scale(&mut st.shared_out, &rt.shg, t, s.n_embd)?;
@@ -598,7 +846,9 @@ impl Model {
         }
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
         kernels::sync()?;
-        let selected = st.router_selected.read_i32((t * s.n_expert_used) as usize)?;
+        let selected = st
+            .router_selected
+            .read_i32((t * s.n_expert_used) as usize)?;
         self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, t)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
@@ -611,7 +861,13 @@ impl Model {
 impl Model {
     /// One draft forward: [last_tok, MASK x bs-1] + the feature window
     /// -> bs candidate ids (row 0 overwritten with last_tok).
-    fn dflash_draft(&self, st: &mut State, d: &mut DraftModel, committed: u32, last_tok: u32) -> Result<Vec<u32>> {
+    fn dflash_draft(
+        &self,
+        st: &mut State,
+        d: &mut DraftModel,
+        committed: u32,
+        last_tok: u32,
+    ) -> Result<Vec<u32>> {
         let s = self.shape;
         let bs = d.block_size;
         let w_eff = (committed as usize).min(RING_CAP);
@@ -634,12 +890,26 @@ impl Model {
         let mut ids: Vec<i32> = vec![d.mask_id as i32; bs];
         ids[0] = last_tok as i32;
         st.tok.write(0, kernels::as_bytes(&ids))?;
-        kernels::embed_q8_0(&mut d.h, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, bs as u32)?;
+        kernels::embed_q8_0(
+            &mut d.h,
+            &self.token_embd,
+            &st.tok,
+            s.n_embd,
+            s.n_vocab,
+            bs as u32,
+        )?;
 
         let eps = s.rms_eps;
         let n_cap = d.layer_ids.len() as u32;
         // fuse: fc @ features -> rms(hidden_norm)
-        kernels::matmul_q8_0(&mut d.feat, &d.fc, &d.feat_in, n_cap * s.n_embd, s.n_embd, w_eff as u32)?;
+        kernels::matmul_q8_0(
+            &mut d.feat,
+            &d.fc,
+            &d.feat_in,
+            n_cap * s.n_embd,
+            s.n_embd,
+            w_eff as u32,
+        )?;
         kernels::rms_norm_inplace(&mut d.feat, &d.hidden_norm, s.n_embd, w_eff as u32, eps)?;
 
         let kv_dim = d.n_kv * d.head_dim;
@@ -649,20 +919,66 @@ impl Model {
             kernels::rms_norm(&mut d.hn, &d.h, &l.attn_norm, s.n_embd, bs as u32, eps)?;
             // K/V: context rows from features, block rows from hn
             kernels::matmul_q8_0(&mut d.kcat, &l.wk, &d.feat, s.n_embd, kv_dim, w_eff as u32)?;
-            kernels::matmul_q8_0_off(&mut d.kcat, w_eff * kv_dim as usize * 4, &l.wk, 0, &d.hn, 0, s.n_embd, kv_dim, bs as u32)?;
+            kernels::matmul_q8_0_off(
+                &mut d.kcat,
+                w_eff * kv_dim as usize * 4,
+                &l.wk,
+                0,
+                &d.hn,
+                0,
+                s.n_embd,
+                kv_dim,
+                bs as u32,
+            )?;
             kernels::matmul_q8_0(&mut d.vcat, &l.wv, &d.feat, s.n_embd, kv_dim, w_eff as u32)?;
-            kernels::matmul_q8_0_off(&mut d.vcat, w_eff * kv_dim as usize * 4, &l.wv, 0, &d.hn, 0, s.n_embd, kv_dim, bs as u32)?;
-            kernels::gqa_head_rms_norm(&mut d.kcat, Some(&l.k_norm), total_k * d.n_kv, d.head_dim, eps)?;
+            kernels::matmul_q8_0_off(
+                &mut d.vcat,
+                w_eff * kv_dim as usize * 4,
+                &l.wv,
+                0,
+                &d.hn,
+                0,
+                s.n_embd,
+                kv_dim,
+                bs as u32,
+            )?;
+            kernels::gqa_head_rms_norm(
+                &mut d.kcat,
+                Some(&l.k_norm),
+                total_k * d.n_kv,
+                d.head_dim,
+                eps,
+            )?;
             // Q from the block only
             kernels::matmul_q8_0(&mut d.q, &l.wq, &d.hn, s.n_embd, q_dim, bs as u32)?;
-            kernels::gqa_head_rms_norm(&mut d.q, Some(&l.q_norm), bs as u32 * d.n_head, d.head_dim, eps)?;
+            kernels::gqa_head_rms_norm(
+                &mut d.q,
+                Some(&l.q_norm),
+                bs as u32 * d.n_head,
+                d.head_dim,
+                eps,
+            )?;
             // plain neox rope, full head, rebased positions
             kernels::qwen35_rope_yarn(&mut d.kcat, total_k, d.n_kv, d.head_dim, 0, &d.rope)?;
-            kernels::qwen35_rope_yarn(&mut d.q, bs as u32, d.n_head, d.head_dim, w_eff as u32, &d.rope)?;
+            kernels::qwen35_rope_yarn(
+                &mut d.q,
+                bs as u32,
+                d.n_head,
+                d.head_dim,
+                w_eff as u32,
+                &d.rope,
+            )?;
             // non-causal attention over all context + block rows
             kernels::qwen35_draft_attn(
-                &mut d.attn, &d.q, &d.kcat, &d.vcat,
-                bs as u32, total_k, d.n_head, d.n_kv, d.head_dim,
+                &mut d.attn,
+                &d.q,
+                &d.kcat,
+                &d.vcat,
+                bs as u32,
+                total_k,
+                d.n_head,
+                d.n_kv,
+                d.head_dim,
                 1.0 / (d.head_dim as f32).sqrt(),
             )?;
             kernels::matmul_q8_0(&mut d.tmp, &l.wo, &d.attn, q_dim, s.n_embd, bs as u32)?;
@@ -681,7 +997,9 @@ impl Model {
         kernels::sync()?;
         let logits = st.logits.read_f32(bs * s.n_vocab as usize)?;
         let v = s.n_vocab as usize;
-        let mut out: Vec<u32> = (0..bs).map(|i| argmax(&logits[i * v..(i + 1) * v])).collect();
+        let mut out: Vec<u32> = (0..bs)
+            .map(|i| argmax(&logits[i * v..(i + 1) * v]))
+            .collect();
         out[0] = last_tok;
         Ok(out)
     }
@@ -735,12 +1053,19 @@ pub fn generate_dflash(
         let all = model
             .forward_rows(st, &draft_tok, committed, bs as u32)?
             .ok_or("no verify logits")?;
-        st.qwen35.as_mut().unwrap().dflash.as_mut().unwrap().capture_gdn = false;
+        st.qwen35
+            .as_mut()
+            .unwrap()
+            .dflash
+            .as_mut()
+            .unwrap()
+            .capture_gdn = false;
         let t_verify = t0.elapsed();
-        let target_tok: Vec<u32> =
-            (0..bs).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
+        let target_tok: Vec<u32> = (0..bs).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
         if std::env::var_os("PULSAR_DFLASH_DEBUG").is_some() {
-            eprintln!("dflash round @{committed}:\n  draft  {draft_tok:?}\n  target {target_tok:?}");
+            eprintln!(
+                "dflash round @{committed}:\n  draft  {draft_tok:?}\n  target {target_tok:?}"
+            );
         }
         // 3. accept the matching prefix (row i predicts the token after
         //    draft_tok[i]; draft_tok[0] = last_tok is always accepted)

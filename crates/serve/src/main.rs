@@ -125,9 +125,8 @@ fn run() -> engine::Result {
         })();
         if let Err(e) = result {
             eprintln!("pulsar-serve: request failed: {e}");
-            let _ = stream.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
-            );
+            let _ = stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n");
         }
     }
     Ok(())
@@ -193,7 +192,10 @@ fn handle_chat(
     let messages = req["messages"]
         .as_array()
         .ok_or("chat request needs a messages array")?;
-    let temp = req["temperature"].as_f64().map(|v| v as f32).unwrap_or(default_temp);
+    let temp = req["temperature"]
+        .as_f64()
+        .map(|v| v as f32)
+        .unwrap_or(default_temp);
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
     let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(1024) as usize;
@@ -244,7 +246,10 @@ fn handle_chat(
                         "id": id, "object": "chat.completion.chunk", "model": model_name,
                         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
                     });
-                    if write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush()).is_err() {
+                    if write!(stream, "data: {chunk}\n\n")
+                        .and_then(|_| stream.flush())
+                        .is_err()
+                    {
                         send_err = Some(());
                     }
                 }
@@ -256,7 +261,10 @@ fn handle_chat(
         });
         let _ = write!(stream, "data: {fin}\n\ndata: [DONE]\n\n");
         let _ = stream.flush();
-        eprintln!("pulsar-serve: {id}: {} prompt + {n_out} completion tokens (streamed)", prompt.len());
+        eprintln!(
+            "pulsar-serve: {id}: {} prompt + {n_out} completion tokens (streamed)",
+            prompt.len()
+        );
     } else {
         let mut out: Vec<u8> = Vec::new();
         let mut n_out = 0usize;
@@ -286,7 +294,10 @@ fn handle_chat(
                 "total_tokens": prompt.len() + n_out,
             },
         });
-        eprintln!("pulsar-serve: {id}: {} prompt + {n_out} completion tokens", prompt.len());
+        eprintln!(
+            "pulsar-serve: {id}: {} prompt + {n_out} completion tokens",
+            prompt.len()
+        );
         respond_json(stream, 200, &json)?;
     }
     Ok(())

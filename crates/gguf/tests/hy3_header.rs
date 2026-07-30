@@ -17,15 +17,26 @@ fn parses_hy3_production_header() {
     let g = Gguf::parse(&fixture()).expect("parse");
 
     assert_eq!(g.architecture(), Some("hy-v3"));
-    assert_eq!(g.arch_meta("block_count").and_then(|v| v.as_u64()), Some(81));
-    assert_eq!(g.arch_meta("expert_count").and_then(|v| v.as_u64()), Some(192));
-    assert_eq!(g.arch_meta("expert_used_count").and_then(|v| v.as_u64()), Some(8));
+    assert_eq!(
+        g.arch_meta("block_count").and_then(|v| v.as_u64()),
+        Some(81)
+    );
+    assert_eq!(
+        g.arch_meta("expert_count").and_then(|v| v.as_u64()),
+        Some(192)
+    );
+    assert_eq!(
+        g.arch_meta("expert_used_count").and_then(|v| v.as_u64()),
+        Some(8)
+    );
 
     // routed experts on the streaming path: uniform IQ2_XXS, layers 1..=79
     let gate1 = g.tensor("blk.1.ffn_gate_exps.weight").expect("blk.1 gate");
     assert_eq!(gate1.ty, TensorType::IQ2XXS);
     // the MTP draft layer rides at Q2_K (imatrix never covers it)
-    let gate80 = g.tensor("blk.80.ffn_gate_exps.weight").expect("blk.80 gate");
+    let gate80 = g
+        .tensor("blk.80.ffn_gate_exps.weight")
+        .expect("blk.80 gate");
     assert_eq!(gate80.ty, TensorType::Q2K);
     // resident set at Q8_0
     let q0 = g.tensor("blk.0.attn_q.weight").expect("attn_q");
@@ -53,5 +64,9 @@ fn parses_hy3_production_header() {
     }
 
     assert!(g.data_offset % g.alignment == 0);
-    assert!(g.tensors.len() > 900, "expected ~1k tensors, got {}", g.tensors.len());
+    assert!(
+        g.tensors.len() > 900,
+        "expected ~1k tensors, got {}",
+        g.tensors.len()
+    );
 }

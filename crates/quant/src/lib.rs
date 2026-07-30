@@ -86,13 +86,22 @@ pub fn row_to_f32(ty: gguf::TensorType, raw: &[u8], out: &mut Vec<f32>) -> Resul
     out.clear();
     match ty {
         gguf::TensorType::F32 => {
-            out.extend(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+            out.extend(
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+            );
         }
         gguf::TensorType::F16 => {
-            out.extend(raw.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))));
+            out.extend(
+                raw.chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))),
+            );
         }
         gguf::TensorType::BF16 => {
-            out.extend(raw.chunks_exact(2).map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))));
+            out.extend(
+                raw.chunks_exact(2)
+                    .map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))),
+            );
         }
         other => return Err(format!("unsupported source type {other:?}")),
     }
@@ -285,7 +294,9 @@ pub fn quantize_row_q2_k(x: &[f32], out: &mut Vec<u8>) {
                 weights[l] = xs[l].abs();
             }
             let mut m = 0f32;
-            let s = make_qkx2_quants(16, 3, xs, &weights, &mut ls, &mut m, &mut laux, -0.5, 0.1, 15, true);
+            let s = make_qkx2_quants(
+                16, 3, xs, &weights, &mut ls, &mut m, &mut laux, -0.5, 0.1, 15, true,
+            );
             lall[16 * j..16 * j + 16].copy_from_slice(&ls);
             scales[j] = s;
             mins[j] = m;
@@ -531,14 +542,30 @@ fn qkx2_block_scales(
         let xs = &blk[sub * j..sub * (j + 1)];
         qkx_weights_av(xs, &mut weights[..sub]);
         let mut m = 0f32;
-        let s = make_qkx2_quants(sub, nmax, xs, &weights[..sub], &mut ls[..sub], &mut m, &mut laux[..sub], rmin, rdelta, nstep, false);
+        let s = make_qkx2_quants(
+            sub,
+            nmax,
+            xs,
+            &weights[..sub],
+            &mut ls[..sub],
+            &mut m,
+            &mut laux[..sub],
+            rmin,
+            rdelta,
+            nstep,
+            false,
+        );
         lall[sub * j..sub * (j + 1)].copy_from_slice(&ls[..sub]);
         scales[j] = s;
         mins[j] = m;
         max_scale = max_scale.max(s);
         max_min = max_min.max(m);
     }
-    let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+    let inv_scale = if max_scale > 0.0 {
+        63.0 / max_scale
+    } else {
+        0.0
+    };
     let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
     let mut sc_q = [0u8; 8];
     let mut mn_q = [0u8; 8];
@@ -546,12 +573,24 @@ fn qkx2_block_scales(
         sc_q[j] = nearest_int(inv_scale * scales[j]).clamp(0, 63) as u8;
         mn_q[j] = nearest_int(inv_min * mins[j]).clamp(0, 63) as u8;
     }
-    let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
+    let d = if max_scale > 0.0 {
+        max_scale / 63.0
+    } else {
+        0.0
+    };
     let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
     (sc_q, mn_q, d, dmin)
 }
 
-fn requant_sub32(blk: &[f32], d: f32, dmin: f32, sc_q: &[u8; 8], mn_q: &[u8; 8], nmax: i32, lall: &mut [u8; QK_K]) {
+fn requant_sub32(
+    blk: &[f32],
+    d: f32,
+    dmin: f32,
+    sc_q: &[u8; 8],
+    mn_q: &[u8; 8],
+    nmax: i32,
+    lall: &mut [u8; QK_K],
+) {
     let dq = f16_to_f32(f32_to_f16(d));
     let mq = f16_to_f32(f32_to_f16(dmin));
     for j in 0..8 {
@@ -873,7 +912,9 @@ mod tests {
             s ^= s << 17;
             (s as f64 / u64::MAX as f64) as f32 - 0.5
         };
-        (0..n).map(|_| (0..4).map(|_| next()).sum::<f32>() * 0.5).collect()
+        (0..n)
+            .map(|_| (0..4).map(|_| next()).sum::<f32>() * 0.5)
+            .collect()
     }
 
     fn rmse(a: &[f32], b: &[f32]) -> f32 {

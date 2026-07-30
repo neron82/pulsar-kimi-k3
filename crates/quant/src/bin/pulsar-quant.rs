@@ -36,7 +36,11 @@ fn parse_type(s: &str) -> Result<TensorType, String> {
         "iq2_xxs" => TensorType::IQ2XXS,
         "f16" => TensorType::F16,
         "f32" => TensorType::F32,
-        other => return Err(format!("unknown target type {other} (stage 1: q8_0 q2_k..q6_k f16 f32)")),
+        other => {
+            return Err(format!(
+                "unknown target type {other} (stage 1: q8_0 q2_k..q6_k f16 f32)"
+            ))
+        }
     })
 }
 
@@ -72,9 +76,8 @@ fn ensure_shard(path: &std::path::Path, fetch_cmd: Option<&str>) -> Result<(), S
     if path.exists() {
         return Ok(());
     }
-    let cmd = fetch_cmd.ok_or_else(|| {
-        format!("{} missing and no --fetch-cmd given", path.display())
-    })?;
+    let cmd =
+        fetch_cmd.ok_or_else(|| format!("{} missing and no --fetch-cmd given", path.display()))?;
     let cmd = cmd.replace("{}", &path.display().to_string());
     eprintln!("pulsar-quant: fetching {} ({cmd})", path.display());
     let st = std::process::Command::new("sh")
@@ -83,10 +86,16 @@ fn ensure_shard(path: &std::path::Path, fetch_cmd: Option<&str>) -> Result<(), S
         .status()
         .map_err(|e| format!("fetch: {e}"))?;
     if !st.success() {
-        return Err(format!("fetch command failed ({st}) for {}", path.display()));
+        return Err(format!(
+            "fetch command failed ({st}) for {}",
+            path.display()
+        ));
     }
     if !path.exists() {
-        return Err(format!("fetch command succeeded but {} still missing", path.display()));
+        return Err(format!(
+            "fetch command succeeded but {} still missing",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -174,7 +183,9 @@ fn run() -> Result<(), String> {
             "-o" => output = Some(need("-o")?),
             "--map" => {
                 for part in need("--map")?.split(',') {
-                    let (pat, ty) = part.split_once('=').ok_or(format!("bad --map entry {part}"))?;
+                    let (pat, ty) = part
+                        .split_once('=')
+                        .ok_or(format!("bad --map entry {part}"))?;
                     maps.push((pat.to_string(), parse_type(ty)?));
                 }
             }
@@ -183,7 +194,11 @@ fn run() -> Result<(), String> {
             "--fetch-cmd" => fetch_cmd = Some(need("--fetch-cmd")?),
             "--delete-shards" => delete_shards = true,
             "--header-reserve" => {
-                header_reserve_mb = Some(need("--header-reserve")?.parse::<u64>().map_err(|e| e.to_string())?)
+                header_reserve_mb = Some(
+                    need("--header-reserve")?
+                        .parse::<u64>()
+                        .map_err(|e| e.to_string())?,
+                )
             }
             other => return Err(format!("unknown arg {other}")),
         }
@@ -236,8 +251,12 @@ fn run() -> Result<(), String> {
             .unwrap_or(default_ty);
         let row = dims[0];
         let ok = match want {
-            TensorType::Q2K | TensorType::Q3K | TensorType::Q4K | TensorType::Q5K
-            | TensorType::Q6K | TensorType::IQ2XXS => row % 256 == 0,
+            TensorType::Q2K
+            | TensorType::Q3K
+            | TensorType::Q4K
+            | TensorType::Q5K
+            | TensorType::Q6K
+            | TensorType::IQ2XXS => row % 256 == 0,
             TensorType::Q8_0 => row % 32 == 0,
             _ => true,
         };
@@ -255,9 +274,12 @@ fn run() -> Result<(), String> {
     // ---- output: data first at the reserve, header patched in at the end
     let f = File::create(&output).map_err(|e| e.to_string())?;
     let mut w = BufWriter::with_capacity(8 << 20, f);
-    w.seek(SeekFrom::Start(data_start)).map_err(|e| e.to_string())?;
+    w.seek(SeekFrom::Start(data_start))
+        .map_err(|e| e.to_string())?;
 
-    let nthread = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let nthread = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
     let t0 = std::time::Instant::now();
     let mut out_tensors: Vec<OutTensor> = Vec::with_capacity(n_total as usize);
     let mut out_off = 0u64;
@@ -292,7 +314,12 @@ fn run() -> Result<(), String> {
         for t in &g.tensors {
             match t.ty {
                 TensorType::F32 | TensorType::F16 | TensorType::BF16 => {}
-                other => return Err(format!("{}: source type {other:?} is not a float type", t.name)),
+                other => {
+                    return Err(format!(
+                        "{}: source type {other:?} is not a float type",
+                        t.name
+                    ))
+                }
             }
             let mut ty = pick(&t.name, &t.dims);
             if ty == TensorType::IQ2XXS {
@@ -303,7 +330,10 @@ fn run() -> Result<(), String> {
                     .and_then(|m| m.get(&t.name))
                     .is_some_and(|e| e.len() as u64 == row || e.len() as u64 == row * n_exp);
                 if !ok {
-                    eprintln!("pulsar-quant: {} has no usable imatrix entry, falling back to q2_k", t.name);
+                    eprintln!(
+                        "pulsar-quant: {} has no usable imatrix entry, falling back to q2_k",
+                        t.name
+                    );
                     ty = TensorType::Q2K;
                 }
             }
@@ -364,8 +394,14 @@ fn run() -> Result<(), String> {
             }
             let end = out_off + nbytes;
             let next = end.next_multiple_of(align);
-            w.write_all(&vec![0u8; (next - end) as usize]).map_err(|e| e.to_string())?;
-            out_tensors.push(OutTensor { name: t.name.clone(), dims: t.dims.clone(), ty, out_off });
+            w.write_all(&vec![0u8; (next - end) as usize])
+                .map_err(|e| e.to_string())?;
+            out_tensors.push(OutTensor {
+                name: t.name.clone(),
+                dims: t.dims.clone(),
+                ty,
+                out_off,
+            });
             out_off = next;
             written += nbytes;
             *by_type.entry(format!("{:?}", ty)).or_default() += nbytes;

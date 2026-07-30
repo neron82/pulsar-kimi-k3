@@ -103,8 +103,18 @@ pub fn vec_dot_iq2_xxs_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
         let q8 = &x.qs[ibl * QK_K..(ibl + 1) * QK_K];
         let mut bsum = 0i32;
         for ib32 in 0..QK_K / 32 {
-            let aux0 = u32::from_le_bytes([blk[2 + 8 * ib32], blk[3 + 8 * ib32], blk[4 + 8 * ib32], blk[5 + 8 * ib32]]);
-            let aux1 = u32::from_le_bytes([blk[6 + 8 * ib32], blk[7 + 8 * ib32], blk[8 + 8 * ib32], blk[9 + 8 * ib32]]);
+            let aux0 = u32::from_le_bytes([
+                blk[2 + 8 * ib32],
+                blk[3 + 8 * ib32],
+                blk[4 + 8 * ib32],
+                blk[5 + 8 * ib32],
+            ]);
+            let aux1 = u32::from_le_bytes([
+                blk[6 + 8 * ib32],
+                blk[7 + 8 * ib32],
+                blk[8 + 8 * ib32],
+                blk[9 + 8 * ib32],
+            ]);
             let ls = (2 * (aux1 >> 28) + 1) as i32;
             let mut sumi = 0i32;
             for k in 0..4 {
@@ -112,7 +122,11 @@ pub fn vec_dot_iq2_xxs_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
                 let sm = sign_mask((aux1 >> (7 * k)) & 127);
                 let q8k = &q8[ib32 * 32 + 8 * k..ib32 * 32 + 8 * k + 8];
                 for i in 0..8 {
-                    let w = if (sm >> i) & 1 == 1 { -(g[i] as i8 as i32) } else { g[i] as i8 as i32 };
+                    let w = if (sm >> i) & 1 == 1 {
+                        -(g[i] as i8 as i32)
+                    } else {
+                        g[i] as i8 as i32
+                    };
                     sumi += w * q8k[i] as i32;
                 }
             }
@@ -372,7 +386,11 @@ mod avx2 {
             let mut w = 0u64;
             let mut i = 0;
             while i < 8 {
-                w |= (if (full >> i) & 1 == 1 { 0xFFu64 } else { 0x01u64 }) << (8 * i);
+                w |= (if (full >> i) & 1 == 1 {
+                    0xFFu64
+                } else {
+                    0x01u64
+                }) << (8 * i);
                 i += 1;
             }
             t[m as usize] = w;
@@ -400,7 +418,10 @@ mod avx2 {
             for g in 0..8 {
                 let sc = *blk.add(66 + g);
                 let q: [u16; 4] = std::array::from_fn(|j| {
-                    u16::from_le_bytes([*blk.add(2 + 2 * (4 * g + j)), *blk.add(3 + 2 * (4 * g + j))])
+                    u16::from_le_bytes([
+                        *blk.add(2 + 2 * (4 * g + j)),
+                        *blk.add(3 + 2 * (4 * g + j)),
+                    ])
                 });
                 let gv = _mm256_set_epi64x(
                     grid[(q[3] & 511) as usize] as i64,
@@ -423,7 +444,10 @@ mod avx2 {
                 );
                 acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d32, lsv));
             }
-            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(
+                _mm256_castsi256_si128(acc),
+                _mm256_extracti128_si256(acc, 1),
+            );
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
             let bsum = _mm_cvtsi128_si32(s);
@@ -455,11 +479,16 @@ mod avx2 {
                     *blk.add(69 + 4 * g),
                 ]);
                 let db = xd * (0.5 + (aux >> 28) as f32) * 0.5;
-                let qg: [u32; 8] =
-                    std::array::from_fn(|k| grid[*blk.add(2 + 8 * g + k) as usize]);
+                let qg: [u32; 8] = std::array::from_fn(|k| grid[*blk.add(2 + 8 * g + k) as usize]);
                 let gv = _mm256_set_epi32(
-                    qg[7] as i32, qg[6] as i32, qg[5] as i32, qg[4] as i32,
-                    qg[3] as i32, qg[2] as i32, qg[1] as i32, qg[0] as i32,
+                    qg[7] as i32,
+                    qg[6] as i32,
+                    qg[5] as i32,
+                    qg[4] as i32,
+                    qg[3] as i32,
+                    qg[2] as i32,
+                    qg[1] as i32,
+                    qg[0] as i32,
                 );
                 let sv = _mm256_set_epi64x(
                     KSIGNS64[((aux >> 21) & 127) as usize] as i64,
@@ -511,10 +540,8 @@ mod avx2 {
                 let q3v = _mm256_loadu_si256(blk.add(32 + 32 * k as usize) as *const __m256i);
                 for shift in 0..4i32 {
                     let bit = 4 * k + shift;
-                    let lo = _mm256_and_si256(
-                        _mm256_srl_epi16(q3v, _mm_cvtsi32_si128(2 * shift)),
-                        low2,
-                    );
+                    let lo =
+                        _mm256_and_si256(_mm256_srl_epi16(q3v, _mm_cvtsi32_si128(2 * shift)), low2);
                     let hq = _mm256_slli_epi16(
                         _mm256_and_si256(_mm256_srl_epi16(hmv, _mm_cvtsi32_si128(bit)), one),
                         2,
@@ -532,7 +559,10 @@ mod avx2 {
                     acc = _mm256_add_epi32(acc, _mm256_madd_epi16(d16, scv));
                 }
             }
-            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(
+                _mm256_castsi256_si128(acc),
+                _mm256_extracti128_si256(acc, 1),
+            );
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
             let isum = _mm_cvtsi128_si32(s) - 4 * corr;
@@ -572,7 +602,10 @@ mod avx2 {
                 acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d2, _mm256_set1_epi32(sc2)));
                 msum += m1 * (bs[4 * j] + bs[4 * j + 1]) + m2 * (bs[4 * j + 2] + bs[4 * j + 3]);
             }
-            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(
+                _mm256_castsi256_si128(acc),
+                _mm256_extracti128_si256(acc, 1),
+            );
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
             let isum = _mm_cvtsi128_si32(s);
@@ -607,10 +640,8 @@ mod avx2 {
             for k in 0..2 {
                 let q2v = _mm256_loadu_si256(blk.add(16 + 32 * k) as *const __m256i);
                 for shift in 0..4i32 {
-                    let q = _mm256_and_si256(
-                        _mm256_srl_epi16(q2v, _mm_cvtsi32_si128(2 * shift)),
-                        low2,
-                    );
+                    let q =
+                        _mm256_and_si256(_mm256_srl_epi16(q2v, _mm_cvtsi32_si128(2 * shift)), low2);
                     let q8v =
                         _mm256_loadu_si256(q8.add(128 * k + 32 * shift as usize) as *const __m256i);
                     let d16 = _mm256_maddubs_epi16(q, q8v);
@@ -622,7 +653,10 @@ mod avx2 {
                     acc = _mm256_add_epi32(acc, _mm256_madd_epi16(d16, scv));
                 }
             }
-            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(
+                _mm256_castsi256_si128(acc),
+                _mm256_extracti128_si256(acc, 1),
+            );
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
             let isum = _mm_cvtsi128_si32(s);
@@ -666,7 +700,10 @@ mod avx2 {
                 let d32 = _mm256_madd_epi16(d16, ones);
                 acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d32, _mm256_set1_epi32(ls)));
             }
-            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(
+                _mm256_castsi256_si128(acc),
+                _mm256_extracti128_si256(acc, 1),
+            );
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
             let bsum = _mm_cvtsi128_si32(s);
@@ -736,8 +773,18 @@ pub fn dequant_row_iq2_xxs(row: &[u8], n: usize, out: &mut Vec<f32>) {
         let blk = &row[ibl * IQ2_XXS_BLOCK_BYTES..(ibl + 1) * IQ2_XXS_BLOCK_BYTES];
         let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         for ib32 in 0..QK_K / 32 {
-            let aux0 = u32::from_le_bytes([blk[2 + 8 * ib32], blk[3 + 8 * ib32], blk[4 + 8 * ib32], blk[5 + 8 * ib32]]);
-            let aux1 = u32::from_le_bytes([blk[6 + 8 * ib32], blk[7 + 8 * ib32], blk[8 + 8 * ib32], blk[9 + 8 * ib32]]);
+            let aux0 = u32::from_le_bytes([
+                blk[2 + 8 * ib32],
+                blk[3 + 8 * ib32],
+                blk[4 + 8 * ib32],
+                blk[5 + 8 * ib32],
+            ]);
+            let aux1 = u32::from_le_bytes([
+                blk[6 + 8 * ib32],
+                blk[7 + 8 * ib32],
+                blk[8 + 8 * ib32],
+                blk[9 + 8 * ib32],
+            ]);
             let db = 0.125 * xd * (2 * (aux1 >> 28) + 1) as f32;
             for k in 0..4 {
                 let g = t.grid[((aux0 >> (8 * k)) & 0xff) as usize].to_le_bytes();
@@ -756,7 +803,9 @@ mod tests {
     use super::*;
 
     fn lcg(state: &mut u64) -> f32 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
     }
 
@@ -784,7 +833,11 @@ mod tests {
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
         assert!(rel < 1e-4, "dot {got} vs reference {reference} (rel {rel})");
         // and the quantization itself must be sane vs the true dot
-        let true_dot: f64 = src.iter().zip(&act).map(|(&a, &b)| a as f64 * b as f64).sum();
+        let true_dot: f64 = src
+            .iter()
+            .zip(&act)
+            .map(|(&a, &b)| a as f64 * b as f64)
+            .sum();
         assert!(reference.signum() == true_dot.signum() || true_dot.abs() < 1.0);
     }
 
@@ -802,9 +855,7 @@ mod tests {
                 let (k, js, half) = (c / 8, (c % 8) / 2, c % 2);
                 for i in 0..16 {
                     let q = (q2[32 * k + 16 * half + i] >> (2 * js)) & 3;
-                    out.push(
-                        xd * (sc[c] & 0x0f) as f32 * q as f32 - xmin * (sc[c] >> 4) as f32,
-                    );
+                    out.push(xd * (sc[c] & 0x0f) as f32 * q as f32 - xmin * (sc[c] >> 4) as f32);
                 }
             }
         }
@@ -836,9 +887,16 @@ mod tests {
             reference += deq[i] as f64 * (xq.d[i / QK_K] as f64 * xq.qs[i] as f64);
         }
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
-        assert!(rel < 1e-4, "q2k dot {got} vs reference {reference} (rel {rel})");
+        assert!(
+            rel < 1e-4,
+            "q2k dot {got} vs reference {reference} (rel {rel})"
+        );
         let simd = vec_dot_q2_k_q8_k(&row, &xq, n);
-        assert_eq!(simd.to_bits(), got.to_bits(), "q2k simd {simd} vs scalar {got}");
+        assert_eq!(
+            simd.to_bits(),
+            got.to_bits(),
+            "q2k simd {simd} vs scalar {got}"
+        );
     }
 
     #[test]
@@ -878,9 +936,16 @@ mod tests {
             }
         }
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
-        assert!(rel < 1e-4, "q3k dot {got} vs reference {reference} (rel {rel})");
+        assert!(
+            rel < 1e-4,
+            "q3k dot {got} vs reference {reference} (rel {rel})"
+        );
         let simd = vec_dot_q3_k_q8_k(&row, &xq, n);
-        assert_eq!(simd.to_bits(), got.to_bits(), "q3k simd {simd} vs scalar {got}");
+        assert_eq!(
+            simd.to_bits(),
+            got.to_bits(),
+            "q3k simd {simd} vs scalar {got}"
+        );
     }
 
     #[test]
@@ -921,9 +986,16 @@ mod tests {
             }
         }
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
-        assert!(rel < 1e-4, "q4k dot {got} vs reference {reference} (rel {rel})");
+        assert!(
+            rel < 1e-4,
+            "q4k dot {got} vs reference {reference} (rel {rel})"
+        );
         let simd = vec_dot_q4_k_q8_k(&row, &xq, n);
-        assert_eq!(simd.to_bits(), got.to_bits(), "q4k simd {simd} vs scalar {got}");
+        assert_eq!(
+            simd.to_bits(),
+            got.to_bits(),
+            "q4k simd {simd} vs scalar {got}"
+        );
     }
 
     #[test]
@@ -949,23 +1021,35 @@ mod tests {
             for g in 0..8 {
                 let sc = blk[66 + g];
                 for j in 0..4 {
-                    let q = u16::from_le_bytes([blk[2 + 2 * (4 * g + j)], blk[3 + 2 * (4 * g + j)]]);
+                    let q =
+                        u16::from_le_bytes([blk[2 + 2 * (4 * g + j)], blk[3 + 2 * (4 * g + j)]]);
                     let gr = grid[(q & 511) as usize].to_le_bytes();
                     let sm = sign_mask((q >> 9) as u32);
-                    let ls = if j < 2 { 2 * (sc & 0x0f) + 1 } else { 2 * (sc >> 4) + 1 } as f64;
+                    let ls = if j < 2 {
+                        2 * (sc & 0x0f) + 1
+                    } else {
+                        2 * (sc >> 4) + 1
+                    } as f64;
                     for i in 0..8 {
                         let w = gr[i] as i8 as f64 * if (sm >> i) & 1 == 1 { -1.0 } else { 1.0 };
                         let idx = ibl * QK_K + 32 * g + 8 * j + i;
-                        reference += 0.125 * xd * ls * w
-                            * (xq.d[idx / QK_K] as f64 * xq.qs[idx] as f64);
+                        reference +=
+                            0.125 * xd * ls * w * (xq.d[idx / QK_K] as f64 * xq.qs[idx] as f64);
                     }
                 }
             }
         }
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
-        assert!(rel < 1e-4, "iq2xs dot {got} vs reference {reference} (rel {rel})");
+        assert!(
+            rel < 1e-4,
+            "iq2xs dot {got} vs reference {reference} (rel {rel})"
+        );
         let simd = vec_dot_iq2_xs_q8_k(&row, &xq, n);
-        assert_eq!(simd.to_bits(), got.to_bits(), "iq2xs simd {simd} vs scalar {got}");
+        assert_eq!(
+            simd.to_bits(),
+            got.to_bits(),
+            "iq2xs simd {simd} vs scalar {got}"
+        );
     }
 
     #[test]
@@ -990,7 +1074,10 @@ mod tests {
             let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
             for g in 0..8 {
                 let aux = u32::from_le_bytes([
-                    blk[66 + 4 * g], blk[67 + 4 * g], blk[68 + 4 * g], blk[69 + 4 * g],
+                    blk[66 + 4 * g],
+                    blk[67 + 4 * g],
+                    blk[68 + 4 * g],
+                    blk[69 + 4 * g],
                 ]);
                 let db = xd * (0.5 + (aux >> 28) as f64) * 0.5;
                 for j in 0..4 {
@@ -1010,9 +1097,16 @@ mod tests {
             }
         }
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
-        assert!(rel < 1e-4, "iq3xxs dot {got} vs reference {reference} (rel {rel})");
+        assert!(
+            rel < 1e-4,
+            "iq3xxs dot {got} vs reference {reference} (rel {rel})"
+        );
         let simd = vec_dot_iq3_xxs_q8_k(&row, &xq, n);
-        assert_eq!(simd.to_bits(), got.to_bits(), "iq3xxs simd {simd} vs scalar {got}");
+        assert_eq!(
+            simd.to_bits(),
+            got.to_bits(),
+            "iq3xxs simd {simd} vs scalar {got}"
+        );
     }
 
     /// bsum is exact integer math in both paths and the float ops run in

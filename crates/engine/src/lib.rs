@@ -906,17 +906,26 @@ mod real {
         }
 
         pub fn detailed() -> bool {
-            matches!(std::env::var("PULSAR_PROFILE_DETAIL").as_deref(), Ok("1" | "layers" | "cuda"))
+            matches!(
+                std::env::var("PULSAR_PROFILE_DETAIL").as_deref(),
+                Ok("1" | "layers" | "cuda")
+            )
         }
 
         pub fn begin_k3_token(&mut self, index: u64, phase: &'static str) {
             if Self::enabled() {
-                self.current_k3 = Some(K3TokenProfile { index, phase, ..Default::default() });
+                self.current_k3 = Some(K3TokenProfile {
+                    index,
+                    phase,
+                    ..Default::default()
+                });
             }
         }
 
         pub fn finish_k3_token(&mut self, total: std::time::Duration, output: std::time::Duration) {
-            let Some(mut token) = self.current_k3.take() else { return };
+            let Some(mut token) = self.current_k3.take() else {
+                return;
+            };
             token.total = total;
             token.output = output;
             token.layers = token.layers_detail.iter().map(|l| l.total).sum();
@@ -928,7 +937,9 @@ mod real {
         pub fn record_sampling(&mut self, elapsed: std::time::Duration) {
             if let Some(token) = self.k3_tokens.last_mut() {
                 token.sampling += elapsed;
-                token.unclassified = token.total.saturating_sub(token.layers + token.output + token.sampling);
+                token.unclassified = token
+                    .total
+                    .saturating_sub(token.layers + token.output + token.sampling);
             } else if let Some(token) = self.current_k3.as_mut() {
                 token.sampling += elapsed;
             }
@@ -981,9 +992,14 @@ mod real {
                     resolve += l.expert_resolution;
                     storage += l.storage;
                     cpu += l.cpu_routing;
-                    cpu_math += l.cpu_expert_dequant + l.cpu_expert_gate + l.cpu_expert_up
-                        + l.cpu_expert_activation + l.cpu_expert_down + l.cpu_expert_accumulation
-                        + l.cpu_latent_norm + l.cpu_miscellaneous;
+                    cpu_math += l.cpu_expert_dequant
+                        + l.cpu_expert_gate
+                        + l.cpu_expert_up
+                        + l.cpu_expert_activation
+                        + l.cpu_expert_down
+                        + l.cpu_expert_accumulation
+                        + l.cpu_latent_norm
+                        + l.cpu_miscellaneous;
                     expert_evals += l.cpu_expert_evaluations;
                     expert_matrices += l.cpu_expert_matrices;
                     expert_bytes = expert_bytes.saturating_add(l.cpu_expert_weight_bytes);
@@ -1009,24 +1025,48 @@ mod real {
         }
 
         pub fn hit_rate(hits: u64, misses: u64) -> f64 {
-            if hits.saturating_add(misses) == 0 { 0.0 } else { hits as f64 * 100.0 / (hits + misses) as f64 }
+            if hits.saturating_add(misses) == 0 {
+                0.0
+            } else {
+                hits as f64 * 100.0 / (hits + misses) as f64
+            }
         }
 
         pub fn detailed_report(&self) -> String {
             let mut out = String::new();
             for token in &self.k3_tokens {
                 out.push_str(&format!("K3 token {} [{}]\n", token.index, token.phase));
-                out.push_str(&format!("  total wall:       {:>10.3}s\n", token.total.as_secs_f64()));
-                out.push_str(&format!("  layers total:     {:>10.3}s\n", token.layers.as_secs_f64()));
-                out.push_str(&format!("  output/lm-head:   {:>10.3}s\n", token.output.as_secs_f64()));
-                out.push_str(&format!("  unclassified:     {:>10.3}s\n", token.unclassified.as_secs_f64()));
+                out.push_str(&format!(
+                    "  total wall:       {:>10.3}s\n",
+                    token.total.as_secs_f64()
+                ));
+                out.push_str(&format!(
+                    "  layers total:     {:>10.3}s\n",
+                    token.layers.as_secs_f64()
+                ));
+                out.push_str(&format!(
+                    "  output/lm-head:   {:>10.3}s\n",
+                    token.output.as_secs_f64()
+                ));
+                out.push_str(&format!(
+                    "  unclassified:     {:>10.3}s\n",
+                    token.unclassified.as_secs_f64()
+                ));
                 let mut category_total = std::time::Duration::ZERO;
                 for l in &token.layers_detail {
-                    category_total += l.cpu_expert_dequant + l.cpu_expert_gate + l.cpu_expert_up
-                        + l.cpu_expert_activation + l.cpu_expert_down + l.cpu_expert_accumulation
-                        + l.cpu_latent_norm + l.cpu_miscellaneous;
+                    category_total += l.cpu_expert_dequant
+                        + l.cpu_expert_gate
+                        + l.cpu_expert_up
+                        + l.cpu_expert_activation
+                        + l.cpu_expert_down
+                        + l.cpu_expert_accumulation
+                        + l.cpu_latent_norm
+                        + l.cpu_miscellaneous;
                 }
-                out.push_str(&format!("  CPU math categories: {:>10.3}s\n", category_total.as_secs_f64()));
+                out.push_str(&format!(
+                    "  CPU math categories: {:>10.3}s\n",
+                    category_total.as_secs_f64()
+                ));
                 for l in &token.layers_detail {
                     out.push_str(&format!("  Layer {} [{}] total {:.3}ms input {:.3}ms KDA {:.3}ms MLA {:.3}ms router {:.3}ms resolve {:.3}ms storage {:.3}ms H2D {:.3}ms MoE {:.3}ms residual {:.3}ms sync {:.3}ms unclassified {:.3}ms\n    CPU dequant {:.3}ms gate {:.3}ms up {:.3}ms activation {:.3}ms down {:.3}ms accumulation {:.3}ms latent_norm {:.3}ms misc {:.3}ms; expert evals {} matrices {} weight_bytes {} threads {}\n",
                         l.index, l.kind, l.total.as_secs_f64()*1e3, l.input_residual_norm.as_secs_f64()*1e3,
@@ -1228,10 +1268,21 @@ mod real {
 
     impl DeviceSlabCache {
         fn new(budget_bytes: usize, slab_bytes: usize) -> Result<DeviceSlabCache> {
-            let slots = if budget_bytes == 0 { 0 } else { (budget_bytes / slab_bytes.max(1)).clamp(1, 4096) };
+            let slots = if budget_bytes == 0 {
+                0
+            } else {
+                (budget_bytes / slab_bytes.max(1)).clamp(1, 4096)
+            };
             let pool_bytes = (slots * slab_bytes + SLAB_SLACK).max(1);
             Ok(DeviceSlabCache {
-                pool: DeviceBuf::alloc_named(pool_bytes, if slots == 0 { "K3 expert device cache placeholder" } else { "K3 expert device cache" })?,
+                pool: DeviceBuf::alloc_named(
+                    pool_bytes,
+                    if slots == 0 {
+                        "K3 expert device cache placeholder"
+                    } else {
+                        "K3 expert device cache"
+                    },
+                )?,
                 slab_bytes,
                 map: std::collections::HashMap::with_capacity(slots),
                 meta: vec![(0, u64::MAX); slots],
@@ -1382,7 +1433,9 @@ mod real {
             let incoming: usize = missing.iter().map(|r| r.len as usize).sum();
             self.io_bytes = self.io_bytes.saturating_add(incoming as u64);
             self.io_reads = self.io_reads.saturating_add(missing.len() as u64);
-            self.io_max_read = self.io_max_read.max(missing.iter().map(|r| r.len).max().unwrap_or(0));
+            self.io_max_read = self
+                .io_max_read
+                .max(missing.iter().map(|r| r.len).max().unwrap_or(0));
             while self.used + incoming > self.budget && !self.cache.is_empty() {
                 let victim = self
                     .cache
@@ -2129,10 +2182,12 @@ mod real {
     fn upload_k3_host(bytes: &[u8]) -> Result<DeviceBuf> {
         const K3_VRAM_RESERVE: usize = 1536 << 20;
         let force_host = k3_use_host_pinned();
-        let use_host = force_host || kernels::selected_device().ok()
-            .and_then(|dev| kernels::mem_info(dev).ok())
-            .map(|(free, _)| free < bytes.len().saturating_add(K3_VRAM_RESERVE))
-            .unwrap_or(false);
+        let use_host = force_host
+            || kernels::selected_device()
+                .ok()
+                .and_then(|dev| kernels::mem_info(dev).ok())
+                .map(|(free, _)| free < bytes.len().saturating_add(K3_VRAM_RESERVE))
+                .unwrap_or(false);
         if use_host && !force_host {
             eprintln!("pulsar: K3 VRAM resident budget reached; keeping {:.2} MiB weight host-mapped to preserve {:.0} MiB CUDA headroom", bytes.len() as f64 / (1 << 20) as f64, K3_VRAM_RESERVE as f64 / (1 << 20) as f64);
         }
@@ -2378,10 +2433,8 @@ mod real {
             TensorType::Q8_0 => q8_0_bytes_to_f32(&read_tensor_bytes(file, g, name)?, n)?,
             TensorType::Q4_0 => {
                 let bytes = read_tensor_bytes_raw(file, g, name)?;
-                let (block_elems, block_bytes) = t
-                    .ty
-                    .block_layout()
-                    .ok_or_else(|| meta_err(name))?;
+                let (block_elems, block_bytes) =
+                    t.ty.block_layout().ok_or_else(|| meta_err(name))?;
                 let block_elems = block_elems as usize;
                 let block_bytes = block_bytes as usize;
                 if n % block_elems != 0 || bytes.len() != (n / block_elems) * block_bytes {
@@ -2448,9 +2501,21 @@ mod real {
             let requested = std::env::var("PULSAR_GPU").unwrap_or_else(|_| "<automatic>".into());
             let devices = kernels::cuda_devices(true)?;
             kernels::set_device(primary_device)?;
-            eprintln!(
-                "pulsar: PULSAR_GPU={requested} -> primary CUDA device {primary_device}"
-            );
+            if let Some(primary) = devices.iter().find(|d| d.index == primary_device) {
+                eprintln!(
+                    "pulsar: requested PULSAR_GPU={requested}; physical GPU UUID={uuid}; name={name}; process-local CUDA index={index}; PCI={domain:04x}:{bus:02x}:{device:02x}",
+                    uuid = primary.uuid,
+                    name = primary.name,
+                    index = primary.index,
+                    domain = primary.pci_domain,
+                    bus = primary.pci_bus,
+                    device = primary.pci_device,
+                );
+            } else {
+                eprintln!(
+                    "pulsar: requested PULSAR_GPU={requested}; process-local CUDA index={primary_device}; physical GPU identity unavailable"
+                );
+            }
             for d in &devices {
                 let role = if d.index == primary_device {
                     if shape.family == Family::KimiK3 {
@@ -2529,9 +2594,7 @@ mod real {
                         | TensorType::Q3K
                         | TensorType::Q4K
                         | TensorType::Q5K
-                        | TensorType::Q6K => {
-                            read_tensor_bytes(&file, &gguf, "token_embd.weight")?
-                        }
+                        | TensorType::Q6K => read_tensor_bytes(&file, &gguf, "token_embd.weight")?,
                         other => {
                             return Err(format!(
                                 "token_embd.weight: unsupported K3 embedding type {other:?}"
@@ -3237,7 +3300,8 @@ mod real {
                                 k3.ssm_dt_b = Some(upload_k3(&file, &gguf, &t("ssm_dt.bias"))?);
                                 k3.wqkv_gate =
                                     Some(upload_k3_mla_kq(&file, &gguf, &t("attn_gate.weight"))?);
-                                k3.ssm_o_norm = Some(upload_k3(&file, &gguf, &t("ssm_norm.weight"))?);
+                                k3.ssm_o_norm =
+                                    Some(upload_k3(&file, &gguf, &t("ssm_norm.weight"))?);
                                 k3.wo =
                                     Some(upload_k3_mla_kq(&file, &gguf, &t("attn_output.weight"))?);
                             }
@@ -3255,14 +3319,15 @@ mod real {
                                 )?);
                                 k3.mla_kv_a_norm =
                                     Some(upload_k3(&file, &gguf, &t("attn_kv_a_norm.weight"))?);
-                                let optional_mla_kq = |suffix: &str| -> Result<Option<kimi_k3::K3DenseWeight>> {
-                                    let name = t(suffix);
-                                    if gguf.tensor(&name).is_some() {
-                                        Ok(Some(upload_k3_mla_kq(&file, &gguf, &name)?))
-                                    } else {
-                                        Ok(None)
-                                    }
-                                };
+                                let optional_mla_kq =
+                                    |suffix: &str| -> Result<Option<kimi_k3::K3DenseWeight>> {
+                                        let name = t(suffix);
+                                        if gguf.tensor(&name).is_some() {
+                                            Ok(Some(upload_k3_mla_kq(&file, &gguf, &name)?))
+                                        } else {
+                                            Ok(None)
+                                        }
+                                    };
                                 let optional_mla_absorbed =
                                     |suffix: &str| -> Result<Option<DeviceBuf>> {
                                         let name = t(suffix);
@@ -3312,11 +3377,8 @@ mod real {
                             )?);
                             k3.ffn_latent_norm =
                                 Some(upload_k3(&file, &gguf, &t("ffn_latent_norm.weight"))?);
-                            k3.ffn_latent_up = Some(upload_k3_mla_q8(
-                                &file,
-                                &gguf,
-                                &t("ffn_latent_up.weight"),
-                            )?);
+                            k3.ffn_latent_up =
+                                Some(upload_k3_mla_q8(&file, &gguf, &t("ffn_latent_up.weight"))?);
                             for (slot, suffix) in [
                                 (&mut k3.ffn_gate_exps, "ffn_gate_exps.weight"),
                                 (&mut k3.ffn_up_exps, "ffn_up_exps.weight"),
@@ -3330,11 +3392,8 @@ mod real {
                                 Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_gate_shexp.weight"))?);
                             k3.ffn_up_shexp =
                                 Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_up_shexp.weight"))?);
-                            k3.ffn_down_shexp = Some(upload_k3_mla_q8(
-                                &file,
-                                &gguf,
-                                &t("ffn_down_shexp.weight"),
-                            )?);
+                            k3.ffn_down_shexp =
+                                Some(upload_k3_mla_q8(&file, &gguf, &t("ffn_down_shexp.weight"))?);
                         }
 
                         return Ok(LayerW {
@@ -4549,7 +4608,8 @@ mod real {
                     };
                     // decode floor: one layer's slot resolve always fits
                     let gpu_moe = s.family == Family::KimiK3
-                        && std::env::var("PULSAR_K3_EXPERT_BACKEND").ok().as_deref() == Some("cuda");
+                        && std::env::var("PULSAR_K3_EXPERT_BACKEND").ok().as_deref()
+                            == Some("cuda");
                     // The initial K3 CUDA backend is synchronous and reuses one
                     // layer-sized packed staging slot. It does not reserve a
                     // prefetch window or the complete expert bank.
@@ -4581,7 +4641,11 @@ mod real {
                         let requested = dev_env.unwrap_or_else(|| {
                             pool.saturating_sub(staging_bytes).saturating_sub(reserve)
                         });
-                        if requested.saturating_add(staging_bytes).saturating_add(reserve) > free {
+                        if requested
+                            .saturating_add(staging_bytes)
+                            .saturating_add(reserve)
+                            > free
+                        {
                             return Err(format!(
                                 "K3 expert device cache request {:.2} GiB is unsafe: {:.2} GiB free, {:.2} GiB staging, {:.2} MiB safety margin",
                                 requested as f64 / (1 << 30) as f64,
@@ -6934,7 +6998,10 @@ mod real {
             let prev = std::env::var("PULSAR_K3_HOST").ok();
             std::env::set_var("PULSAR_K3_HOST", "1");
             let buf = upload_k3_host(&[0x5au8; 256]).expect("mapped pinned alloc");
-            assert!(buf.is_pinned(), "PULSAR_K3_HOST=1 must select pinned storage");
+            assert!(
+                buf.is_pinned(),
+                "PULSAR_K3_HOST=1 must select pinned storage"
+            );
             drop(buf);
             if let Some(v) = prev {
                 std::env::set_var("PULSAR_K3_HOST", v);
@@ -6972,8 +7039,15 @@ mod telemetry_tests {
     #[test]
     fn aggregation_and_reset_shape_are_independent() {
         let mut p = Prof::default();
-        p.current_for_test(K3TokenProfile { index: 0, phase: "decode", ..Default::default() });
-        p.push_k3_layer(K3LayerProfile { total: Duration::from_secs(2), ..Default::default() });
+        p.current_for_test(K3TokenProfile {
+            index: 0,
+            phase: "decode",
+            ..Default::default()
+        });
+        p.push_k3_layer(K3LayerProfile {
+            total: Duration::from_secs(2),
+            ..Default::default()
+        });
         p.finish_k3_token(Duration::from_secs(3), Duration::from_millis(100));
         assert_eq!(p.k3_tokens.len(), 1);
         assert_eq!(p.k3_tokens[0].layers, Duration::from_secs(2));

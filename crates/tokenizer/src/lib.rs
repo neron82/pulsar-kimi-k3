@@ -375,9 +375,7 @@ impl ChatMarkers {
                 let mut v = vec![self.assistant];
                 v.extend(t.encode("\n"));
                 // thinking off when the vocab carries think tokens
-                if let (Some(ts), Some(te)) =
-                    (t.find_token("<think>"), t.find_token("</think>"))
-                {
+                if let (Some(ts), Some(te)) = (t.find_token("<think>"), t.find_token("</think>")) {
                     v.extend([ts, te]);
                     v.extend(t.encode("\n"));
                 }
@@ -404,7 +402,10 @@ impl ChatMarkers {
             return v; // next role token delimits the turn
         }
         v.push(self.eot.unwrap_or(self.eos));
-        if matches!(self.style, ChatStyle::ChatMl | ChatStyle::Gemma | ChatStyle::MiniMax) {
+        if matches!(
+            self.style,
+            ChatStyle::ChatMl | ChatStyle::Gemma | ChatStyle::MiniMax
+        ) {
             v.extend(t.encode("\n"));
         }
         v
@@ -479,10 +480,21 @@ impl Tokenizer {
         .filter_map(&id_key)
         .collect();
         const EOG_TEXTS: &[&str] = &[
-            "</s>", "<|endoftext|>", "<|end_of_text|>", "<|eot_id|>",
-            "<|eom_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>",
-            "<|endofturn|>", "<|content_model_end_sampling|>", "[e~[",
-            "<|user|>", "<|observation|>", "<|return|>", "[EOS]",
+            "</s>",
+            "<|endoftext|>",
+            "<|end_of_text|>",
+            "<|eot_id|>",
+            "<|eom_id|>",
+            "<|im_end|>",
+            "<|end|>",
+            "<end_of_turn>",
+            "<|endofturn|>",
+            "<|content_model_end_sampling|>",
+            "[e~[",
+            "<|user|>",
+            "<|observation|>",
+            "<|return|>",
+            "[EOS]",
         ];
         for (i, tok) in tokens.iter().enumerate() {
             if EOG_TEXTS.iter().any(|t| *t == tok.as_str()) {
@@ -506,10 +518,17 @@ impl Tokenizer {
             stop_ids,
             add_bos: match g.metadata.get("tokenizer.ggml.add_bos_token") {
                 Some(Value::Bool(b)) => *b,
-                _ => g.metadata.get("tokenizer.ggml.model").and_then(Value::as_str)
-                    == Some("llama"),
+                _ => {
+                    g.metadata
+                        .get("tokenizer.ggml.model")
+                        .and_then(Value::as_str)
+                        == Some("llama")
+                }
             },
-            pre: if g.metadata.get("tokenizer.ggml.model").and_then(Value::as_str)
+            pre: if g
+                .metadata
+                .get("tokenizer.ggml.model")
+                .and_then(Value::as_str)
                 == Some("gemma4")
             {
                 Pre::Gemma4
@@ -595,7 +614,9 @@ impl Tokenizer {
         let mut out = Vec::new();
         if self.pre == Pre::Gemma4 {
             for &id in ids {
-                let Some(tok) = self.tokens.get(id as usize) else { continue };
+                let Some(tok) = self.tokens.get(id as usize) else {
+                    continue;
+                };
                 if let Some(b) = parse_byte_token(tok) {
                     out.push(b);
                     continue;
@@ -612,7 +633,9 @@ impl Tokenizer {
             return out;
         }
         for &id in ids {
-            let Some(tok) = self.tokens.get(id as usize) else { continue };
+            let Some(tok) = self.tokens.get(id as usize) else {
+                continue;
+            };
             for c in tok.chars() {
                 match self.char_to_byte.get(&c) {
                     Some(&b) => out.push(b),
@@ -664,7 +687,10 @@ impl Tokenizer {
     /// ds4's shape; pieces are words. Rank-heap it if prefill tokenization
     /// ever shows up in a profile.
     fn bpe_piece(&self, piece: &[u8], out: &mut Vec<u32>) {
-        let encoded: String = piece.iter().map(|&b| self.byte_to_char[b as usize]).collect();
+        let encoded: String = piece
+            .iter()
+            .map(|&b| self.byte_to_char[b as usize])
+            .collect();
         let mut sym: Vec<String> = encoded.chars().map(String::from).collect();
 
         loop {
@@ -785,7 +811,9 @@ fn cjk_at(s: &[u8], pos: usize) -> bool {
         return false;
     }
     let cp = peek_codepoint(s, pos);
-    (0x4e00..=0x9fa5).contains(&cp) || (0x3040..=0x309f).contains(&cp) || (0x30a0..=0x30ff).contains(&cp)
+    (0x4e00..=0x9fa5).contains(&cp)
+        || (0x3040..=0x309f).contains(&cp)
+        || (0x30a0..=0x30ff).contains(&cp)
 }
 
 /// ASCII letters, plus any non-ASCII char (CJK is carved out first by the
@@ -922,11 +950,26 @@ fn glm4_number(cp: u32) -> bool {
         return cp.try_into().map(ascii_digit).unwrap_or(false);
     }
     const RANGES: &[(u32, u32)] = &[
-        (0x0660, 0x0669), (0x06f0, 0x06f9), (0x07c0, 0x07c9), (0x0966, 0x096f),
-        (0x09e6, 0x09ef), (0x0a66, 0x0a6f), (0x0ae6, 0x0aef), (0x0b66, 0x0b6f),
-        (0x0be6, 0x0bef), (0x0c66, 0x0c6f), (0x0ce6, 0x0cef), (0x0d66, 0x0d6f),
-        (0x0de6, 0x0def), (0x0e50, 0x0e59), (0x0ed0, 0x0ed9), (0x0f20, 0x0f29),
-        (0x1040, 0x1049), (0x1090, 0x1099), (0x17e0, 0x17e9), (0x1810, 0x1819),
+        (0x0660, 0x0669),
+        (0x06f0, 0x06f9),
+        (0x07c0, 0x07c9),
+        (0x0966, 0x096f),
+        (0x09e6, 0x09ef),
+        (0x0a66, 0x0a6f),
+        (0x0ae6, 0x0aef),
+        (0x0b66, 0x0b6f),
+        (0x0be6, 0x0bef),
+        (0x0c66, 0x0c6f),
+        (0x0ce6, 0x0cef),
+        (0x0d66, 0x0d6f),
+        (0x0de6, 0x0def),
+        (0x0e50, 0x0e59),
+        (0x0ed0, 0x0ed9),
+        (0x0f20, 0x0f29),
+        (0x1040, 0x1049),
+        (0x1090, 0x1099),
+        (0x17e0, 0x17e9),
+        (0x1810, 0x1819),
         (0xff10, 0xff19),
     ];
     RANGES.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp))
@@ -937,24 +980,63 @@ fn glm4_punct_symbol(cp: u32) -> bool {
         return cp.try_into().map(punct_symbol).unwrap_or(false);
     }
     const RANGES: &[(u32, u32)] = &[
-        (0x00a1, 0x00a9), (0x00ab, 0x00ac), (0x00ae, 0x00b1), (0x00b4, 0x00b4),
-        (0x00b6, 0x00b8), (0x00bb, 0x00bb), (0x00bf, 0x00bf), (0x00d7, 0x00d7),
-        (0x00f7, 0x00f7), (0x02c2, 0x02df), (0x02e5, 0x02eb), (0x02ed, 0x02ff),
-        (0x0375, 0x037e), (0x0384, 0x0385), (0x0387, 0x0387), (0x055a, 0x055f),
-        (0x0589, 0x058a), (0x05be, 0x05c0), (0x05c3, 0x05c3), (0x05c6, 0x05c7),
-        (0x0609, 0x060a), (0x060c, 0x060d), (0x061b, 0x061b), (0x061e, 0x061f),
-        (0x066a, 0x066a), (0x066d, 0x066d), (0x06d4, 0x06d4), (0x2000, 0x206f),
-        (0x20a0, 0x20cf), (0x2100, 0x214f), (0x2190, 0x23ff), (0x2460, 0x24ff),
-        (0x2500, 0x2775), (0x2794, 0x2bff), (0x2e00, 0x2e7f), (0x3000, 0x303f),
-        (0xfd3e, 0xfd3f), (0xfe10, 0xfe6f), (0xff01, 0xff0f), (0xff1a, 0xff20),
-        (0xff3b, 0xff40), (0xff5b, 0xff65), (0x1f000, 0x1faff),
+        (0x00a1, 0x00a9),
+        (0x00ab, 0x00ac),
+        (0x00ae, 0x00b1),
+        (0x00b4, 0x00b4),
+        (0x00b6, 0x00b8),
+        (0x00bb, 0x00bb),
+        (0x00bf, 0x00bf),
+        (0x00d7, 0x00d7),
+        (0x00f7, 0x00f7),
+        (0x02c2, 0x02df),
+        (0x02e5, 0x02eb),
+        (0x02ed, 0x02ff),
+        (0x0375, 0x037e),
+        (0x0384, 0x0385),
+        (0x0387, 0x0387),
+        (0x055a, 0x055f),
+        (0x0589, 0x058a),
+        (0x05be, 0x05c0),
+        (0x05c3, 0x05c3),
+        (0x05c6, 0x05c7),
+        (0x0609, 0x060a),
+        (0x060c, 0x060d),
+        (0x061b, 0x061b),
+        (0x061e, 0x061f),
+        (0x066a, 0x066a),
+        (0x066d, 0x066d),
+        (0x06d4, 0x06d4),
+        (0x2000, 0x206f),
+        (0x20a0, 0x20cf),
+        (0x2100, 0x214f),
+        (0x2190, 0x23ff),
+        (0x2460, 0x24ff),
+        (0x2500, 0x2775),
+        (0x2794, 0x2bff),
+        (0x2e00, 0x2e7f),
+        (0x3000, 0x303f),
+        (0xfd3e, 0xfd3f),
+        (0xfe10, 0xfe6f),
+        (0xff01, 0xff0f),
+        (0xff1a, 0xff20),
+        (0xff3b, 0xff40),
+        (0xff5b, 0xff65),
+        (0x1f000, 0x1faff),
     ];
     RANGES.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp))
 }
 
 fn glm4_char_at(s: &[u8], pos: usize) -> Glm4Char {
     if pos >= s.len() {
-        return Glm4Char { cp: 0, next: pos, valid: false, is_letter: false, is_number: false, is_whitespace: false };
+        return Glm4Char {
+            cp: 0,
+            next: pos,
+            valid: false,
+            is_letter: false,
+            is_number: false,
+            is_whitespace: false,
+        };
     }
     let cp = peek_codepoint(s, pos);
     let next = next_char(s, pos);
@@ -965,7 +1047,14 @@ fn glm4_char_at(s: &[u8], pos: usize) -> Glm4Char {
     } else {
         !is_whitespace && !is_number && !glm4_punct_symbol(cp)
     };
-    Glm4Char { cp, next, valid: true, is_letter, is_number, is_whitespace }
+    Glm4Char {
+        cp,
+        next,
+        valid: true,
+        is_letter,
+        is_number,
+        is_whitespace,
+    }
 }
 
 fn ascii_lower(cp: u32) -> u32 {
@@ -975,7 +1064,6 @@ fn ascii_lower(cp: u32) -> u32 {
         cp
     }
 }
-
 
 /// Han (CJK ideograph) check for the kimi-k2 split (llama.cpp
 /// unicode_cpt_is_han ranges).
@@ -1024,7 +1112,10 @@ fn pretokenize_minimax(s: &[u8]) -> Vec<&[u8]> {
                 } else if n1c.valid && n1c.next < len {
                     let n2c = glm4_char_at(s, n1c.next);
                     let n2 = ascii_lower(n2c.cp);
-                    if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                    if (n1 == 0x72 && n2 == 0x65)
+                        || (n1 == 0x76 && n2 == 0x65)
+                        || (n1 == 0x6c && n2 == 0x6c)
+                    {
                         pos = n2c.next;
                     }
                 }
@@ -1108,7 +1199,10 @@ fn pretokenize_qwen2(s: &[u8]) -> Vec<&[u8]> {
             if n1c.valid && n1c.next < len {
                 let n2c = glm4_char_at(s, n1c.next);
                 let n2 = ascii_lower(n2c.cp);
-                if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                if (n1 == 0x72 && n2 == 0x65)
+                    || (n1 == 0x76 && n2 == 0x65)
+                    || (n1 == 0x6c && n2 == 0x6c)
+                {
                     end = n2c.next;
                 }
             }
@@ -1224,7 +1318,10 @@ fn pretokenize_kimi_k2(s: &[u8]) -> Vec<&[u8]> {
                 } else if n1c.valid && n1c.next < len {
                     let n2c = glm4_char_at(s, n1c.next);
                     let n2 = ascii_lower(n2c.cp);
-                    if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                    if (n1 == 0x72 && n2 == 0x65)
+                        || (n1 == 0x76 && n2 == 0x65)
+                        || (n1 == 0x6c && n2 == 0x6c)
+                    {
                         pos = n2c.next;
                     }
                 }
@@ -1288,7 +1385,6 @@ fn pretokenize_kimi_k2(s: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-
 /// glm4/kimi shared whitespace policy: keep the run through its last
 /// newline; otherwise leave the final ws char to join the next word.
 fn glm4_whitespace_segment(s: &[u8], pos: usize, len: usize) -> usize {
@@ -1341,7 +1437,10 @@ fn pretokenize_glm4(s: &[u8]) -> Vec<&[u8]> {
             if next.valid && next.next < len {
                 let next2 = glm4_char_at(s, next.next);
                 let n2 = ascii_lower(next2.cp);
-                if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                if (n1 == 0x72 && n2 == 0x65)
+                    || (n1 == 0x76 && n2 == 0x65)
+                    || (n1 == 0x6c && n2 == 0x6c)
+                {
                     pos = next2.next;
                     out.push(&s[start..pos]);
                     continue;
@@ -1432,15 +1531,24 @@ mod tests {
     #[test]
     fn kimi_k2_han_runs_and_inline_contractions() {
         let toks = pretokenize_kimi_k2("Hello\u{4f60}\u{597d}world don't 123".as_bytes());
-        let strs: Vec<&str> = toks.iter().map(|t| std::str::from_utf8(t).unwrap()).collect();
+        let strs: Vec<&str> = toks
+            .iter()
+            .map(|t| std::str::from_utf8(t).unwrap())
+            .collect();
         // Han run splits alone; contraction stays attached to its word
-        assert_eq!(strs, vec!["Hello", "\u{4f60}\u{597d}", "world", " don't", " ", "123"]);
+        assert_eq!(
+            strs,
+            vec!["Hello", "\u{4f60}\u{597d}", "world", " don't", " ", "123"]
+        );
     }
 
     #[test]
     fn qwen2_standalone_contractions_and_single_digits() {
         let toks = pretokenize_qwen2(b"don't 12 x;\ny");
-        let strs: Vec<&str> = toks.iter().map(|b| std::str::from_utf8(b).unwrap()).collect();
+        let strs: Vec<&str> = toks
+            .iter()
+            .map(|b| std::str::from_utf8(b).unwrap())
+            .collect();
         // contraction is its OWN piece (gpt2 order), digits split singly,
         // punct absorbs the newline
         assert_eq!(strs, vec!["don", "'t", " ", "1", "2", " x", ";\n", "y"]);
@@ -1494,10 +1602,7 @@ mod tests {
     #[test]
     fn glm4_leading_space_joins_word_and_punct_keeps_newline() {
         let pieces: Vec<&[u8]> = pretokenize_glm4(b"a b;\nc");
-        assert_eq!(
-            pieces,
-            vec![&b"a"[..], &b" b"[..], &b";\n"[..], &b"c"[..]]
-        );
+        assert_eq!(pieces, vec![&b"a"[..], &b" b"[..], &b";\n"[..], &b"c"[..]]);
     }
 
     #[test]

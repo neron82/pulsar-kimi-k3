@@ -23,10 +23,15 @@ fn matches_ds4_token_streams() {
 
     let gold: &[(&str, &[u32])] = &[
         ("Hello, world!", &[16883, 11, 2385, 0]),
-        ("int x;\nreturn y;\n\ndone", &[632, 1025, 401, 3589, 376, 983, 37470]),
+        (
+            "int x;\nreturn y;\n\ndone",
+            &[632, 1025, 401, 3589, 376, 983, 37470],
+        ),
         (
             "De kat zat op 12345 matten.",
-            &[3864, 43204, 1575, 253, 4993, 206, 7827, 2445, 1672, 1645, 13],
+            &[
+                3864, 43204, 1575, 253, 4993, 206, 7827, 2445, 1672, 1645, 13,
+            ],
         ),
         (
             "print(\"héllo\") 你好世界",
@@ -35,7 +40,11 @@ fn matches_ds4_token_streams() {
     ];
     for (text, ids) in gold {
         assert_eq!(t.encode(text), *ids, "encode mismatch for {text:?}");
-        assert_eq!(t.decode(ids), text.as_bytes(), "decode mismatch for {text:?}");
+        assert_eq!(
+            t.decode(ids),
+            text.as_bytes(),
+            "decode mismatch for {text:?}"
+        );
     }
 }
 

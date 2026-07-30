@@ -37,7 +37,9 @@ fn quantize_tiny_model() {
     h.extend_from_slice(&1u32.to_le_bytes());
 
     let bf16_bytes = |v: &[f32]| -> Vec<u8> {
-        v.iter().flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes()).collect()
+        v.iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
     };
     let t_exps = bf16_bytes(&vals);
     let t_attn = bf16_bytes(&vals);
@@ -93,7 +95,10 @@ fn quantize_tiny_model() {
     let head = std::fs::read(&output).unwrap();
     let g = gguf::Gguf::parse(&head).unwrap();
     assert_eq!(g.architecture(), Some("test"));
-    assert!(!g.metadata.contains_key("split.count"), "split.* must be stripped");
+    assert!(
+        !g.metadata.contains_key("split.count"),
+        "split.* must be stripped"
+    );
     let exps = g.tensor("blk.0.ffn_gate_exps.weight").unwrap();
     assert_eq!(exps.ty, gguf::TensorType::Q2K);
     let attn = g.tensor("blk.0.attn_q.weight").unwrap();

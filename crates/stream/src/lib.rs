@@ -34,10 +34,9 @@ pub fn expert_reads(g: &Gguf, model_len: u64) -> Result<Vec<Read>, String> {
         if t.dims.len() != 3 || t.dims[2] != n_expert {
             return Err(format!("{}: unexpected exps dims {:?}", t.name, t.dims));
         }
-        let row = t
-            .ty
-            .row_bytes(t.dims[0])
-            .ok_or_else(|| format!("{}: unmodeled type {:?}", t.name, t.ty))?;
+        let row =
+            t.ty.row_bytes(t.dims[0])
+                .ok_or_else(|| format!("{}: unmodeled type {:?}", t.name, t.ty))?;
         let expert_bytes = row * t.dims[1];
         let base = g.data_offset + t.offset;
         for e in 0..n_expert {
@@ -45,7 +44,10 @@ pub fn expert_reads(g: &Gguf, model_len: u64) -> Result<Vec<Read>, String> {
             if offset + expert_bytes > model_len {
                 return Err(format!("{}: expert {} beyond eof", t.name, e));
             }
-            out.push(Read { offset, len: expert_bytes });
+            out.push(Read {
+                offset,
+                len: expert_bytes,
+            });
         }
     }
     if out.is_empty() {
@@ -214,8 +216,10 @@ pub mod uring {
                 break;
             }
             ring.submit_and_wait(1)?;
-            let completions: Vec<(u64, i32)> =
-                ring.completion().map(|c| (c.user_data(), c.result())).collect();
+            let completions: Vec<(u64, i32)> = ring
+                .completion()
+                .map(|c| (c.user_data(), c.result()))
+                .collect();
             for (ud, res) in completions {
                 if res < 0 {
                     return Err(std::io::Error::from_raw_os_error(-res));
@@ -225,9 +229,8 @@ pub mod uring {
                 inflight -= 1;
                 stats.reads += 1;
                 stats.bytes_payload += inf.payload_len as u64;
-                stats.checksum ^= unsafe {
-                    *inf.buf.ptr.add(inf.payload_off + inf.payload_len / 2)
-                };
+                stats.checksum ^=
+                    unsafe { *inf.buf.ptr.add(inf.payload_off + inf.payload_len / 2) };
             }
         }
         stats.secs = t0.elapsed().as_secs_f64();
@@ -281,7 +284,11 @@ pub mod fetch {
             qd: usize,
             buf_alloc: Option<super::uring::BufAlloc>,
         ) -> std::io::Result<Fetcher> {
-            Self::open_split(std::slice::from_ref(&(0, path.to_path_buf())), qd, buf_alloc)
+            Self::open_split(
+                std::slice::from_ref(&(0, path.to_path_buf())),
+                qd,
+                buf_alloc,
+            )
         }
 
         pub fn open_split(
@@ -316,7 +323,10 @@ pub mod fetch {
                 Ok(i) => i,
                 Err(i) => i.saturating_sub(1),
             };
-            (types::Fd(self.files[i].1.as_raw_fd()), offset - self.files[i].0)
+            (
+                types::Fd(self.files[i].1.as_raw_fd()),
+                offset - self.files[i].0,
+            )
         }
 
         pub fn fetch(&mut self, reads: &[Read]) -> std::io::Result<Vec<Slab>> {
@@ -347,12 +357,9 @@ pub mod fetch {
                     let aligned_off = local & !(ALIGN - 1);
                     let payload_off = (local - aligned_off) as usize;
                     let disk_len = (payload_off as u64 + r.len).next_multiple_of(ALIGN);
-                    let buf = Aligned::new_with(
-                        disk_len as usize + 256,
-                        ALIGN as usize,
-                        self.buf_alloc,
-                    )
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+                    let buf =
+                        Aligned::new_with(disk_len as usize + 256, ALIGN as usize, self.buf_alloc)
+                            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
                     let sqe = opcode::Read::new(fd, buf.ptr(), disk_len as u32)
                         .offset(aligned_off)
                         .build()
@@ -362,7 +369,12 @@ pub mod fetch {
                         payload_off,
                         payload_len: r.len as usize,
                     });
-                    unsafe { self.ring.submission().push(&sqe).expect("submission queue full") };
+                    unsafe {
+                        self.ring
+                            .submission()
+                            .push(&sqe)
+                            .expect("submission queue full")
+                    };
                     inflight += 1;
                     next += 1;
                 }
@@ -590,7 +602,10 @@ pub mod pipeline {
                 Ok(i) => i,
                 Err(i) => i.saturating_sub(1),
             };
-            (types::Fd(self.files[i].1.as_raw_fd()), offset - self.files[i].0)
+            (
+                types::Fd(self.files[i].1.as_raw_fd()),
+                offset - self.files[i].0,
+            )
         }
 
         /// Allocate a buffer from the pool (or return None if empty).
@@ -617,7 +632,11 @@ pub mod pipeline {
         /// and freeing them immediately.  Returns the number of completions drained.
         fn drain_ring(&mut self) -> std::io::Result<usize> {
             // Collect completions first to avoid borrow conflicts
-            let cqes: Vec<(u64, i32)> = self.ring.completion().map(|c| (c.user_data(), c.result())).collect();
+            let cqes: Vec<(u64, i32)> = self
+                .ring
+                .completion()
+                .map(|c| (c.user_data(), c.result()))
+                .collect();
             let mut count = 0;
             for (ud, res) in cqes {
                 if res < 0 {
@@ -626,7 +645,9 @@ pub mod pipeline {
                 // user_data encodes: (batch_id << 32) | slot_idx
                 let slot_idx = (ud & 0xFFFF_FFFF) as usize;
                 let batch_id = (ud >> 32) as u64;
-                let slot = self.pool[slot_idx].take().expect("completion on empty slot");
+                let slot = self.pool[slot_idx]
+                    .take()
+                    .expect("completion on empty slot");
                 let batch_pos = slot.batch_pos;
                 self.stats.reads += 1;
                 self.stats.bytes_payload += slot.payload_len as u64;
@@ -638,7 +659,8 @@ pub mod pipeline {
                     payload_len: slot.payload_len,
                 };
                 self.free_slot(slot_idx);
-                self.pending_completions.push_back((batch_id, batch_pos, pending));
+                self.pending_completions
+                    .push_back((batch_id, batch_pos, pending));
                 count += 1;
             }
             Ok(count)
@@ -751,9 +773,10 @@ pub mod pipeline {
         /// Returns `None` if the completion is not yet available (caller should
         /// call `drain_one` and retry).
         fn try_yield(&mut self, batch_id: u64, pos: usize) -> Option<Slab> {
-            let idx = self.pending_completions.iter().position(|&(bid, p, _)| {
-                bid == batch_id && p == pos
-            })?;
+            let idx = self
+                .pending_completions
+                .iter()
+                .position(|&(bid, p, _)| bid == batch_id && p == pos)?;
 
             let (_, _, pending) = self.pending_completions.remove(idx).unwrap();
             Some(Slab {
@@ -861,11 +884,18 @@ pub mod pipeline {
             let (path, _f) = temp_file(8192, "single_read");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
-            let reads = vec![Read { offset: 0, len: 4096 }];
+            let reads = vec![Read {
+                offset: 0,
+                len: 4096,
+            }];
             let batch = pl.submit(&reads).unwrap();
             let results: Vec<_> = batch.collect::<std::io::Result<Vec<_>>>().unwrap();
             assert_eq!(results.len(), 1);
@@ -881,14 +911,27 @@ pub mod pipeline {
             let (path, _f) = temp_file(65536, "multiple_reads_ordered");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
             let reads = vec![
-                Read { offset: 0, len: 4096 },
-                Read { offset: 4096, len: 4096 },
-                Read { offset: 8192, len: 4096 },
+                Read {
+                    offset: 0,
+                    len: 4096,
+                },
+                Read {
+                    offset: 4096,
+                    len: 4096,
+                },
+                Read {
+                    offset: 8192,
+                    len: 4096,
+                },
             ];
             let batch = pl.submit(&reads).unwrap();
             let results: Vec<_> = batch.collect::<std::io::Result<Vec<_>>>().unwrap();
@@ -905,12 +948,19 @@ pub mod pipeline {
             let (path, _f) = temp_file(1 << 20, "backpressure");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 2, max_slots: 2, buf_alloc: None },
+                PipelineConfig {
+                    qd: 2,
+                    max_slots: 2,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
             let reads: Vec<Read> = (0..8)
-                .map(|i| Read { offset: (i as u64) * 4096, len: 4096 })
+                .map(|i| Read {
+                    offset: (i as u64) * 4096,
+                    len: 4096,
+                })
                 .collect();
             let batch = pl.submit(&reads).unwrap();
             let results: Vec<_> = batch.collect::<std::io::Result<Vec<_>>>().unwrap();
@@ -926,7 +976,11 @@ pub mod pipeline {
             let (path, _f) = temp_file(4096, "empty_batch");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
@@ -941,12 +995,22 @@ pub mod pipeline {
             let (path, _f) = temp_file(65536, "multiple_batches");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
-            let reads_a = vec![Read { offset: 0, len: 4096 }];
-            let reads_b = vec![Read { offset: 4096, len: 4096 }];
+            let reads_a = vec![Read {
+                offset: 0,
+                len: 4096,
+            }];
+            let reads_b = vec![Read {
+                offset: 4096,
+                len: 4096,
+            }];
 
             let batch_a = pl.submit(&reads_a).unwrap();
             let res_a: Vec<_> = batch_a.collect::<std::io::Result<Vec<_>>>().unwrap();
@@ -965,13 +1029,23 @@ pub mod pipeline {
             let (path, _f) = temp_file(65536, "stats_counters");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
             let reads = vec![
-                Read { offset: 0, len: 4096 },
-                Read { offset: 8192, len: 8192 },
+                Read {
+                    offset: 0,
+                    len: 4096,
+                },
+                Read {
+                    offset: 8192,
+                    len: 8192,
+                },
             ];
             let batch = pl.submit(&reads).unwrap();
             let _: Vec<_> = batch.collect::<std::io::Result<Vec<_>>>().unwrap();
@@ -991,11 +1065,18 @@ pub mod pipeline {
             let (path, _f) = temp_file(65536, "reset_stats");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
-            let reads = vec![Read { offset: 0, len: 4096 }];
+            let reads = vec![Read {
+                offset: 0,
+                len: 4096,
+            }];
             let batch = pl.submit(&reads).unwrap();
             let _: Vec<_> = batch.collect::<std::io::Result<Vec<_>>>().unwrap();
             assert!(pl.stats().reads > 0);
@@ -1011,18 +1092,28 @@ pub mod pipeline {
             let (path, _f) = temp_file(1 << 20, "cancel_drop");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
             let reads: Vec<Read> = (0..16)
-                .map(|i| Read { offset: (i as u64) * 4096, len: 4096 })
+                .map(|i| Read {
+                    offset: (i as u64) * 4096,
+                    len: 4096,
+                })
                 .collect();
 
             let batch = pl.submit(&reads).unwrap();
             drop(batch);
 
-            let reads2 = vec![Read { offset: 0, len: 4096 }];
+            let reads2 = vec![Read {
+                offset: 0,
+                len: 4096,
+            }];
             let batch2 = pl.submit(&reads2).unwrap();
             let results: Vec<_> = batch2.collect::<std::io::Result<Vec<_>>>().unwrap();
             assert_eq!(results.len(), 1);
@@ -1034,11 +1125,18 @@ pub mod pipeline {
             let (path, _f) = temp_file(2 << 20, "large_reads");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
-            let reads = vec![Read { offset: 0, len: 1 << 20 }];
+            let reads = vec![Read {
+                offset: 0,
+                len: 1 << 20,
+            }];
             let batch = pl.submit(&reads).unwrap();
             let results: Vec<_> = batch.collect::<std::io::Result<Vec<_>>>().unwrap();
             assert_eq!(results.len(), 1);
@@ -1051,13 +1149,20 @@ pub mod pipeline {
             let (path, _f) = temp_file(4096, "invalid_offset");
             let mut pl = Pipeline::open(
                 &path,
-                PipelineConfig { qd: 4, max_slots: 8, buf_alloc: None },
+                PipelineConfig {
+                    qd: 4,
+                    max_slots: 8,
+                    buf_alloc: None,
+                },
             )
             .unwrap();
 
             // Read beyond file — io_uring returns a short read (0 bytes), not an error.
             // The slab will have a zero-length payload.
-            let reads = vec![Read { offset: 1 << 30, len: 4096 }];
+            let reads = vec![Read {
+                offset: 1 << 30,
+                len: 4096,
+            }];
             let batch = pl.submit(&reads).unwrap();
             let results: Vec<_> = batch.collect::<std::io::Result<Vec<_>>>().unwrap();
             // io_uring O_DIRECT reads past EOF return short reads without error
@@ -1074,8 +1179,14 @@ mod tests {
     #[test]
     fn plan_roundtrip() {
         let reads = vec![
-            Read { offset: 4096, len: 1536 },
-            Read { offset: 1 << 33, len: 4718592 },
+            Read {
+                offset: 4096,
+                len: 1536,
+            },
+            Read {
+                offset: 1 << 33,
+                len: 4718592,
+            },
         ];
         assert_eq!(plan_from_str(&plan_to_string(&reads)).unwrap(), reads);
     }

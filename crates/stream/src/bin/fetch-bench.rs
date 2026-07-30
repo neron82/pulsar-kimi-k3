@@ -35,7 +35,10 @@ fn plan(model: &str, count: &str, seed: &str, out: &str) {
     eprintln!(
         "universe: {} expert slabs across {} exps tensors",
         all.len(),
-        all.len() / g.arch_meta("expert_count").and_then(gguf::Value::as_u64).unwrap() as usize
+        all.len()
+            / g.arch_meta("expert_count")
+                .and_then(gguf::Value::as_u64)
+                .unwrap() as usize
     );
     // xorshift64: deterministic, identical sampling for any future re-run
     let mut picks = Vec::with_capacity(count);
@@ -47,17 +50,20 @@ fn plan(model: &str, count: &str, seed: &str, out: &str) {
     }
     std::fs::write(out, stream::plan_to_string(&picks)).expect("write plan");
     let total: u64 = picks.iter().map(|r| r.len).sum();
-    eprintln!("plan: {} reads, {:.2} GiB payload -> {}", picks.len(), total as f64 / (1u64 << 30) as f64, out);
+    eprintln!(
+        "plan: {} reads, {:.2} GiB payload -> {}",
+        picks.len(),
+        total as f64 / (1u64 << 30) as f64,
+        out
+    );
 }
 
 #[cfg(target_os = "linux")]
 fn run(model: &str, plan_file: &str, qd: &str) {
     use std::os::unix::fs::OpenOptionsExt;
     let qd: usize = qd.parse().expect("qd");
-    let reads = stream::plan_from_str(
-        &std::fs::read_to_string(plan_file).expect("read plan"),
-    )
-    .expect("parse plan");
+    let reads = stream::plan_from_str(&std::fs::read_to_string(plan_file).expect("read plan"))
+        .expect("parse plan");
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECT)
@@ -81,14 +87,16 @@ fn pipeline_run(model: &str, plan_file: &str, qd: &str, max_slots: &str) {
     use stream::pipeline::{Pipeline, PipelineConfig};
     let qd: usize = qd.parse().expect("qd");
     let max_slots: usize = max_slots.parse().expect("max_slots");
-    let reads = stream::plan_from_str(
-        &std::fs::read_to_string(plan_file).expect("read plan"),
-    )
-    .expect("parse plan");
+    let reads = stream::plan_from_str(&std::fs::read_to_string(plan_file).expect("read plan"))
+        .expect("parse plan");
 
     let mut pl = Pipeline::open(
         &std::path::Path::new(model),
-        PipelineConfig { qd, max_slots, buf_alloc: None },
+        PipelineConfig {
+            qd,
+            max_slots,
+            buf_alloc: None,
+        },
     )
     .expect("open pipeline");
 
