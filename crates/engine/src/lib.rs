@@ -978,7 +978,7 @@ mod real {
                     "\nK3 token {} [{}]: total {:.3}s, layers {:.3}s, output {:.3}s, unclassified {:.3}s\n  GPU activity {:.3}s, synchronization/readback {:.3}s, expert resolution {:.3}s (storage {:.3}s), CPU work {:.3}s\n  storage: {} bytes in {} reads; H2D {} bytes; D2H {} bytes; host cache {:.1}% ({} hits/{} misses); device cache {:.1}% ({} hits/{} misses)",
                     token.index, token.phase, token.total.as_secs_f64(), token.layers.as_secs_f64(),
                     token.output.as_secs_f64(), token.unclassified.as_secs_f64(), gpu.as_secs_f64(),
-                    sync.as_secs_f64(), resolve.as_secs_f64(), storage.as_secs_f64(), storage_bytes,
+                    sync.as_secs_f64(), resolve.as_secs_f64(), storage.as_secs_f64(), cpu.as_secs_f64(), storage_bytes,
                     storage_reads, h2d, d2h, Self::hit_rate(host_hits, host_misses), host_hits,
                     host_misses, Self::hit_rate(device_hits, device_misses), device_hits, device_misses
                 ));
@@ -1202,10 +1202,6 @@ mod real {
                 touch: std::collections::HashMap::new(),
                 hits: 0,
                 misses: 0,
-                io_bytes: 0,
-                io_reads: 0,
-                io_max_read: 0,
-                io_wait: std::time::Duration::ZERO,
             })
         }
 
@@ -1298,6 +1294,10 @@ mod real {
                 tick: 0,
                 hits: 0,
                 misses: 0,
+                io_bytes: 0,
+                io_reads: 0,
+                io_max_read: 0,
+                io_wait: std::time::Duration::ZERO,
                 pinned: Vec::new(),
             })
         }
