@@ -16,11 +16,15 @@ fn main() {
     //
     // PULSAR_CUDA_ARCH overrides (e.g. "89" for a fast dev build, or
     // "89,120" once the toolkit codegens Blackwell SASS natively).
+    // CUDA 13 dropped sm_61, so the default is filtered against the actual
+    // nvcc toolkit while older CUDA toolkits can still retain Pascal.
     // 80 must stay in the list: the int8 mma prefill GEMM gates on
     // cc >= 8 at runtime, so every >= 8.0 device needs a fatbin entry
     // compiled with __CUDA_ARCH__ >= 800 (A100 falling back to the
     // compute_61 floor PTX would silently run the empty stub)
-    let archs = std::env::var("PULSAR_CUDA_ARCH").unwrap_or_else(|_| "61,75,80,86,89".into());
+    let archs = std::env::var("PULSAR_CUDA_ARCH")
+        .map(|value| value.split(',').map(str::to_owned).collect())
+        .unwrap_or_else(|_| default_archs());
     let mut build = cc::Build::new();
     build.cuda(true).flag("-O3").flag("--use_fast_math");
     // nvcc rejects host compilers newer than its toolkit supports (e.g.
@@ -29,7 +33,12 @@ fn main() {
     if let Some(ccbin) = pick_ccbin() {
         build.flag(&format!("-ccbin={ccbin}"));
     }
-    let list: Vec<&str> = archs.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let list: Vec<&str> = archs
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     for (i, a) in list.iter().enumerate() {
         let first = i == 0;
         let last = i + 1 == list.len();
@@ -42,9 +51,37 @@ fn main() {
         };
         build.flag("-gencode").flag(&code);
     }
-    build.file("cuda/pulsar_kernels.cu").compile("pulsar_kernels");
+    build
+        .file("cuda/pulsar_kernels.cu")
+        .compile("pulsar_kernels");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+}
+
+fn default_archs() -> Vec<String> {
+    let requested = ["61", "75", "80", "86", "89"];
+    let output = std::process::Command::new("nvcc")
+        .arg("--list-gpu-arch")
+        .output();
+    let supported = match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("compute_"))
+            .map(str::to_owned)
+            .collect::<std::collections::HashSet<_>>(),
+        _ => return requested.iter().map(|arch| (*arch).into()).collect(),
+    };
+
+    let filtered = requested
+        .iter()
+        .filter(|arch| supported.contains(**arch))
+        .map(|arch| (*arch).into())
+        .collect::<Vec<String>>();
+    if filtered.is_empty() {
+        requested.iter().map(|arch| (*arch).into()).collect()
+    } else {
+        filtered
+    }
 }
 
 fn pick_ccbin() -> Option<String> {

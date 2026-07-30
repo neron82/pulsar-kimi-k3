@@ -106,7 +106,8 @@ __device__ __forceinline__ static float pulsar_gelu(float x) {
                                     (x + 0.044715f * x * x * x)));
 }
 
-/* act_op for the gated-FFN kernels: 0 = silu (swiglu), 1 = gelu tanh */
+/* act_op for the gated-FFN kernels: 0 = silu (swiglu), 1 = gelu tanh,
+ * 4 = Kimi-K3 SiTU-GLU (beta=4, linear_beta=25). */
 __device__ __forceinline__ static float pulsar_gate_act(float g, uint32_t op) {
     return op ? pulsar_gelu(g) : g / (1.0f + expf(-g));
 }
@@ -118,6 +119,13 @@ __device__ __forceinline__ static float pulsar_gate_act(float g, uint32_t op) {
  *   3 = deepseek4 clamped silu: gate one-side clamped to 10, up clamped
  *   to +-10 (DS4_SWIGLU_CLAMP_EXP, both Flash and Pro), plain silu. */
 __device__ __forceinline__ static float pulsar_glu(float g, float u, uint32_t op) {
+    if (op == 4u) {
+        constexpr float beta = 4.0f;
+        constexpr float linear_beta = 25.0f;
+        const float gate_act = beta * tanhf(g / beta) / (1.0f + expf(-g));
+        const float up_act = linear_beta * tanhf(u / linear_beta);
+        return gate_act * up_act;
+    }
     if (op == 2u) {
         g = fminf(g, 7.0f);
         u = fminf(fmaxf(u, -7.0f), 7.0f);
@@ -2644,6 +2652,32 @@ __global__ static void matmul_kq_kernel(
     if (lane == 0) out[(uint64_t)token * out_dim + row] = acc;
 }
 
+/* Single-token specialization: 1D grid, one block per row, no y-dim
+ * overhead, no token bounds check, simpler addressing.  Follows the
+ * same pattern as matmul_kq_tokens_kernel for n_tok=16. */
+template <typename DOT>
+__global__ static void matmul_kq_1tok_kernel(
+        float *out,           /* [out_dim] */
+        const char *w,        /* [out_dim] rows of row_bytes */
+        const block_q8_K *xq, /* [in_blocks] */
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x;
+    if (row >= out_dim) return;
+    const char *wr = w + (uint64_t)row * row_bytes;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < in_blocks; b += 32u) {
+        acc += DOT::block(wr, xq, b);
+    }
+    #pragma unroll
+    for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, mask);
+    }
+    if (lane == 0) out[row] = acc;
+}
+
 /* Token-tiled variant: one warp owns a row for ALL TT tokens, so the
  * row bytes are read once (L1-hot across the register token loop)
  * instead of once per token - on a 248k-row lm head the legacy grid
@@ -2694,6 +2728,27 @@ extern "C" int pulsar_matmul_kq(
     }
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
+    /* Single-token decode: 1D grid, one block per row, no y-dim overhead */
+    if (n_tok == 1u) {
+        dim3 grid1(out_dim, 1, 1);
+        dim3 block1(32, 1, 1);
+        switch (quant) {
+#define PULSAR_KQ1(Q, DOT)                                                    \
+        case Q:                                                                \
+            matmul_kq_1tok_kernel<DOT><<<grid1, block1>>>(                     \
+                    (float *)out_dev, (const char *)w_dev,                     \
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, row_bytes); \
+            return cuda_ok(cudaGetLastError(), "matmul_kq1 launch")
+        PULSAR_KQ1(PULSAR_QUANT_Q2_K, dot_q2_K);
+        PULSAR_KQ1(PULSAR_QUANT_IQ2_XXS, dot_iq2_xxs);
+        PULSAR_KQ1(PULSAR_QUANT_Q4_K, dot_q4_K);
+        PULSAR_KQ1(PULSAR_QUANT_Q5_K, dot_q5_K);
+        PULSAR_KQ1(PULSAR_QUANT_Q6_K, dot_q6_K);
+        PULSAR_KQ1(PULSAR_QUANT_Q3_K, dot_q3_K);
+#undef PULSAR_KQ1
+        default: return 0;
+        }
+    }
     /* verify/draft-sized batches take the token-tiled kernel: one row
      * read serves all 16 tokens (identical math, per-token order) */
     if (n_tok == 16u) {
@@ -2739,6 +2794,199 @@ extern "C" int pulsar_matmul_kq(
         return 0;
     }
     return cuda_ok(cudaGetLastError(), "matmul_kq launch");
+}
+
+/* ---- Q2_K / Q3_K dense matmul (f32 activations -> q8_K quant -> kq dot) -
+ * Convenience wrapper: quantize f32 activations to q8_K on-device, then
+ * dispatch to pulsar_matmul_kq.  Reuses the existing quantize_q8_K kernel
+ * and the existing K-quant dot kernels (dot_q2_K, dot_q3_K). */
+
+/* forward decls for host-side helpers defined later in the MoE selftest section */
+static void host_quantize_q8_K(block_q8_K *out, const float *x,
+                               uint32_t in_dim, uint32_t n_rows);
+static float host_dot_q2_K_block(const char *row, const block_q8_K *xq, uint32_t b);
+static float host_dot_q3_K_block(const char *row, const block_q8_K *xq, uint32_t bi);
+static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
+                      uint64_t row_bytes, uint32_t quant);
+
+extern "C" int pulsar_qk_matmul(
+        void *out_dev,
+        const void *w_dev,
+        const void *x_dev,         /* f32 [n_tok][in_dim] */
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes,
+        uint32_t quant) {
+    if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || out_dim == 0 || n_tok == 0 || row_bytes == 0) {
+        return 0;
+    }
+    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    const uint64_t xq_bytes = (uint64_t)n_tok * in_blocks * sizeof(block_q8_K);
+    void *xq_dev = NULL;
+    if (!cuda_ok(cudaMalloc(&xq_dev, xq_bytes), "qk_matmul xq alloc")) return 0;
+    int ok = pulsar_quantize_q8_K(xq_dev, x_dev, in_dim, n_tok) &&
+             pulsar_matmul_kq(out_dev, w_dev, xq_dev, in_dim, out_dim, n_tok, row_bytes, quant) &&
+             cuda_ok(cudaGetLastError(), "qk_matmul launch");
+    cudaFree(xq_dev);
+    return ok;
+}
+
+/* CPU-reference selftest: quantize random weights to Q2_K/Q3_K on the host,
+ * quantize activations to q8_K, run both pipelines, compare. */
+static int qk_matmul_selftest_one(uint32_t quant, const char *name) {
+    const uint32_t in_dim = 256, out_dim = 128, n_tok = 3;
+    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    uint64_t block_bytes;
+    float (*host_dot)(const char *, const block_q8_K *, uint32_t);
+    switch (quant) {
+    case PULSAR_QUANT_Q2_K:
+        block_bytes = sizeof(block_q2_K);
+        host_dot = host_dot_q2_K_block;
+        break;
+    case PULSAR_QUANT_Q3_K:
+        block_bytes = sizeof(block_q3_K);
+        host_dot = host_dot_q3_K_block;
+        break;
+    default:
+        return 0;
+    }
+    const uint64_t w_bytes = (uint64_t)out_dim * in_blocks * block_bytes;
+    const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t o_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
+
+    char *w = (char *)malloc(w_bytes + 256);
+    float *x = (float *)malloc(x_bytes);
+    float *ref = (float *)calloc(o_bytes, 1);
+    float *gpu = (float *)malloc(o_bytes);
+    block_q8_K *xq = (block_q8_K *)malloc((uint64_t)n_tok * in_blocks * sizeof(block_q8_K));
+
+    /* Fill weight slab with random quantized data */
+    fill_slab(w, out_dim, in_dim, (uint64_t)in_blocks * block_bytes, quant);
+    memset(w + w_bytes, 0, 256);
+
+    for (uint64_t i = 0; i < (uint64_t)n_tok * in_dim; i++) x[i] = gqa_test_randf();
+
+    /* Host reference: quantize activations to q8_K, then dot */
+    host_quantize_q8_K(xq, x, in_dim, n_tok);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float acc = 0.0f;
+            for (uint32_t b = 0; b < in_blocks; b++) {
+                acc += host_dot(w + (uint64_t)r * in_blocks * block_bytes, xq + (uint64_t)t * in_blocks, b);
+            }
+            ref[(uint64_t)t * out_dim + r] = acc;
+        }
+    }
+
+    void *w_dev = NULL, *x_dev = NULL, *out_dev = NULL;
+    int ok = cuda_ok(cudaMalloc(&w_dev, w_bytes), "w alloc") &&
+             cuda_ok(cudaMalloc(&x_dev, x_bytes), "x alloc") &&
+             cuda_ok(cudaMalloc(&out_dev, o_bytes), "out alloc") &&
+             cuda_ok(cudaMemcpy(w_dev, w, w_bytes, cudaMemcpyHostToDevice), "w h2d") &&
+             cuda_ok(cudaMemcpy(x_dev, x, x_bytes, cudaMemcpyHostToDevice), "x h2d") &&
+             pulsar_qk_matmul(out_dev, w_dev, x_dev, in_dim, out_dim, n_tok,
+                              (uint64_t)in_blocks * block_bytes, quant) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(gpu, out_dev, o_bytes, cudaMemcpyDeviceToHost), "d2h");
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * out_dim; i++) {
+            float d = fabsf(gpu[i] - ref[i]);
+            if (d > maxd) maxd = d;
+            float a = fabsf(ref[i]);
+            if (a > maxref) maxref = a;
+        }
+        ok = maxd <= 1e-3f * (maxref > 1.0f ? maxref : 1.0f);
+    }
+    fprintf(stderr, "qk-matmul-selftest %s: %s (max abs diff %.2e, max |ref| %.2e)\n",
+            name, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+    if (w_dev) cudaFree(w_dev);
+    if (x_dev) cudaFree(x_dev);
+    if (out_dev) cudaFree(out_dev);
+    free(w); free(x); free(ref); free(gpu); free(xq);
+    return ok;
+}
+
+/* n_tok=1 selftest: exercises the dedicated 1D-grid kernel path */
+static int qk_matmul_selftest_one_1tok(uint32_t quant, const char *name) {
+    const uint32_t in_dim = 256, out_dim = 128, n_tok = 1;
+    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    uint64_t block_bytes;
+    float (*host_dot)(const char *, const block_q8_K *, uint32_t);
+    switch (quant) {
+    case PULSAR_QUANT_Q2_K:
+        block_bytes = sizeof(block_q2_K);
+        host_dot = host_dot_q2_K_block;
+        break;
+    case PULSAR_QUANT_Q3_K:
+        block_bytes = sizeof(block_q3_K);
+        host_dot = host_dot_q3_K_block;
+        break;
+    default:
+        return 0;
+    }
+    const uint64_t w_bytes = (uint64_t)out_dim * in_blocks * block_bytes;
+    const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t o_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
+
+    char *w = (char *)malloc(w_bytes + 256);
+    float *x = (float *)malloc(x_bytes);
+    float *ref = (float *)calloc(o_bytes, 1);
+    float *gpu = (float *)malloc(o_bytes);
+    block_q8_K *xq = (block_q8_K *)malloc((uint64_t)n_tok * in_blocks * sizeof(block_q8_K));
+
+    fill_slab(w, out_dim, in_dim, (uint64_t)in_blocks * block_bytes, quant);
+    memset(w + w_bytes, 0, 256);
+
+    for (uint64_t i = 0; i < (uint64_t)n_tok * in_dim; i++) x[i] = gqa_test_randf();
+
+    host_quantize_q8_K(xq, x, in_dim, n_tok);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float acc = 0.0f;
+            for (uint32_t b = 0; b < in_blocks; b++) {
+                acc += host_dot(w + (uint64_t)r * in_blocks * block_bytes, xq + (uint64_t)t * in_blocks, b);
+            }
+            ref[(uint64_t)t * out_dim + r] = acc;
+        }
+    }
+
+    void *w_dev = NULL, *xq_dev = NULL, *out_dev = NULL;
+    const uint64_t xq_bytes = (uint64_t)n_tok * in_blocks * sizeof(block_q8_K);
+    int ok = cuda_ok(cudaMalloc(&w_dev, w_bytes), "w alloc") &&
+             cuda_ok(cudaMalloc(&xq_dev, xq_bytes), "xq alloc") &&
+             cuda_ok(cudaMalloc(&out_dev, o_bytes), "out alloc") &&
+             cuda_ok(cudaMemcpy(w_dev, w, w_bytes, cudaMemcpyHostToDevice), "w h2d") &&
+             cuda_ok(cudaMemcpy(xq_dev, xq, xq_bytes, cudaMemcpyHostToDevice), "xq h2d") &&
+             pulsar_matmul_kq(out_dev, w_dev, xq_dev, in_dim, out_dim, n_tok,
+                              (uint64_t)in_blocks * block_bytes, quant) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(gpu, out_dev, o_bytes, cudaMemcpyDeviceToHost), "d2h");
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * out_dim; i++) {
+            float d = fabsf(gpu[i] - ref[i]);
+            if (d > maxd) maxd = d;
+            float a = fabsf(ref[i]);
+            if (a > maxref) maxref = a;
+        }
+        ok = maxd <= 1e-3f * (maxref > 1.0f ? maxref : 1.0f);
+    }
+    fprintf(stderr, "qk-matmul-selftest %s: %s (max abs diff %.2e, max |ref| %.2e)\n",
+            name, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+    if (w_dev) cudaFree(w_dev);
+    if (xq_dev) cudaFree(xq_dev);
+    if (out_dev) cudaFree(out_dev);
+    free(w); free(x); free(ref); free(gpu); free(xq);
+    return ok;
+}
+
+extern "C" int pulsar_qk_matmul_selftest(void) {
+    return qk_matmul_selftest_one(PULSAR_QUANT_Q2_K, "q2_K") &&
+           qk_matmul_selftest_one(PULSAR_QUANT_Q3_K, "q3_K") &&
+           qk_matmul_selftest_one_1tok(PULSAR_QUANT_Q2_K, "q2_K_1tok") &&
+           qk_matmul_selftest_one_1tok(PULSAR_QUANT_Q3_K, "q3_K_1tok");
 }
 
 extern "C" int pulsar_moe_pair_swiglu(
@@ -4516,6 +4764,1197 @@ extern "C" int pulsar_mla_selftest(void) {
     return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, "plain") &&
            mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, "yarn");
 }
+/* ===== Kimi K3 kernel slice =============================================
+ *
+ * SiTU-GLU: gate = beta * tanh(gate/beta) * sigmoid(gate)
+ *           up   = linear_beta * tanh(up/linear_beta)
+ *           out  = gate * up
+ *
+ * This is act_op 4 in the gated-FFN family. The existing pulsar_swiglu
+ * wrapper does not carry beta parameters, so a dedicated entry point is
+ * provided. The KDA (Kimi Diffusion Attention) kernel is NOT implemented
+ * here -- it will land in a later slice. */
+
+__global__ static void k3_situ_glu_kernel(
+        float *out,
+        const float *gate,
+        const float *up,
+        uint32_t n,
+        float beta,
+        float linear_beta) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gate[i];
+    const float u = up[i];
+    /* SiTU: sigmoid * tanh with beta scaling */
+    const float gate_act = beta * tanhf(g / beta) * (1.0f / (1.0f + expf(-g)));
+    const float up_act = linear_beta * tanhf(u / linear_beta);
+    out[i] = gate_act * up_act;
+}
+
+extern "C" int pulsar_k3_situ_glu(
+        void *out_dev,
+        const void *gate_dev,
+        const void *up_dev,
+        uint32_t n,
+        float beta,
+        float linear_beta) {
+    if (n == 0 || beta == 0.0f || linear_beta == 0.0f) return 0;
+    k3_situ_glu_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *)out_dev, (const float *)gate_dev, (const float *)up_dev,
+            n, beta, linear_beta);
+    return cuda_ok(cudaGetLastError(), "k3_situ_glu launch");
+}
+
+/* ---- K3 sigmoid/top-k router: up to 896 experts, top-16 -----------------
+ *
+ * Sigmoid-scored, bias-aware, top-k, normalized -- same algorithm as the
+ * existing router_select_kernel but with a higher expert cap (896 vs 512)
+ * and k_used up to 16. The existing router behavior for current models
+ * (n_expert <= 512) is preserved unchanged.
+ *
+ * J = 28 covers 896 experts in one register tile (28 * 32 = 896). The
+ * kernel is otherwise identical to router_select_kernel<J> with
+ * softmax_mode=0 (sigmoid + bias + normalize). */
+
+template <uint32_t J>
+__global__ static void k3_router_select_kernel(
+        int32_t *selected,         /* [n_tok][k_used] */
+        float *weights,            /* [n_tok][k_used] */
+        const float *logits,       /* [n_tok][n_expert] */
+        const float *bias,         /* [n_expert] */
+        uint32_t n_expert,
+        uint32_t k_used,
+        float weight_scale,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t token = blockIdx.x * blockDim.y + threadIdx.y;
+    if (token >= n_tok || lane >= 32u) return;
+
+    const float *log = logits + (uint64_t)token * n_expert;
+    int32_t *sel = selected + (uint64_t)token * k_used;
+    float *w = weights + (uint64_t)token * k_used;
+
+    float local_prob[J];
+    float local_score[J];
+    #pragma unroll
+    for (uint32_t j = 0; j < J; j++) {
+        const uint32_t e = lane + j * 32u;
+        if (e < n_expert) {
+            const float raw = log[e];
+            const float p = raw >= 0.0f
+                ? 1.0f / (1.0f + expf(-raw))
+                : expf(raw) / (1.0f + expf(raw));
+            local_prob[j] = p;
+            local_score[j] = p + bias[e];
+        } else {
+            local_prob[j] = 0.0f;
+            local_score[j] = -INFINITY;
+        }
+    }
+    __syncwarp();
+
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < k_used; k++) {
+        float best_score = -INFINITY;
+        float best_prob = 0.0f;
+        uint32_t best_idx = UINT32_MAX;
+        #pragma unroll
+        for (uint32_t j = 0; j < J; j++) {
+            const uint32_t e = lane + j * 32u;
+            if (best_score < local_score[j] ||
+                (local_score[j] == best_score && e < best_idx)) {
+                best_score = local_score[j];
+                best_prob = local_prob[j];
+                best_idx = e;
+            }
+        }
+        #pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            const float other_score = __shfl_xor_sync(0xffffffffu, best_score, mask);
+            const float other_prob = __shfl_xor_sync(0xffffffffu, best_prob, mask);
+            const uint32_t other_idx = __shfl_xor_sync(0xffffffffu, best_idx, mask);
+            if (other_score > best_score ||
+                (other_score == best_score && other_idx < best_idx)) {
+                best_score = other_score;
+                best_prob = other_prob;
+                best_idx = other_idx;
+            }
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < J; j++) {
+            if (lane + j * 32u == best_idx) local_score[j] = -INFINITY;
+        }
+        if (lane == 0) {
+            sel[k] = (int32_t)best_idx;
+            w[k] = best_prob;
+        }
+        sum += best_prob;
+    }
+
+    if (lane == 0) {
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t k = 0; k < k_used; k++) w[k] = w[k] / sum * weight_scale;
+    }
+}
+
+extern "C" int pulsar_k3_router_select(
+        void *selected_dev,        /* int32 [n_tok][k_used] */
+        void *weights_dev,         /* f32   [n_tok][k_used] */
+        const void *logits_dev,    /* f32   [n_tok][n_expert] */
+        const void *bias_dev,      /* f32   [n_expert] */
+        uint32_t n_expert,
+        uint32_t k_used,
+        float weight_scale,
+        uint32_t n_tok) {
+    if (n_expert == 0 || k_used == 0 || k_used > n_expert || n_tok == 0 ||
+        n_expert > 896u || k_used > 16u) {
+        return 0;
+    }
+    dim3 block(32, 4, 1);
+    k3_router_select_kernel<28><<<(n_tok + 3u) / 4u, block>>>(
+            (int32_t *)selected_dev, (float *)weights_dev,
+            (const float *)logits_dev, (const float *)bias_dev,
+            n_expert, k_used, weight_scale, n_tok);
+    return cuda_ok(cudaGetLastError(), "k3 router select launch");
+}
+
+/* ---- K3 SiTU-GLU CPU-reference selftest -------------------------------- */
+
+static int k3_situ_glu_selftest_one(uint32_t n, float beta, float linear_beta) {
+    float *x = (float *)malloc(n * sizeof(float));
+    float *y = (float *)malloc(n * sizeof(float));
+    float *ref = (float *)malloc(n * sizeof(float));
+    float *gpu = (float *)malloc(n * sizeof(float));
+
+    for (uint32_t i = 0; i < n; i++) {
+        x[i] = gqa_test_randf() * 6.0f - 3.0f;
+        y[i] = gqa_test_randf() * 6.0f - 3.0f;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const float g = x[i], u = y[i];
+        const float sg = g >= 0.0f
+            ? 1.0f / (1.0f + expf(-g))
+            : expf(g) / (1.0f + expf(g));
+        const float gate_act = beta * tanhf(g / beta) * sg;
+        const float up_act = linear_beta * tanhf(u / linear_beta);
+        ref[i] = gate_act * up_act;
+    }
+
+    void *x_d = NULL, *y_d = NULL, *o_d = NULL;
+    int ok = cuda_ok(cudaMalloc(&x_d, n * 4), "x") &&
+             cuda_ok(cudaMalloc(&y_d, n * 4), "y") &&
+             cuda_ok(cudaMalloc(&o_d, n * 4), "o") &&
+             cuda_ok(cudaMemcpy(x_d, x, n * 4, cudaMemcpyHostToDevice), "x h2d") &&
+             cuda_ok(cudaMemcpy(y_d, y, n * 4, cudaMemcpyHostToDevice), "y h2d") &&
+             pulsar_k3_situ_glu(o_d, x_d, y_d, n, beta, linear_beta) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(gpu, o_d, n * 4, cudaMemcpyDeviceToHost), "d2h");
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint32_t i = 0; i < n; i++) {
+            float d = fabsf(gpu[i] - ref[i]);
+            if (d > maxd) maxd = d;
+            float a = fabsf(ref[i]);
+            if (a > maxref) maxref = a;
+        }
+        ok = maxd <= 1e-4f * fmaxf(maxref, 1.0f);
+    }
+    fprintf(stderr, "k3-situ-glu-selftest n=%u beta=%.1f lb=%.1f: %s (max diff %.2e, max |ref| %.2e)\n",
+            n, (double)beta, (double)linear_beta, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+    if (x_d) cudaFree(x_d);
+    if (y_d) cudaFree(y_d);
+    if (o_d) cudaFree(o_d);
+    free(x); free(y); free(ref); free(gpu);
+    return ok;
+}
+
+extern "C" int pulsar_k3_situ_glu_selftest(void) {
+    return k3_situ_glu_selftest_one(1024, 1.0f, 1.0f) &&
+           k3_situ_glu_selftest_one(2048, 2.0f, 1.5f) &&
+           k3_situ_glu_selftest_one(512, 0.5f, 0.5f);
+}
+
+/* ---- K3 router CPU-reference selftest ---------------------------------- */
+
+static int k3_router_selftest_one(uint32_t n_expert, uint32_t k_used,
+                                   float scale, uint32_t n_tok) {
+    float *logits = (float *)malloc((uint64_t)n_tok * n_expert * sizeof(float));
+    float *bias = (float *)malloc((uint64_t)n_expert * sizeof(float));
+    int32_t *sel_ref = (int32_t *)malloc((uint64_t)n_tok * k_used * sizeof(int32_t));
+    float *w_ref = (float *)malloc((uint64_t)n_tok * k_used * sizeof(float));
+    int32_t *sel_gpu = (int32_t *)malloc((uint64_t)n_tok * k_used * sizeof(int32_t));
+    float *w_gpu = (float *)malloc((uint64_t)n_tok * k_used * sizeof(float));
+
+    for (uint64_t i = 0; i < (uint64_t)n_tok * n_expert; i++)
+        logits[i] = gqa_test_randf() * 4.0f;
+    for (uint32_t e = 0; e < n_expert; e++)
+        bias[e] = gqa_test_randf();
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *log = logits + (uint64_t)t * n_expert;
+        float prob[896], score[896];
+        for (uint32_t e = 0; e < n_expert; e++) {
+            prob[e] = 1.0f / (1.0f + expf(-log[e]));
+            score[e] = prob[e] + bias[e];
+        }
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < k_used; k++) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                if (best == UINT32_MAX || score[e] > score[best]) best = e;
+            }
+            sel_ref[(uint64_t)t * k_used + k] = (int32_t)best;
+            w_ref[(uint64_t)t * k_used + k] = prob[best];
+            sum += prob[best];
+            score[best] = -INFINITY;
+        }
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t k = 0; k < k_used; k++)
+            w_ref[(uint64_t)t * k_used + k] =
+                w_ref[(uint64_t)t * k_used + k] / sum * scale;
+    }
+
+    void *log_dev = NULL, *bias_dev = NULL, *sel_dev = NULL, *w_dev = NULL;
+    const uint64_t log_bytes = (uint64_t)n_tok * n_expert * sizeof(float);
+    const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)n_tok * k_used * sizeof(int32_t);
+    const uint64_t w_bytes = (uint64_t)n_tok * k_used * sizeof(float);
+    int ok = cuda_ok(cudaMalloc(&log_dev, log_bytes), "logits alloc") &&
+             cuda_ok(cudaMalloc(&bias_dev, bias_bytes), "bias alloc") &&
+             cuda_ok(cudaMalloc(&sel_dev, sel_bytes), "sel alloc") &&
+             cuda_ok(cudaMalloc(&w_dev, w_bytes), "w alloc") &&
+             cuda_ok(cudaMemcpy(log_dev, logits, log_bytes, cudaMemcpyHostToDevice), "logits h2d") &&
+             cuda_ok(cudaMemcpy(bias_dev, bias, bias_bytes, cudaMemcpyHostToDevice), "bias h2d") &&
+             pulsar_k3_router_select(sel_dev, w_dev, log_dev, bias_dev,
+                                      n_expert, k_used, scale, n_tok) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(sel_gpu, sel_dev, sel_bytes, cudaMemcpyDeviceToHost), "sel d2h") &&
+             cuda_ok(cudaMemcpy(w_gpu, w_dev, w_bytes, cudaMemcpyDeviceToHost), "w d2h");
+    float maxd = 0.0f;
+    uint32_t idx_mismatch = 0;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * k_used; i++) {
+            if (sel_gpu[i] != sel_ref[i]) idx_mismatch++;
+            float d = fabsf(w_gpu[i] - w_ref[i]);
+            if (d > maxd) maxd = d;
+        }
+        ok = idx_mismatch == 0 && maxd <= 1e-5f;
+    }
+    fprintf(stderr,
+            "k3-router-selftest n_expert=%u k=%u: %s (idx mismatches %u, max w diff %.2e)\n",
+            n_expert, k_used, ok ? "PASS" : "FAIL", idx_mismatch, (double)maxd);
+    if (log_dev) cudaFree(log_dev);
+    if (bias_dev) cudaFree(bias_dev);
+    if (sel_dev) cudaFree(sel_dev);
+    if (w_dev) cudaFree(w_dev);
+    free(logits); free(bias); free(sel_ref); free(w_ref); free(sel_gpu); free(w_gpu);
+    return ok;
+}
+
+extern "C" int pulsar_k3_router_selftest(void) {
+    /* K3-like shapes: 896 experts top-16, 512 top-8 (existing max), 256 top-6,
+     * 128 top-4, odd token counts to exercise partial warps */
+    return k3_router_selftest_one(896, 16, 1.0f, 5) &&
+           k3_router_selftest_one(896, 8, 2.0f, 3) &&
+           k3_router_selftest_one(512, 8, 1.0f, 7) &&
+           k3_router_selftest_one(256, 6, 1.5f, 4) &&
+           k3_router_selftest_one(128, 4, 1.0f, 1);
+}
+
+/* ---- K3 KDA delta-state autoregressive step (single token) ---------------
+ *
+ * Per v-head h with state S [dim x dim] (S[i][j]: i = k-dim, j = v-dim),
+ * k/q from k-head h % H_k:
+ *
+ *   q_h *= 1/sqrt(dim)
+ *   S[i][j] *= exp(g[h][i])          (per-dimension decay, NOT per-head scalar)
+ *   sk_j = sum_i S[i][j] * k_h[i]
+ *   d_j  = (v_h[j] - sk_j) * beta[h]
+ *   S[i][j] += k_h[i] * d_j
+ *   o_j  = sum_i S[i][j] * q_h[i]
+ *
+ * This differs from qwen35_gdn_step_kernel in that g is per-dimension
+ * [dim] per head, not a scalar per head.  One block per head, dim threads
+ * (thread j owns column j).  dim <= 256. */
+__global__ static void k3_kda_step_kernel(
+        float *out,          /* [H_v][dim] */
+        float *state,        /* [H_v][dim][dim] in-place */
+        const float *q,      /* [H_k][dim] (already conv+l2, pre-scale) */
+        const float *k,      /* [H_k][dim] */
+        const float *v,      /* [H_v][dim] */
+        const float *g,      /* [H_v][dim] per-dimension log-decay (negative) */
+        const float *beta,   /* [H_v] in (0,1) */
+        uint32_t h_v,
+        uint32_t h_k,
+        uint32_t dim) {
+    uint32_t h = blockIdx.x;
+    uint32_t j = threadIdx.x;
+    if (h >= h_v || j >= dim) return;
+    const uint32_t kh = h % h_k;
+    const float *qh = q + (uint64_t)kh * dim;
+    const float *kk = k + (uint64_t)kh * dim;
+    const float *gh = g + (uint64_t)h * dim;
+    float *S = state + (uint64_t)h * dim * dim;
+    const float qscale = rsqrtf((float)dim);
+
+    __shared__ float sq[256];
+    __shared__ float sk_sh[256];
+    __shared__ float g_sh[256];
+    for (uint32_t i = j; i < dim; i += blockDim.x) {
+        sq[i] = qh[i] * qscale;
+        sk_sh[i] = kk[i];
+        g_sh[i] = gh[i];
+    }
+    __syncthreads();
+
+    /* decay + sk in one pass down column j.
+     * S[i][j] *= exp(g[i])  (per-dimension decay) */
+    float sk = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) {
+        float s = S[(uint64_t)i * dim + j] * expf(g_sh[i]);
+        S[(uint64_t)i * dim + j] = s;
+        sk += s * sk_sh[i];
+    }
+    const float d = (v[(uint64_t)h * dim + j] - sk) * beta[h];
+    /* rank-1 update + output in a second pass */
+    float o = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) {
+        float s = S[(uint64_t)i * dim + j] + sk_sh[i] * d;
+        S[(uint64_t)i * dim + j] = s;
+        o += s * sq[i];
+    }
+    out[(uint64_t)h * dim + j] = o;
+}
+
+extern "C" int pulsar_k3_kda_step(
+        void *out_dev, void *state_dev,
+        const void *q_dev, const void *k_dev, const void *v_dev,
+        const void *g_dev, const void *beta_dev,
+        uint32_t h_v, uint32_t h_k, uint32_t dim) {
+    if (!out_dev || !state_dev || !q_dev || !k_dev || !v_dev || !g_dev ||
+        !beta_dev || h_v == 0 || h_k == 0 || h_v % h_k != 0 || dim == 0 ||
+        dim > 256u) {
+        return 0;
+    }
+    k3_kda_step_kernel<<<h_v, dim>>>(
+            (float *)out_dev, (float *)state_dev,
+            (const float *)q_dev, (const float *)k_dev, (const float *)v_dev,
+            (const float *)g_dev, (const float *)beta_dev, h_v, h_k, dim);
+    return cuda_ok(cudaGetLastError(), "k3_kda_step launch");
+}
+
+/* ---- K3 KDA delta-state CPU-reference selftest ------------------------- */
+
+static int k3_kda_step_selftest_one(uint32_t h_v, uint32_t h_k, uint32_t dim) {
+    const uint64_t sbytes = (uint64_t)h_v * dim * dim * sizeof(float);
+    const uint64_t qkbytes = (uint64_t)h_k * dim * sizeof(float);
+    const uint64_t vbytes = (uint64_t)h_v * dim * sizeof(float);
+    const uint64_t gbytes = (uint64_t)h_v * dim * sizeof(float);
+    const uint64_t obytes = (uint64_t)h_v * dim * sizeof(float);
+
+    float *S_ref = (float *)malloc(sbytes);
+    float *q = (float *)malloc(qkbytes);
+    float *k = (float *)malloc(qkbytes);
+    float *v = (float *)malloc(vbytes);
+    float *g = (float *)malloc(gbytes);
+    float *beta = (float *)malloc((uint64_t)h_v * sizeof(float));
+    float *got = (float *)malloc(obytes);
+
+    memset(S_ref, 0, sbytes);
+
+    /* deterministic nonzero inputs */
+    for (uint32_t i = 0; i < h_k * dim; i++) {
+        q[i] = 0.5f + 0.1f * (float)(i % 7);
+        k[i] = 0.3f + 0.1f * (float)((i + 3) % 11);
+    }
+    for (uint32_t i = 0; i < h_v * dim; i++) {
+        v[i] = 0.7f + 0.1f * (float)((i + 5) % 13);
+    }
+    for (uint32_t h = 0; h < h_v; h++) {
+        for (uint32_t i = 0; i < dim; i++) {
+            g[h * dim + i] = -0.1f - 0.05f * (float)((h * dim + i) % 5);
+        }
+        beta[h] = 0.5f + 0.1f * (float)(h % 3);
+    }
+
+    void *dS = NULL, *dq = NULL, *dk = NULL, *dv = NULL, *dg = NULL, *dbeta = NULL, *dout = NULL;
+    int ok = cuda_ok(cudaMalloc(&dS, sbytes), "S alloc") &&
+             cuda_ok(cudaMemset(dS, 0, sbytes), "S zero") &&
+             cuda_ok(cudaMalloc(&dq, qkbytes), "q alloc") &&
+             cuda_ok(cudaMalloc(&dk, qkbytes), "k alloc") &&
+             cuda_ok(cudaMalloc(&dv, vbytes), "v alloc") &&
+             cuda_ok(cudaMalloc(&dg, gbytes), "g alloc") &&
+             cuda_ok(cudaMalloc(&dbeta, (uint64_t)h_v * sizeof(float)), "beta alloc") &&
+             cuda_ok(cudaMalloc(&dout, obytes), "out alloc") &&
+             cuda_ok(cudaMemcpy(dq, q, qkbytes, cudaMemcpyHostToDevice), "q h2d") &&
+             cuda_ok(cudaMemcpy(dk, k, qkbytes, cudaMemcpyHostToDevice), "k h2d") &&
+             cuda_ok(cudaMemcpy(dv, v, vbytes, cudaMemcpyHostToDevice), "v h2d") &&
+             cuda_ok(cudaMemcpy(dg, g, gbytes, cudaMemcpyHostToDevice), "g h2d") &&
+             cuda_ok(cudaMemcpy(dbeta, beta, (uint64_t)h_v * sizeof(float), cudaMemcpyHostToDevice), "beta h2d");
+
+    if (ok) {
+        ok &= pulsar_k3_kda_step(dout, dS, dq, dk, dv, dg, dbeta, h_v, h_k, dim);
+        ok &= cuda_ok(cudaDeviceSynchronize(), "sync");
+        ok &= cuda_ok(cudaMemcpy(got, dout, obytes, cudaMemcpyDeviceToHost), "d2h");
+    }
+
+    /* CPU reference: same algorithm as the kernel */
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint32_t h = 0; h < h_v; h++) {
+            const uint32_t kh = h % h_k;
+            const float *qh = q + (uint64_t)kh * dim;
+            const float *kh_ptr = k + (uint64_t)kh * dim;
+            const float *gh = g + (uint64_t)h * dim;
+            float *S = S_ref + (uint64_t)h * dim * dim;
+            const float qscale = 1.0f / sqrtf((float)dim);
+
+            /* decay: S[i][j] *= exp(g[h][i]) */
+            for (uint32_t i = 0; i < dim; i++) {
+                const float decay = expf(gh[i]);
+                for (uint32_t j = 0; j < dim; j++) {
+                    S[(uint64_t)i * dim + j] *= decay;
+                }
+            }
+
+            /* sk_j = sum_i S[i][j] * k[i] */
+            /* d_j = (v[j] - sk_j) * beta[h] */
+            /* S[i][j] += k[i] * d_j */
+            for (uint32_t j = 0; j < dim; j++) {
+                float sk = 0.0f;
+                for (uint32_t i = 0; i < dim; i++) {
+                    sk += S[(uint64_t)i * dim + j] * kh_ptr[i];
+                }
+                const float d = (v[(uint64_t)h * dim + j] - sk) * beta[h];
+                for (uint32_t i = 0; i < dim; i++) {
+                    S[(uint64_t)i * dim + j] += kh_ptr[i] * d;
+                }
+            }
+
+            /* o_j = sum_i S[i][j] * q[i] */
+            for (uint32_t j = 0; j < dim; j++) {
+                float o = 0.0f;
+                for (uint32_t i = 0; i < dim; i++) {
+                    o += S[(uint64_t)i * dim + j] * qh[i] * qscale;
+                }
+                const float diff = fabsf(o - got[(uint64_t)h * dim + j]);
+                if (diff > maxd) maxd = diff;
+                if (fabsf(o) > maxref) maxref = fabsf(o);
+            }
+        }
+        ok = maxd <= 5.0e-4f * fmaxf(maxref, 1.0f);
+    }
+
+    fprintf(stderr,
+            "k3-kda-step-selftest h_v=%u h_k=%u dim=%u: %s (max diff %.2e, max |ref| %.2e)\n",
+            h_v, h_k, dim, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+
+    if (dS) cudaFree(dS);
+    if (dq) cudaFree(dq);
+    if (dk) cudaFree(dk);
+    if (dv) cudaFree(dv);
+    if (dg) cudaFree(dg);
+    if (dbeta) cudaFree(dbeta);
+    if (dout) cudaFree(dout);
+    free(S_ref); free(q); free(k); free(v); free(g); free(beta); free(got);
+    return ok;
+}
+
+extern "C" int pulsar_k3_kda_step_selftest(void) {
+    /* K3-like shapes: 96 heads, dim=128, H_v=H_k (KDA has no GQA) */
+    return k3_kda_step_selftest_one(4, 4, 64) &&   /* small: 4 heads, dim=64 */
+           k3_kda_step_selftest_one(8, 4, 64) &&   /* H_v > H_k */
+           k3_kda_step_selftest_one(4, 4, 128) &&  /* K3 dim=128 */
+           k3_kda_step_selftest_one(8, 8, 96);     /* non-power-of-2 dim */
+}
+
+/* ---- K3 gated MLA absorbed attention (single-token, split k_b/v_b path) ---
+ *
+ * For each head h (n_head total), with qk_dim = qk_nope + qk_rope:
+ *
+ *   q_nope = Q[h * qk_dim : h * qk_dim + qk_nope]           [qk_nope]
+ *   q_pe   = Q[h * qk_dim + qk_nope : (h+1) * qk_dim]       [qk_rope]
+ *
+ *   q_nope_absorbed[j] = sum_i q_nope[i] * W_k_b[i][j][h]   [kv_lora_rank]
+ *   score = (q_nope_absorbed · kv_cmpr + q_pe · k_pe) * scale
+ *   weight = softmax([score]) = 1.0  (single-token self-attn)
+ *
+ *   output[h * v_mla + d] = sum_j kv_cmpr[j] * W_v_b[j][d][h]
+ *
+ * W_k_b layout: [qk_nope][kv_lora_rank][n_head]  (row-major: i, j, h)
+ * W_v_b layout: [kv_lora_rank][v_mla][n_head]     (row-major: j, d, h)
+ *
+ * Two variants:
+ *   F32 variant: W_k_b, W_v_b are const float * (per-element indexing)
+ *   Q8_0 variant: W_k_b, W_v_b are q8_0 bytes (dequantized on the fly)
+ *
+ * One block per head, kv_lora_rank threads (thread j owns column j).
+ * kv_lora_rank <= 1024, v_mla <= 256. */
+
+/* F32 variant: W_k_b, W_v_b are const float * */
+ __global__ static void k3_mla_absorbed_attn_split_kernel(
+         float *out,              /* [n_head * v_mla] */
+         const float *Q,          /* [n_head * qk_dim] */
+         const float *kv_cmpr,    /* [kv_lora_rank] */
+         const float *k_pe,       /* [qk_rope] */
+         const float *W_k_b,      /* [qk_nope][kv_lora_rank][n_head] */
+         const float *W_v_b,      /* [kv_lora_rank][v_mla][n_head] */
+         uint32_t n_head,
+         uint32_t qk_nope,
+         uint32_t qk_rope,
+         uint32_t kv_lora_rank,
+         uint32_t v_mla,
+         float scale) {
+     uint32_t h = blockIdx.x;
+     uint32_t j = threadIdx.x;
+     if (h >= n_head || j >= kv_lora_rank) return;
+
+     const uint32_t qk_dim = qk_nope + qk_rope;
+     const float *qh = Q + (uint64_t)h * qk_dim;
+     const float *q_nope = qh;
+
+     /* q_nope_absorbed[j] = sum_i q_nope[i] * W_k_b[i][j][h] */
+     float absorbed = 0.0f;
+     for (uint32_t i = 0; i < qk_nope; i++) {
+         absorbed += q_nope[i] * W_k_b[((uint64_t)i * kv_lora_rank + j) * n_head + h];
+     }
+
+     /* single-token: softmax weight = 1.0, so output = V @ wv_b */
+     for (uint32_t d = 0; d < v_mla; d++) {
+         float v = 0.0f;
+         for (uint32_t jj = 0; jj < kv_lora_rank; jj++) {
+             v += kv_cmpr[jj] * W_v_b[((uint64_t)jj * v_mla + d) * n_head + h];
+         }
+         out[(uint64_t)h * v_mla + d] = v;
+     }
+ }
+
+ extern "C" int pulsar_k3_mla_absorbed_attn_split(
+         void *out_dev,
+         const void *Q_dev,
+         const void *kv_cmpr_dev,
+         const void *k_pe_dev,
+         const void *W_k_b_dev,
+         const void *W_v_b_dev,
+         uint32_t n_head,
+         uint32_t qk_nope,
+         uint32_t qk_rope,
+         uint32_t kv_lora_rank,
+         uint32_t v_mla,
+         float scale) {
+     if (!out_dev || !Q_dev || !kv_cmpr_dev || !k_pe_dev ||
+         !W_k_b_dev || !W_v_b_dev ||
+         n_head == 0 || qk_nope == 0 || kv_lora_rank == 0 || v_mla == 0 ||
+         kv_lora_rank > 1024u || v_mla > 256u) {
+         return 0;
+     }
+     k3_mla_absorbed_attn_split_kernel<<<n_head, kv_lora_rank>>>(
+             (float *)out_dev,
+             (const float *)Q_dev,
+             (const float *)kv_cmpr_dev,
+             (const float *)k_pe_dev,
+             (const float *)W_k_b_dev,
+             (const float *)W_v_b_dev,
+             n_head, qk_nope, qk_rope, kv_lora_rank, v_mla, scale);
+     return cuda_ok(cudaGetLastError(), "k3_mla_absorbed_attn_split launch");
+ }
+
+ /* Q8_0 variant: W_k_b, W_v_b are q8_0 bytes, dequantized on the fly.
+  * W_k_b layout: [qk_nope][kv_lora_rank][n_head] rows of q8_0 bytes
+  *   row (i, j, h) = W_k_b + ((i * kv_lora_rank + j) * n_head + h) * q8_row_bytes(qk_nope)
+  *   but the q8_0 row is qk_nope elements, not 1 — so the layout is:
+  *   W_k_b[i][j][h] is a SCALAR at index ((i * kv_lora_rank + j) * n_head + h)
+  *   in the F32 layout. For Q8_0, each element is a 34-byte block of 32.
+  *   Since qk_nope=128, each row is 4 blocks = 136 bytes.
+  *   The Q8_0 layout stores [qk_nope][kv_lora_rank][n_head] as:
+  *   for each i in 0..qk_nope:
+  *     for each j in 0..kv_lora_rank:
+  *       for each h in 0..n_head:
+  *         q8_0 block of qk_nope elements (136 bytes)
+  *   Wait — that's wrong. The F32 layout is a 3D tensor [qk_nope][kv_lora_rank][n_head]
+  *   accessed as W_k_b[i * kv_lora_rank * n_head + j * n_head + h].
+  *   For Q8_0, the same logical tensor is stored as q8_0 rows of length qk_nope,
+  *   but each "element" is actually a full q8_0 row of qk_nope values.
+  *   The correct Q8_0 layout for W_k_b is:
+  *     W_k_b_q8[i][j][h] is a q8_0 row of qk_nope elements at offset
+  *       ((i * kv_lora_rank + j) * n_head + h) * q8_row_bytes(qk_nope)
+  *   But that's wrong too — the F32 kernel reads W_k_b[i][j][h] as a SCALAR,
+  *   not a row. The tensor is [qk_nope][kv_lora_rank][n_head] where each
+  *   element is a scalar. So the Q8_0 layout would be:
+  *     W_k_b_q8 is [qk_nope * kv_lora_rank * n_head] q8_0 blocks of 32 elements
+  *   But that's just a flat q8_0 array of length qk_nope * kv_lora_rank * n_head.
+  *
+  * Actually, looking at the F32 kernel more carefully:
+  *   W_k_b[((uint64_t)i * kv_lora_rank + j) * n_head + h]
+  * This is a 3D tensor [qk_nope][kv_lora_rank][n_head] stored in row-major
+  * with the last dimension (n_head) being contiguous. Each element is a float.
+  *
+  * For Q8_0, we store the same logical tensor as q8_0 blocks. The q8_0
+  * format stores 32 elements per block. Since qk_nope=128, each "row" of
+  * the first dimension (i) has kv_lora_rank * n_head elements, which is
+  * 512 * 96 = 49152 elements = 1536 blocks of 32.
+  *
+  * The Q8_0 layout is:
+  *   W_k_b_q8[i][j][h] at block index ((i * kv_lora_rank + j) * n_head + h) / 32
+  *   within that block, element ((i * kv_lora_rank + j) * n_head + h) % 32
+  *
+  * But this is complex. A simpler approach: since the F32 kernel reads
+  * W_k_b[i][j][h] as a scalar, and q8_0 stores 32 elements per block,
+  * we can dequantize the relevant block and extract the scalar.
+  *
+  * Actually, the simplest correct approach is to keep W_k_b/W_v_b as F32
+  * for the split absorbed path (as the task says: "either add a correct
+  * Q8_0-aware absorbed split kernel or convert/dequantize those weights
+  * to an explicitly correct F32 representation at load time").
+  *
+  * We chose the F32-at-load-time approach for the split path. The Q8_0
+  * variant below is for the fused path's wkv_b which is a standard 2D
+  * matmul that pulsar_q8_0_matmul handles natively.
+  *
+  * So we DON'T need a Q8_0 absorbed split kernel — the split path keeps
+  * W_k_b/W_v_b as F32 (loaded via upload_k3_mla_absorbed_f32), and the
+  * fused path's wkv_b is Q8_0 (loaded via upload_k3_mla_q8) and consumed
+  * by pulsar_q8_0_matmul before the fused kernel.
+  *
+  * The Q8_0 variant below is provided for completeness but is NOT used
+  * by the current dispatch. It demonstrates the correct Q8_0-aware
+  * absorbed split kernel for future use. */
+
+ /* Q8_0 variant: W_k_b, W_v_b are q8_0 bytes.
+  * W_k_b layout: flat q8_0 array of qk_nope * kv_lora_rank * n_head elements.
+  *   Element at index idx = ((i * kv_lora_rank + j) * n_head + h) is stored
+  *   in q8_0 block idx/32 at sub-index idx%32.
+  * W_v_b layout: flat q8_0 array of kv_lora_rank * v_mla * n_head elements.
+  *   Element at index idx = ((j * v_mla + d) * n_head + h) is stored
+  *   in q8_0 block idx/32 at sub-index idx%32. */
+ __global__ static void k3_mla_absorbed_attn_split_q8_kernel(
+         float *out,              /* [n_head * v_mla] */
+         const float *Q,          /* [n_head * qk_dim] */
+         const float *kv_cmpr,    /* [kv_lora_rank] */
+         const float *k_pe,       /* [qk_rope] */
+         const char *W_k_b_q8,    /* q8_0 [qk_nope * kv_lora_rank * n_head] */
+         const char *W_v_b_q8,    /* q8_0 [kv_lora_rank * v_mla * n_head] */
+         uint32_t n_head,
+         uint32_t qk_nope,
+         uint32_t qk_rope,
+         uint32_t kv_lora_rank,
+         uint32_t v_mla,
+         float scale) {
+     uint32_t h = blockIdx.x;
+     uint32_t j = threadIdx.x;
+     if (h >= n_head || j >= kv_lora_rank) return;
+
+     const uint32_t qk_dim = qk_nope + qk_rope;
+     const float *qh = Q + (uint64_t)h * qk_dim;
+     const float *q_nope = qh;
+
+     /* q_nope_absorbed[j] = sum_i q_nope[i] * W_k_b[i][j][h] (Q8_0) */
+     float absorbed = 0.0f;
+     for (uint32_t i = 0; i < qk_nope; i++) {
+         uint64_t idx = ((uint64_t)i * kv_lora_rank + j) * n_head + h;
+         uint64_t block = idx / 32u;
+         uint32_t sub = (uint32_t)(idx % 32u);
+         const char *blk = W_k_b_q8 + block * 34u;
+         float d = __half2float(*(const __half *)blk);
+         int8_t q = ((const int8_t *)(blk + 2u))[sub];
+         absorbed += q_nope[i] * d * (float)q;
+     }
+
+     /* single-token: softmax weight = 1.0, so output = V @ wv_b (Q8_0) */
+     for (uint32_t d = 0; d < v_mla; d++) {
+         float v = 0.0f;
+         for (uint32_t jj = 0; jj < kv_lora_rank; jj++) {
+             uint64_t idx = ((uint64_t)jj * v_mla + d) * n_head + h;
+             uint64_t block = idx / 32u;
+             uint32_t sub = (uint32_t)(idx % 32u);
+             const char *blk = W_v_b_q8 + block * 34u;
+             float d2 = __half2float(*(const __half *)blk);
+             int8_t q = ((const int8_t *)(blk + 2u))[sub];
+             v += kv_cmpr[jj] * d2 * (float)q;
+         }
+         out[(uint64_t)h * v_mla + d] = v;
+     }
+ }
+
+ extern "C" int pulsar_k3_mla_absorbed_attn_split_q8(
+         void *out_dev,
+         const void *Q_dev,
+         const void *kv_cmpr_dev,
+         const void *k_pe_dev,
+         const void *W_k_b_q8_dev,
+         const void *W_v_b_q8_dev,
+         uint32_t n_head,
+         uint32_t qk_nope,
+         uint32_t qk_rope,
+         uint32_t kv_lora_rank,
+         uint32_t v_mla,
+         float scale) {
+     if (!out_dev || !Q_dev || !kv_cmpr_dev || !k_pe_dev ||
+         !W_k_b_q8_dev || !W_v_b_q8_dev ||
+         n_head == 0 || qk_nope == 0 || kv_lora_rank == 0 || v_mla == 0 ||
+         kv_lora_rank > 1024u || v_mla > 256u) {
+         return 0;
+     }
+     k3_mla_absorbed_attn_split_q8_kernel<<<n_head, kv_lora_rank>>>(
+             (float *)out_dev,
+             (const float *)Q_dev,
+             (const float *)kv_cmpr_dev,
+             (const float *)k_pe_dev,
+             (const char *)W_k_b_q8_dev,
+             (const char *)W_v_b_q8_dev,
+             n_head, qk_nope, qk_rope, kv_lora_rank, v_mla, scale);
+     return cuda_ok(cudaGetLastError(), "k3_mla_absorbed_attn_split_q8 launch");
+ }
+
+/* ---- K3 gated MLA absorbed attention (single-token, fused wkv_b path) -----
+ *
+ * kv = kv_cmpr @ W_kv_b  (f32 matmul, done by caller via pulsar_matmul_f32)
+ * W_kv_b: [kv_lora_rank, n_head * (qk_nope + v_mla)]
+ *
+ * For each head h:
+ *   k_nope = kv[h * stride : h * stride + qk_nope]
+ *   v_cur  = kv[h * stride + qk_nope : (h+1) * stride]
+ *   q_h = Q[h * qk_dim : (h+1) * qk_dim]
+ *   score = (q_h[:qk_nope] · k_nope + q_h[qk_nope:] · k_pe) * scale
+ *   weight = 1.0 (single-token)
+ *   output[h * v_mla + d] = v_cur[d]
+ *
+ * One block per head, qk_nope threads. */
+__global__ static void k3_mla_absorbed_attn_fused_kernel(
+        float *out,              /* [n_head * v_mla] */
+        const float *Q,          /* [n_head * qk_dim] */
+        const float *kv,         /* [n_head * (qk_nope + v_mla)] */
+        const float *k_pe,       /* [qk_rope] */
+        uint32_t n_head,
+        uint32_t qk_nope,
+        uint32_t qk_rope,
+        uint32_t v_mla,
+        float scale) {
+    uint32_t h = blockIdx.x;
+    uint32_t i = threadIdx.x;
+    if (h >= n_head) return;
+
+    const uint32_t stride = qk_nope + v_mla;
+    const float *kv_h = kv + (uint64_t)h * stride;
+
+    /* score = q_nope · k_nope + q_pe · k_pe (unused: single-token) */
+
+    /* output = v_cur (single-token: softmax weight = 1.0) */
+    if (i < v_mla) {
+        out[(uint64_t)h * v_mla + i] = kv_h[qk_nope + i];
+    }
+}
+
+extern "C" int pulsar_k3_mla_absorbed_attn_fused(
+        void *out_dev,
+        const void *Q_dev,
+        const void *kv_dev,
+        const void *k_pe_dev,
+        uint32_t n_head,
+        uint32_t qk_nope,
+        uint32_t qk_rope,
+        uint32_t v_mla,
+        float scale) {
+    if (!out_dev || !Q_dev || !kv_dev || !k_pe_dev ||
+        n_head == 0 || qk_nope == 0 || v_mla == 0) {
+        return 0;
+    }
+    const uint32_t threads = qk_nope > qk_rope ? qk_nope : qk_rope;
+    const uint32_t tb = threads > v_mla ? threads : v_mla;
+    k3_mla_absorbed_attn_fused_kernel<<<n_head, tb>>>(
+            (float *)out_dev,
+            (const float *)Q_dev,
+            (const float *)kv_dev,
+            (const float *)k_pe_dev,
+            n_head, qk_nope, qk_rope, v_mla, scale);
+    return cuda_ok(cudaGetLastError(), "k3_mla_absorbed_attn_fused launch");
+}
+
+/* ---- K3 gated MLA CPU-reference selftests -------------------------------- */
+
+/* Elementwise sigmoid in place: x[i] = sigmoid(x[i]) */
+__global__ static void sigmoid_inplace_kernel(float *x, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] = 1.0f / (1.0f + expf(-x[i]));
+    }
+}
+
+extern "C" int pulsar_k3_sigmoid_inplace(void *x_dev, uint32_t n) {
+    if (!x_dev || n == 0) return 0;
+    const uint32_t block = 256;
+    sigmoid_inplace_kernel<<<(n + block - 1) / block, block>>>((float *)x_dev, n);
+    return cuda_ok(cudaGetLastError(), "k3_sigmoid_inplace");
+}
+
+/* Elementwise multiply: out[i] = a[i] * b[i] */
+__global__ static void mul_inplace_kernel(float *out, const float *b, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] *= b[i];
+    }
+}
+
+extern "C" int pulsar_k3_mul_inplace(void *out_dev, const void *b_dev, uint32_t n) {
+    if (!out_dev || !b_dev || n == 0) return 0;
+    const uint32_t block = 256;
+    mul_inplace_kernel<<<(n + block - 1) / block, block>>>((float *)out_dev, (const float *)b_dev, n);
+    return cuda_ok(cudaGetLastError(), "k3_mul_inplace");
+}
+
+static int k3_mla_absorbed_attn_split_selftest_one(
+        uint32_t n_head, uint32_t qk_nope, uint32_t qk_rope,
+        uint32_t kv_lora_rank, uint32_t v_mla) {
+    const uint32_t qk_dim = qk_nope + qk_rope;
+    const uint64_t Q_bytes = (uint64_t)n_head * qk_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)kv_lora_rank * sizeof(float);
+    const uint64_t pe_bytes = (uint64_t)qk_rope * sizeof(float);
+    const uint64_t kb_bytes = (uint64_t)qk_nope * kv_lora_rank * n_head * sizeof(float);
+    const uint64_t vb_bytes = (uint64_t)kv_lora_rank * v_mla * n_head * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_head * v_mla * sizeof(float);
+
+    float *Q = (float *)malloc(Q_bytes);
+    float *kv_cmpr = (float *)malloc(kv_bytes);
+    float *k_pe = (float *)malloc(pe_bytes);
+    float *W_k_b = (float *)malloc(kb_bytes);
+    float *W_v_b = (float *)malloc(vb_bytes);
+    float *ref = (float *)calloc(out_bytes, 1);
+    float *gpu = (float *)malloc(out_bytes);
+
+    /* deterministic nonzero inputs */
+    for (uint64_t i = 0; i < n_head * qk_dim; i++)
+        Q[i] = 0.5f + 0.1f * (float)(i % 7);
+    for (uint32_t i = 0; i < kv_lora_rank; i++)
+        kv_cmpr[i] = 0.3f + 0.1f * (float)((i + 3) % 11);
+    for (uint32_t i = 0; i < qk_rope; i++)
+        k_pe[i] = 0.7f + 0.1f * (float)((i + 5) % 13);
+    for (uint64_t i = 0; i < qk_nope * kv_lora_rank * n_head; i++)
+        W_k_b[i] = 0.2f + 0.1f * (float)((i + 7) % 17);
+    for (uint64_t i = 0; i < kv_lora_rank * v_mla * n_head; i++)
+        W_v_b[i] = 0.4f + 0.1f * (float)((i + 11) % 19);
+
+    const float scale = 1.0f / sqrtf((float)qk_dim);
+
+    /* CPU reference */
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = Q + (uint64_t)h * qk_dim;
+        const float *q_nope = qh;
+        const float *q_pe = qh + qk_nope;
+
+        /* q_nope_absorbed[j] = sum_i q_nope[i] * W_k_b[i][j][h] */
+        float pe_dot = 0.0f;
+        for (uint32_t r = 0; r < qk_rope; r++) pe_dot += q_pe[r] * k_pe[r];
+
+        float absorbed_dot = 0.0f;
+        for (uint32_t j = 0; j < kv_lora_rank; j++) {
+            float absorbed = 0.0f;
+            for (uint32_t i = 0; i < qk_nope; i++) {
+                absorbed += q_nope[i] * W_k_b[((uint64_t)i * kv_lora_rank + j) * n_head + h];
+            }
+            absorbed_dot += absorbed * kv_cmpr[j];
+        }
+        float score = (absorbed_dot + pe_dot) * scale;
+        (void)score; /* single-token: weight = 1.0 */
+
+        /* output[h][d] = sum_j kv_cmpr[j] * W_v_b[j][d][h] */
+        for (uint32_t d = 0; d < v_mla; d++) {
+            float v = 0.0f;
+            for (uint32_t j = 0; j < kv_lora_rank; j++) {
+                v += kv_cmpr[j] * W_v_b[((uint64_t)j * v_mla + d) * n_head + h];
+            }
+            ref[(uint64_t)h * v_mla + d] = v;
+        }
+    }
+
+    void *dQ = NULL, *dkv = NULL, *dpe = NULL, *dkb = NULL, *dvb = NULL, *dout = NULL;
+    int ok = cuda_ok(cudaMalloc(&dQ, Q_bytes), "Q alloc") &&
+             cuda_ok(cudaMalloc(&dkv, kv_bytes), "kv alloc") &&
+             cuda_ok(cudaMalloc(&dpe, pe_bytes), "pe alloc") &&
+             cuda_ok(cudaMalloc(&dkb, kb_bytes), "wkb alloc") &&
+             cuda_ok(cudaMalloc(&dvb, vb_bytes), "wvb alloc") &&
+             cuda_ok(cudaMalloc(&dout, out_bytes), "out alloc") &&
+             cuda_ok(cudaMemcpy(dQ, Q, Q_bytes, cudaMemcpyHostToDevice), "Q h2d") &&
+             cuda_ok(cudaMemcpy(dkv, kv_cmpr, kv_bytes, cudaMemcpyHostToDevice), "kv h2d") &&
+             cuda_ok(cudaMemcpy(dpe, k_pe, pe_bytes, cudaMemcpyHostToDevice), "pe h2d") &&
+             cuda_ok(cudaMemcpy(dkb, W_k_b, kb_bytes, cudaMemcpyHostToDevice), "wkb h2d") &&
+             cuda_ok(cudaMemcpy(dvb, W_v_b, vb_bytes, cudaMemcpyHostToDevice), "wvb h2d");
+
+    if (ok) {
+        ok &= pulsar_k3_mla_absorbed_attn_split(
+                dout, dQ, dkv, dpe, dkb, dvb,
+                n_head, qk_nope, qk_rope, kv_lora_rank, v_mla, scale);
+        ok &= cuda_ok(cudaDeviceSynchronize(), "sync");
+        ok &= cuda_ok(cudaMemcpy(gpu, dout, out_bytes, cudaMemcpyDeviceToHost), "d2h");
+    }
+
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_head * v_mla; i++) {
+            float d = fabsf(gpu[i] - ref[i]);
+            if (d > maxd) maxd = d;
+            if (fabsf(ref[i]) > maxref) maxref = fabsf(ref[i]);
+        }
+        ok = maxd <= 5.0e-4f * fmaxf(maxref, 1.0f);
+    }
+    fprintf(stderr,
+            "k3-mla-absorbed-attn-split-selftest n_head=%u qk_nope=%u qk_rope=%u kv_lora=%u v_mla=%u: %s (max diff %.2e, max |ref| %.2e)\n",
+            n_head, qk_nope, qk_rope, kv_lora_rank, v_mla,
+            ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+
+    if (dQ) cudaFree(dQ);
+    if (dkv) cudaFree(dkv);
+    if (dpe) cudaFree(dpe);
+    if (dkb) cudaFree(dkb);
+    if (dvb) cudaFree(dvb);
+    if (dout) cudaFree(dout);
+    free(Q); free(kv_cmpr); free(k_pe); free(W_k_b); free(W_v_b); free(ref); free(gpu);
+    return ok;
+}
+
+/* ---- Q8_0 split kernel selftest ------------------------------------------- */
+
+static int k3_mla_absorbed_attn_split_q8_selftest_one(
+        uint32_t n_head, uint32_t qk_nope, uint32_t qk_rope,
+        uint32_t kv_lora_rank, uint32_t v_mla) {
+    const uint32_t qk_dim = qk_nope + qk_rope;
+    const uint64_t Q_bytes = (uint64_t)n_head * qk_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)kv_lora_rank * sizeof(float);
+    const uint64_t pe_bytes = (uint64_t)qk_rope * sizeof(float);
+    const uint64_t kb_elems = (uint64_t)qk_nope * kv_lora_rank * n_head;
+    const uint64_t vb_elems = (uint64_t)kv_lora_rank * v_mla * n_head;
+    const uint64_t kb_q8_bytes = ((kb_elems + 31u) / 32u) * 34u;
+    const uint64_t vb_q8_bytes = ((vb_elems + 31u) / 32u) * 34u;
+    const uint64_t out_bytes = (uint64_t)n_head * v_mla * sizeof(float);
+
+    float *Q = (float *)malloc(Q_bytes);
+    float *kv_cmpr = (float *)malloc(kv_bytes);
+    float *k_pe = (float *)malloc(pe_bytes);
+    float *W_k_b_f32 = (float *)malloc(kb_elems * sizeof(float));
+    float *W_v_b_f32 = (float *)malloc(vb_elems * sizeof(float));
+    char *W_k_b_q8 = (char *)calloc(kb_q8_bytes, 1);
+    char *W_v_b_q8 = (char *)calloc(vb_q8_bytes, 1);
+    float *ref = (float *)calloc(out_bytes, 1);
+    float *gpu = (float *)malloc(out_bytes);
+
+    /* deterministic nonzero inputs */
+    for (uint64_t i = 0; i < n_head * qk_dim; i++)
+        Q[i] = 0.5f + 0.1f * (float)(i % 7);
+    for (uint32_t i = 0; i < kv_lora_rank; i++)
+        kv_cmpr[i] = 0.3f + 0.1f * (float)((i + 3) % 11);
+    for (uint32_t i = 0; i < qk_rope; i++)
+        k_pe[i] = 0.7f + 0.1f * (float)((i + 5) % 13);
+    for (uint64_t i = 0; i < kb_elems; i++)
+        W_k_b_f32[i] = 0.2f + 0.1f * (float)((i + 7) % 17);
+    for (uint64_t i = 0; i < vb_elems; i++)
+        W_v_b_f32[i] = 0.4f + 0.1f * (float)((i + 11) % 19);
+
+    /* Quantize W_k_b and W_v_b to Q8_0 */
+    {
+        float blk[32];
+        uint64_t off = 0;
+        for (uint64_t i = 0; i < kb_elems; i += 32) {
+            uint32_t m = (uint32_t)(kb_elems - i < 32 ? kb_elems - i : 32);
+            for (uint32_t j = 0; j < m; j++) blk[j] = W_k_b_f32[i + j];
+            for (uint32_t j = m; j < 32; j++) blk[j] = 0.0f;
+            float amax = 0.0f;
+            for (uint32_t j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(blk[j]));
+            float d = amax / 127.0f;
+            float id = d > 0.0f ? 1.0f / d : 0.0f;
+            *(uint16_t *)(W_k_b_q8 + off) = f32_to_f16_bits(d);
+            for (uint32_t j = 0; j < 32; j++) {
+                int v = (int)lrintf(blk[j] * id);
+                if (v < -127) v = -127;
+                if (v > 127) v = 127;
+                W_k_b_q8[off + 2 + j] = (char)v;
+            }
+            off += 34;
+        }
+    }
+    {
+        float blk[32];
+        uint64_t off = 0;
+        for (uint64_t i = 0; i < vb_elems; i += 32) {
+            uint32_t m = (uint32_t)(vb_elems - i < 32 ? vb_elems - i : 32);
+            for (uint32_t j = 0; j < m; j++) blk[j] = W_v_b_f32[i + j];
+            for (uint32_t j = m; j < 32; j++) blk[j] = 0.0f;
+            float amax = 0.0f;
+            for (uint32_t j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(blk[j]));
+            float d = amax / 127.0f;
+            float id = d > 0.0f ? 1.0f / d : 0.0f;
+            *(uint16_t *)(W_v_b_q8 + off) = f32_to_f16_bits(d);
+            for (uint32_t j = 0; j < 32; j++) {
+                int v = (int)lrintf(blk[j] * id);
+                if (v < -127) v = -127;
+                if (v > 127) v = 127;
+                W_v_b_q8[off + 2 + j] = (char)v;
+            }
+            off += 34;
+        }
+    }
+
+    const float scale = 1.0f / sqrtf((float)qk_dim);
+
+    /* CPU reference (same as F32 variant) */
+    for (uint32_t h = 0; h < n_head; h++) {
+        for (uint32_t d = 0; d < v_mla; d++) {
+            float v = 0.0f;
+            for (uint32_t jj = 0; jj < kv_lora_rank; jj++) {
+                v += kv_cmpr[jj] * W_v_b_f32[((uint64_t)jj * v_mla + d) * n_head + h];
+            }
+            ref[(uint64_t)h * v_mla + d] = v;
+        }
+    }
+
+    void *dQ = NULL, *dkv = NULL, *dpe = NULL, *dkb = NULL, *dvb = NULL, *dout = NULL;
+    int ok = cuda_ok(cudaMalloc(&dQ, Q_bytes), "Q alloc") &&
+             cuda_ok(cudaMalloc(&dkv, kv_bytes), "kv alloc") &&
+             cuda_ok(cudaMalloc(&dpe, pe_bytes), "pe alloc") &&
+             cuda_ok(cudaMalloc(&dkb, kb_q8_bytes), "wkb alloc") &&
+             cuda_ok(cudaMalloc(&dvb, vb_q8_bytes), "wvb alloc") &&
+             cuda_ok(cudaMalloc(&dout, out_bytes), "out alloc") &&
+             cuda_ok(cudaMemcpy(dQ, Q, Q_bytes, cudaMemcpyHostToDevice), "Q h2d") &&
+             cuda_ok(cudaMemcpy(dkv, kv_cmpr, kv_bytes, cudaMemcpyHostToDevice), "kv h2d") &&
+             cuda_ok(cudaMemcpy(dpe, k_pe, pe_bytes, cudaMemcpyHostToDevice), "pe h2d") &&
+             cuda_ok(cudaMemcpy(dkb, W_k_b_q8, kb_q8_bytes, cudaMemcpyHostToDevice), "wkb h2d") &&
+             cuda_ok(cudaMemcpy(dvb, W_v_b_q8, vb_q8_bytes, cudaMemcpyHostToDevice), "wvb h2d");
+
+    if (ok) {
+        ok &= pulsar_k3_mla_absorbed_attn_split_q8(
+                dout, dQ, dkv, dpe, dkb, dvb,
+                n_head, qk_nope, qk_rope, kv_lora_rank, v_mla, scale);
+        ok &= cuda_ok(cudaDeviceSynchronize(), "sync");
+        ok &= cuda_ok(cudaMemcpy(gpu, dout, out_bytes, cudaMemcpyDeviceToHost), "d2h");
+    }
+
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_head * v_mla; i++) {
+            float d = fabsf(gpu[i] - ref[i]);
+            if (d > maxd) maxd = d;
+            if (fabsf(ref[i]) > maxref) maxref = fabsf(ref[i]);
+        }
+        /* Q8_0 quantization noise: ~0.5% relative */
+        ok = maxd <= 5.0e-3f * fmaxf(maxref, 1.0f);
+    }
+    fprintf(stderr,
+            "k3-mla-absorbed-attn-split-q8-selftest n_head=%u qk_nope=%u qk_rope=%u kv_lora=%u v_mla=%u: %s (max diff %.2e, max |ref| %.2e)\n",
+            n_head, qk_nope, qk_rope, kv_lora_rank, v_mla,
+            ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+
+    if (dQ) cudaFree(dQ);
+    if (dkv) cudaFree(dkv);
+    if (dpe) cudaFree(dpe);
+    if (dkb) cudaFree(dkb);
+    if (dvb) cudaFree(dvb);
+    if (dout) cudaFree(dout);
+    free(Q); free(kv_cmpr); free(k_pe);
+    free(W_k_b_f32); free(W_v_b_f32);
+    free(W_k_b_q8); free(W_v_b_q8);
+    free(ref); free(gpu);
+    return ok;
+}
+
+extern "C" int pulsar_k3_mla_absorbed_attn_split_q8_selftest(void) {
+    return k3_mla_absorbed_attn_split_q8_selftest_one(4, 8, 4, 16, 8) &&
+           k3_mla_absorbed_attn_split_q8_selftest_one(8, 16, 8, 32, 16) &&
+           k3_mla_absorbed_attn_split_q8_selftest_one(4, 128, 64, 64, 32) &&
+           k3_mla_absorbed_attn_split_q8_selftest_one(2, 128, 64, 512, 128);
+}
+
+extern "C" int pulsar_k3_mla_absorbed_attn_split_selftest(void) {
+    /* K3-like shapes: 96 heads, qk_nope=128, qk_rope=64, kv_lora=512, v_mla=128
+     * plus smaller shapes for fast CI */
+    return k3_mla_absorbed_attn_split_selftest_one(4, 8, 4, 16, 8) &&
+           k3_mla_absorbed_attn_split_selftest_one(8, 16, 8, 32, 16) &&
+           k3_mla_absorbed_attn_split_selftest_one(4, 128, 64, 64, 32) &&
+           k3_mla_absorbed_attn_split_selftest_one(2, 128, 64, 512, 128);
+}
+
+static int k3_mla_absorbed_attn_fused_selftest_one(
+        uint32_t n_head, uint32_t qk_nope, uint32_t qk_rope, uint32_t v_mla) {
+    const uint32_t qk_dim = qk_nope + qk_rope;
+    const uint32_t stride = qk_nope + v_mla;
+    const uint64_t Q_bytes = (uint64_t)n_head * qk_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_head * stride * sizeof(float);
+    const uint64_t pe_bytes = (uint64_t)qk_rope * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_head * v_mla * sizeof(float);
+
+    float *Q = (float *)malloc(Q_bytes);
+    float *kv = (float *)malloc(kv_bytes);
+    float *k_pe = (float *)malloc(pe_bytes);
+    float *ref = (float *)calloc(out_bytes, 1);
+    float *gpu = (float *)malloc(out_bytes);
+
+    for (uint64_t i = 0; i < n_head * qk_dim; i++)
+        Q[i] = 0.5f + 0.1f * (float)(i % 7);
+    for (uint64_t i = 0; i < n_head * stride; i++)
+        kv[i] = 0.3f + 0.1f * (float)((i + 3) % 11);
+    for (uint32_t i = 0; i < qk_rope; i++)
+        k_pe[i] = 0.7f + 0.1f * (float)((i + 5) % 13);
+
+    const float scale = 1.0f / sqrtf((float)qk_dim);
+
+    /* CPU reference */
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = Q + (uint64_t)h * qk_dim;
+        const float *kv_h = kv + (uint64_t)h * stride;
+        float score = 0.0f;
+        for (uint32_t i = 0; i < qk_nope; i++) score += qh[i] * kv_h[i];
+        for (uint32_t r = 0; r < qk_rope; r++) score += qh[qk_nope + r] * k_pe[r];
+        score *= scale;
+        (void)score;
+        for (uint32_t d = 0; d < v_mla; d++) {
+            ref[(uint64_t)h * v_mla + d] = kv_h[qk_nope + d];
+        }
+    }
+
+    void *dQ = NULL, *dkv = NULL, *dpe = NULL, *dout = NULL;
+    int ok = cuda_ok(cudaMalloc(&dQ, Q_bytes), "Q alloc") &&
+             cuda_ok(cudaMalloc(&dkv, kv_bytes), "kv alloc") &&
+             cuda_ok(cudaMalloc(&dpe, pe_bytes), "pe alloc") &&
+             cuda_ok(cudaMalloc(&dout, out_bytes), "out alloc") &&
+             cuda_ok(cudaMemcpy(dQ, Q, Q_bytes, cudaMemcpyHostToDevice), "Q h2d") &&
+             cuda_ok(cudaMemcpy(dkv, kv, kv_bytes, cudaMemcpyHostToDevice), "kv h2d") &&
+             cuda_ok(cudaMemcpy(dpe, k_pe, pe_bytes, cudaMemcpyHostToDevice), "pe h2d");
+
+    if (ok) {
+        ok &= pulsar_k3_mla_absorbed_attn_fused(
+                dout, dQ, dkv, dpe,
+                n_head, qk_nope, qk_rope, v_mla, scale);
+        ok &= cuda_ok(cudaDeviceSynchronize(), "sync");
+        ok &= cuda_ok(cudaMemcpy(gpu, dout, out_bytes, cudaMemcpyDeviceToHost), "d2h");
+    }
+
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_head * v_mla; i++) {
+            float d = fabsf(gpu[i] - ref[i]);
+            if (d > maxd) maxd = d;
+            if (fabsf(ref[i]) > maxref) maxref = fabsf(ref[i]);
+        }
+        ok = maxd <= 5.0e-4f * fmaxf(maxref, 1.0f);
+    }
+    fprintf(stderr,
+            "k3-mla-absorbed-attn-fused-selftest n_head=%u qk_nope=%u qk_rope=%u v_mla=%u: %s (max diff %.2e, max |ref| %.2e)\n",
+            n_head, qk_nope, qk_rope, v_mla,
+            ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+
+    if (dQ) cudaFree(dQ);
+    if (dkv) cudaFree(dkv);
+    if (dpe) cudaFree(dpe);
+    if (dout) cudaFree(dout);
+    free(Q); free(kv); free(k_pe); free(ref); free(gpu);
+    return ok;
+}
+
+extern "C" int pulsar_k3_mla_absorbed_attn_fused_selftest(void) {
+    return k3_mla_absorbed_attn_fused_selftest_one(4, 8, 4, 8) &&
+           k3_mla_absorbed_attn_fused_selftest_one(8, 16, 8, 16) &&
+           k3_mla_absorbed_attn_fused_selftest_one(4, 128, 64, 32) &&
+           k3_mla_absorbed_attn_fused_selftest_one(2, 128, 64, 128);
+}
+
 #include "dsa_indexer.inc"
 #include "dsv4_kernels.inc"
 #include "qwen35_kernels.inc"

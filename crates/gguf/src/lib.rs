@@ -202,6 +202,13 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Value::Array(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -254,11 +261,17 @@ impl Gguf {
         }
         let tensor_count = c.u64()?;
         if tensor_count > 1 << 20 {
-            return Err(Error::TooMany { what: "tensor", count: tensor_count });
+            return Err(Error::TooMany {
+                what: "tensor",
+                count: tensor_count,
+            });
         }
         let kv_count = c.u64()?;
         if kv_count > 1 << 20 {
-            return Err(Error::TooMany { what: "metadata kv", count: kv_count });
+            return Err(Error::TooMany {
+                what: "metadata kv",
+                count: kv_count,
+            });
         }
 
         let mut metadata = HashMap::with_capacity(kv_count as usize);
@@ -274,7 +287,10 @@ impl Gguf {
             let name = c.string()?;
             let n_dims = c.u32()?;
             if n_dims > 8 {
-                return Err(Error::TooMany { what: "tensor dim", count: n_dims as u64 });
+                return Err(Error::TooMany {
+                    what: "tensor dim",
+                    count: n_dims as u64,
+                });
             }
             let mut dims = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
@@ -282,7 +298,12 @@ impl Gguf {
             }
             let ty_id = c.u32()?;
             let offset = c.u64()?;
-            tensors.push(TensorInfo { name, dims, ty: TensorType::from_id(ty_id), offset });
+            tensors.push(TensorInfo {
+                name,
+                dims,
+                ty: TensorType::from_id(ty_id),
+                offset,
+            });
         }
 
         let alignment = metadata
@@ -292,7 +313,13 @@ impl Gguf {
             .unwrap_or(DEFAULT_ALIGNMENT);
         let data_offset = (c.at as u64).next_multiple_of(alignment);
 
-        Ok(Gguf { version, metadata, tensors, alignment, data_offset })
+        Ok(Gguf {
+            version,
+            metadata,
+            tensors,
+            alignment,
+            data_offset,
+        })
     }
 
     /// Merge split-gguf shard headers into one table over a VIRTUAL file:
@@ -332,6 +359,92 @@ impl Gguf {
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
+    }
+
+    // --------------------------------------------------------- K3 helpers
+
+    /// True when the architecture is the canonical Atomic K3 family name.
+    pub fn is_kimi_k3(&self) -> bool {
+        self.architecture() == Some(K3_ARCH)
+    }
+
+    /// Number of transformer blocks (93 for K3).
+    pub fn k3_block_count(&self) -> Option<u64> {
+        self.arch_meta("block_count")?.as_u64()
+    }
+
+    /// Number of routed experts (896 for K3).
+    pub fn k3_expert_count(&self) -> Option<u64> {
+        self.arch_meta("expert_count")?.as_u64()
+    }
+
+    /// Number of active experts per token (16 for K3).
+    pub fn k3_expert_used_count(&self) -> Option<u64> {
+        self.arch_meta("expert_used_count")?.as_u64()
+    }
+
+    /// Number of shared experts (2 for K3).
+    pub fn k3_shared_expert_count(&self) -> Option<u64> {
+        self.arch_meta("shared_expert_count")?.as_u64()
+    }
+
+    /// Legacy/private per-layer attention type array: `kimi-k3.attention_layer`.
+    /// The production K3 loader uses the canonical
+    /// `kimi-k3.attention.head_count_kv` array instead.
+    pub fn k3_attention_layers(&self) -> Option<Vec<String>> {
+        let arr = self.arch_meta("attention_layer")?.as_array()?;
+        let strs: Option<Vec<String>> = arr.iter().map(|v| v.as_str().map(String::from)).collect();
+        strs
+    }
+
+    /// Canonical K3 per-layer discriminator: 0 = KDA, nonzero = MLA.
+    pub fn k3_head_count_kv(&self) -> Option<Vec<u32>> {
+        let arr = self.arch_meta("attention.head_count_kv")?.as_array()?;
+        arr.iter().map(|v| v.as_u64().map(|n| n as u32)).collect()
+    }
+}
+
+// --------------------------------------------------------- K3 metadata keys
+
+/// Canonical K3 architecture name.
+pub const K3_ARCH: &str = "kimi-k3";
+
+/// Legacy/private metadata key for the old string-array helper. Production
+/// loaders must use `kimi-k3.attention.head_count_kv`.
+pub const K3_ATTN_LAYER_KEY: &str = "kimi-k3.attention_layer";
+
+/// Metadata key for the canonical per-layer discriminator array.
+pub const K3_HEAD_COUNT_KV_KEY: &str = "kimi-k3.attention.head_count_kv";
+
+/// Metadata key for the number of shared experts.
+pub const K3_SHARED_EXP_KEY: &str = "kimi-k3.shared_expert_count";
+
+// --------------------------------------------------------- K3 tensor helpers
+
+impl TensorInfo {
+    /// True when this tensor has exactly 3 dimensions (an expert slab).
+    /// K3 expert tensors like `blk.N.ffn_gate_exps.weight` are shaped
+    /// `[width, hidden, expert_count]`.
+    pub fn is_3d_slab(&self) -> bool {
+        self.dims.len() == 3
+    }
+
+    /// When this is a 3D expert slab, returns `dims[2]` (the expert count).
+    /// Returns `None` for non-3D tensors.
+    pub fn slab_expert_count(&self) -> Option<u64> {
+        self.dims.get(2).copied()
+    }
+
+    /// Byte size of one expert's slice within a 3D slab.
+    /// For a tensor with dims `[width, hidden, n_exp]`, one expert occupies
+    /// `row_bytes(width) * hidden` bytes.
+    pub fn slab_expert_byte_size(&self) -> Option<u64> {
+        if !self.is_3d_slab() {
+            return None;
+        }
+        let row = self.dims[0];
+        let hidden = self.dims[1];
+        Some(self.ty.row_bytes(row)? * hidden)
     }
 }
 
@@ -392,7 +505,10 @@ impl<'a> Cursor<'a> {
                 let elem_ty = self.u32()?;
                 let count = self.u64()?;
                 if count > 1 << 26 {
-                    return Err(Error::TooMany { what: "array element", count });
+                    return Err(Error::TooMany {
+                        what: "array element",
+                        count,
+                    });
                 }
                 let mut v = Vec::with_capacity(count.min(1 << 16) as usize);
                 for _ in 0..count {
@@ -425,7 +541,11 @@ pub fn split_shard_names(path: &std::path::Path) -> Option<Vec<std::path::PathBu
         return None;
     }
     let dir = path.parent()?;
-    Some((1..=count).map(|i| dir.join(format!("{prefix}-{i:05}-of-{count:05}.gguf"))).collect())
+    Some(
+        (1..=count)
+            .map(|i| dir.join(format!("{prefix}-{i:05}-of-{count:05}.gguf")))
+            .collect(),
+    )
 }
 
 /// Expand "...-00001-of-000NN.gguf" to the full shard list (all must

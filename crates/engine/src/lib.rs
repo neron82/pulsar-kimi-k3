@@ -16,6 +16,7 @@
 #[cfg(target_os = "linux")]
 mod real {
     mod dsv4;
+    mod kimi_k3;
     mod qwen35;
     pub use qwen35::{generate_dflash, DraftModel};
 
@@ -51,6 +52,13 @@ mod real {
         /// prefill loops tokens (conv window + delta state are
         /// sequential).
         Qwen35,
+        /// Kimi K3: hybrid KDA (recurrent delta attention) + gated MLA
+        /// (NoPE) with Attention Residuals (AttnRes), Stable LatentMoE,
+        /// and SiTU-GLU activation. 93 layers: 69 KDA + 24 gated MLA,
+        /// one leading dense layer, 896 experts / top-16 / 2 shared.
+        /// Decode-only graph; prefill loops tokens (KDA recurrence +
+        /// AttnRes snapshot bank are sequential state machines).
+        KimiK3,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -120,6 +128,21 @@ mod real {
         /// SwiGLU clamp for routed AND shared experts (10.0 on V4;
         /// the per-layer metadata array is constant per model)
         pub clamp_exp: f32,
+        // Kimi K3 (zero elsewhere)
+        /// KDA head dimension (128 on K3)
+        pub kda_head_dim: u32,
+        /// SiTU-GLU activation beta
+        pub situ_beta: f32,
+        /// SiTU-GLU linear beta
+        pub situ_linear_beta: f32,
+        /// Attention residual block size (12 on K3)
+        pub attn_res_block_size: u32,
+        /// KDA safe gate lower bound (-5.0 on K3; applied after sigmoid)
+        pub kda_gate_lower_bound: f32,
+        /// Stable LatentMoE latent size (3584 on K3)
+        pub moe_latent_size: u32,
+        /// Number of shared experts (2 on K3)
+        pub n_expert_shared: u32,
     }
 
     impl Shape {
@@ -132,6 +155,9 @@ mod real {
             match self.family {
                 Family::Gqa | Family::Dsv4 | Family::Qwen35 => self.n_head * self.head_dim,
                 Family::Mla => self.n_head * self.value_mla,
+                Family::KimiK3 => {
+                    self.n_head * self.kda_head_dim.max(self.value_mla.max(self.head_dim))
+                }
             }
         }
 
@@ -178,10 +204,14 @@ mod real {
     impl Shape {
         fn from_gguf(g: &Gguf) -> Result<Shape> {
             let u = |k: &str| -> Result<u32> {
-                Ok(g.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| meta_err(k))? as u32)
+                Ok(g.arch_meta(k)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| meta_err(k))? as u32)
             };
             let f = |k: &str| -> Result<f32> {
-                g.arch_meta(k).and_then(Value::as_f32).ok_or_else(|| meta_err(k))
+                g.arch_meta(k)
+                    .and_then(Value::as_f32)
+                    .ok_or_else(|| meta_err(k))
             };
             let family = match g.architecture() {
                 // hyphen vs underscore: the original ds4-lineage ggufs say
@@ -208,6 +238,14 @@ mod real {
                 Some("deepseek4") => Family::Dsv4,
                 // Qwen3.6-35B-A3B hybrid GDN (task #21)
                 Some("qwen35moe") => Family::Qwen35,
+                // Kimi K3: hybrid KDA + gated MLA (NoPE) with AttnRes
+                // and Stable LatentMoE
+                // AtomicBot's converter registers the model as `kimi-v3`.
+                // Keep the dashed/underscored K3 aliases for early private
+                // fixtures, but do not make them the canonical contract.
+                Some("kimi-v3") | Some("kimi_v3") | Some("kimi-k3") | Some("kimi_k3") => {
+                    Family::KimiK3
+                }
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let inkling = g.architecture() == Some("inkling");
@@ -232,11 +270,9 @@ mod real {
                 // per-layer truth lives in Model::geom
                 n_head_kv: u("attention.head_count_kv").unwrap_or_else(|_| {
                     match g.arch_meta("attention.head_count_kv") {
-                        Some(Value::Array(a)) => a
-                            .iter()
-                            .filter_map(Value::as_u64)
-                            .max()
-                            .unwrap_or(1) as u32,
+                        Some(Value::Array(a)) => {
+                            a.iter().filter_map(Value::as_u64).max().unwrap_or(1) as u32
+                        }
                         _ => 1,
                     }
                 }),
@@ -250,8 +286,10 @@ mod real {
                     Ok(v) => v,
                     Err(_) => (0..u("block_count")?)
                         .find(|il| {
-                            g.tensor(&format!("blk.{il}.ffn_gate_exps.weight")).is_some()
-                                || g.tensor(&format!("blk.{il}.ffn_gate_up_exps.weight")).is_some()
+                            g.tensor(&format!("blk.{il}.ffn_gate_exps.weight"))
+                                .is_some()
+                                || g.tensor(&format!("blk.{il}.ffn_gate_up_exps.weight"))
+                                    .is_some()
                         })
                         .ok_or_else(|| meta_err("no MoE layers found"))?,
                 },
@@ -260,8 +298,9 @@ mod real {
                 n_ff_exp: u("expert_feed_forward_length")?,
                 // deepseek4/qwen35moe have no dense FFN layers and omit the key
                 n_ff_dense: match family {
-                    Family::Dsv4 | Family::Qwen35 => u("feed_forward_length")
-                        .unwrap_or(u("expert_feed_forward_length")?),
+                    Family::Dsv4 | Family::Qwen35 => {
+                        u("feed_forward_length").unwrap_or(u("expert_feed_forward_length")?)
+                    }
                     _ => u("feed_forward_length")?,
                 },
                 n_vocab,
@@ -280,7 +319,10 @@ mod real {
                     _ => 0,
                 },
                 // inkling has no rope at all - the key may be absent
-                rope_freq_base: if inkling {
+                rope_freq_base: if inkling || family == Family::KimiK3 {
+                    // K3 is NoPE: KDA is recurrent and MLA explicitly
+                    // disables rotary embeddings. Keep a harmless default for
+                    // shared shape helpers that still expect a base.
                     f("rope.freq_base").unwrap_or(10_000.0)
                 } else {
                     f("rope.freq_base")?
@@ -317,6 +359,13 @@ mod real {
                 ssm_v_heads: 0,
                 ssm_inner: 0,
                 full_attn_interval: 0,
+                kda_head_dim: 0,
+                situ_beta: 0.0,
+                situ_linear_beta: 0.0,
+                attn_res_block_size: 0,
+                kda_gate_lower_bound: 0.0,
+                moe_latent_size: 0,
+                n_expert_shared: 0,
             };
             if family == Family::Gqa {
                 // partial rotary: MiniMax rotates rope.dimension_count of
@@ -364,8 +413,7 @@ mod real {
             if family == Family::Dsv4 {
                 s.n_lora_q = u("attention.q_lora_rank").unwrap_or(1024);
                 s.rot_dim = u("rope.dimension_count").unwrap_or(64);
-                s.rope_orig_ctx =
-                    u("rope.scaling.original_context_length").unwrap_or(65_536);
+                s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(65_536);
                 s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(16.0);
                 s.n_idx_head = u("attention.indexer.head_count").unwrap_or(64);
                 s.n_idx_dim = u("attention.indexer.key_length").unwrap_or(128);
@@ -375,16 +423,36 @@ mod real {
                 s.n_hc = u("hyper_connection.count").unwrap_or(4);
                 s.hc_sinkhorn = u("hyper_connection.sinkhorn_iterations").unwrap_or(20);
                 s.hc_eps = f("hyper_connection.epsilon").unwrap_or(1.0e-6);
-                s.compress_rope_base =
-                    f("attention.compress_rope_freq_base").unwrap_or(160_000.0);
+                s.compress_rope_base = f("attention.compress_rope_freq_base").unwrap_or(160_000.0);
                 s.n_out_group = u("attention.output_group_count").unwrap_or(8);
                 // per-layer float array, constant across layers on V4
                 s.clamp_exp = match g.arch_meta("swiglu_clamp_exp") {
-                    Some(Value::Array(a)) => {
-                        a.first().and_then(Value::as_f32).unwrap_or(10.0)
-                    }
+                    Some(Value::Array(a)) => a.first().and_then(Value::as_f32).unwrap_or(10.0),
                     _ => 10.0,
                 };
+            }
+            if family == Family::KimiK3 {
+                // These keys are emitted by AtomicBot's KimiLinear converter:
+                // kimi-v3.kda.head_dim, kimi-v3.situ_beta,
+                // kimi-v3.attn_res_block_size, kimi-v3.kda.gate_lower_bound.
+                s.kda_head_dim = u("kda.head_dim").unwrap_or(128);
+                s.situ_beta = f("situ_beta").unwrap_or(4.0);
+                s.situ_linear_beta = f("situ_linear_beta").unwrap_or(25.0);
+                s.attn_res_block_size = u("attn_res_block_size").unwrap_or(12);
+                s.kda_gate_lower_bound = f("kda.gate_lower_bound").unwrap_or(-5.0);
+                s.moe_latent_size = u("moe_latent_size").unwrap_or(3584);
+                s.n_expert_shared = u("expert_shared_count").unwrap_or(2);
+                s.n_lora_q = u("attention.q_lora_rank").unwrap_or(1536);
+                s.n_kv_lora = u("attention.kv_lora_rank").unwrap_or(512);
+                s.qk_rope = 0; // K3 MLA is NoPE; no rotary sub-dimension.
+                let qk_mla = u("attention.key_length_mla").unwrap_or(192);
+                s.qk_nope = qk_mla.saturating_sub(s.qk_rope);
+                s.value_mla = u("attention.value_length_mla").unwrap_or(128);
+                s.ssm_conv_k = u("ssm.conv_kernel").unwrap_or(4);
+                // K3 is NoPE; the per-layer head-count array is the source of
+                // truth for KDA vs full/gated MLA.
+                s.rot_dim = 0;
+                s.router_softmax = false;
             }
             Ok(s)
         }
@@ -414,7 +482,9 @@ mod real {
                 TensorType::Q5_1 => kernels::QUANT_Q5_1,
                 TensorType::Q8_0 => kernels::QUANT_Q8_0,
                 TensorType::IQ4XS => kernels::QUANT_IQ4_XS,
-                other => return Err(format!("{}: unsupported expert type {other:?}", t.name).into()),
+                other => {
+                    return Err(format!("{}: unsupported expert type {other:?}", t.name).into())
+                }
             };
             let row_elems = t.dims[0];
             let rows_per_expert = t.dims[1];
@@ -537,6 +607,7 @@ mod real {
         },
         Dsv4(Box<Dsv4W>),
         Qwen35(Box<Qwen35W>),
+        KimiK3(Box<kimi_k3::KimiK3W>),
     }
 
     /// qwen35moe per-layer stack: exactly one of attn/gdn is Some.
@@ -561,9 +632,9 @@ mod real {
 
     /// Gated DeltaNet layer: conv window + delta-rule state, no KV.
     struct Qwen35Gdn {
-        wqkv: DeviceBuf, // q8_0 [n_embd -> 2*key_dim + value_dim]
-        wz: DeviceBuf,   // q8_0 [n_embd -> value_dim] (attn_gate)
-        conv: DeviceBuf, // f32 [conv_dim][ssm_conv_k]
+        wqkv: DeviceBuf,    // q8_0 [n_embd -> 2*key_dim + value_dim]
+        wz: DeviceBuf,      // q8_0 [n_embd -> value_dim] (attn_gate)
+        conv: DeviceBuf,    // f32 [conv_dim][ssm_conv_k]
         alpha_w: DeviceBuf, // f32 [n_embd -> ssm_v_heads]
         beta_w: DeviceBuf,
         /// g = a * softplus(alpha + dt_bias); a stored as -exp(A_log)
@@ -585,7 +656,7 @@ mod real {
         kv_a_norm: DeviceBuf,
         /// attn_output_a: n_out_group banks of [group_dim -> rank] (q8_0)
         out_a: DeviceBuf,
-        sinks: DeviceBuf, // f32 [n_head] per-head sink logits
+        sinks: DeviceBuf,      // f32 [n_head] per-head sink logits
         hc_attn_fn: DeviceBuf, // f32 [n_hc*n_embd -> 6*n_hc] (f16 converted)
         hc_ffn_fn: DeviceBuf,
         hc_attn_scale: DeviceBuf, // f32 [3]
@@ -620,11 +691,11 @@ mod real {
 
     /// DSA lightning-indexer weights (small; resident beside the attn stack).
     struct IdxW {
-        q_b: DeviceBuf,   // q8_0 [n_lora_q][idx_head*idx_dim]
-        k: DeviceBuf,     // q8_0 [n_embd][idx_dim]
-        k_norm: DeviceBuf, // f32 LayerNorm weight [idx_dim]
+        q_b: DeviceBuf,      // q8_0 [n_lora_q][idx_head*idx_dim]
+        k: DeviceBuf,        // q8_0 [n_embd][idx_dim]
+        k_norm: DeviceBuf,   // f32 LayerNorm weight [idx_dim]
         k_norm_b: DeviceBuf, // f32 LayerNorm bias
-        proj: DeviceBuf,  // f32 [n_embd][idx_head]
+        proj: DeviceBuf,     // f32 [n_embd][idx_head]
     }
 
     /// GLM-5.2 DSA layer policy: leading dense layers plus every 4th from
@@ -707,6 +778,11 @@ mod real {
         ones_hc: Option<DeviceBuf>,
         /// deepseek4 output-head HC merge
         dsv4_out: Option<Dsv4OutW>,
+        /// Kimi K3 per-layer kind (KDA or MLA), indexed by layer id
+        pub k3_layer_kinds: Vec<kimi_k3::K3LayerKind>,
+        /// Kimi K3 output AttnRes norm and projection (global tensors)
+        pub k3_output_res_norm: Option<DeviceBuf>,
+        pub k3_output_res_proj: Option<DeviceBuf>,
     }
 
     /// deepseek4 output_hc_*: collapse the final HC streams before
@@ -789,7 +865,15 @@ mod real {
 
     impl AttnStage {
         fn new(l: &LayerW) -> Result<AttnStage> {
-            let Attn::Mla { q_a, q_b, kv_a_mqa, k_b, v_b, .. } = &l.attn else {
+            let Attn::Mla {
+                q_a,
+                q_b,
+                kv_a_mqa,
+                k_b,
+                v_b,
+                ..
+            } = &l.attn
+            else {
                 return Err("attn stage needs an Mla layer".into());
             };
             Ok(AttnStage {
@@ -806,7 +890,15 @@ mod real {
 
         /// Queue copies of `l`'s pinned attn tensors for layer `il`.
         fn kick(&mut self, l: &LayerW, il: usize) -> Result {
-            let Attn::Mla { q_a, q_b, kv_a_mqa, k_b, v_b, .. } = &l.attn else {
+            let Attn::Mla {
+                q_a,
+                q_b,
+                kv_a_mqa,
+                k_b,
+                v_b,
+                ..
+            } = &l.attn
+            else {
                 return Ok(());
             };
             self.layer = None;
@@ -937,7 +1029,7 @@ mod real {
 
     impl DeviceSlabCache {
         fn new(budget_bytes: usize, slab_bytes: usize) -> Result<DeviceSlabCache> {
-            let slots = (budget_bytes / slab_bytes.max(1)).max(1);
+            let slots = (budget_bytes / slab_bytes.max(1)).clamp(1, 4096);
             Ok(DeviceSlabCache {
                 pool: DeviceBuf::alloc(slots * slab_bytes + SLAB_SLACK)?,
                 slab_bytes,
@@ -1094,7 +1186,13 @@ mod real {
                     self.used -= e.slab.bytes();
                 }
             }
-            let Self { fetcher, cache, used, tick, .. } = self;
+            let Self {
+                fetcher,
+                cache,
+                used,
+                tick,
+                ..
+            } = self;
             let mut place_err = None;
             fetcher.fetch_each(&missing, |i, slab| {
                 if place_err.is_none() {
@@ -1105,7 +1203,11 @@ mod real {
                 *used += slab.bytes();
                 cache.insert(
                     missing[i].offset,
-                    CacheEntry { slab, freq: 1, tick: *tick },
+                    CacheEntry {
+                        slab,
+                        freq: 1,
+                        tick: *tick,
+                    },
                 );
                 Ok(())
             })?;
@@ -1165,7 +1267,14 @@ mod real {
                 }
             }
             self.used += incoming;
-            self.cache.insert(offset, CacheEntry { slab, freq: 1, tick: self.tick });
+            self.cache.insert(
+                offset,
+                CacheEntry {
+                    slab,
+                    freq: 1,
+                    tick: self.tick,
+                },
+            );
         }
     }
 
@@ -1207,7 +1316,9 @@ mod real {
         impl Pool {
             pub fn from_env() -> Option<Pool> {
                 let v = std::env::var("PULSAR_CPU").ok()?;
-                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8);
                 let threads = match v.as_str() {
                     "" | "0" | "off" => return None,
                     // physical cores minus main + fetcher headroom
@@ -1229,7 +1340,11 @@ mod real {
                         let _ = done_tx.send(());
                     });
                 }
-                Some(Pool { tx, done_rx, threads })
+                Some(Pool {
+                    tx,
+                    done_rx,
+                    threads,
+                })
             }
 
             pub fn submit(&self, jobs: Vec<Job>) -> usize {
@@ -1284,14 +1399,28 @@ mod real {
 
         impl Lane {
             #[allow(clippy::too_many_arguments)]
-            pub fn new(gq: u32, dq: u32, grb: usize, drb: usize, ne: usize, nf: usize, act_op: u32) -> Lane {
+            pub fn new(
+                gq: u32,
+                dq: u32,
+                grb: usize,
+                drb: usize,
+                ne: usize,
+                nf: usize,
+                act_op: u32,
+            ) -> Lane {
                 Lane {
                     idx: std::collections::HashMap::new(),
                     ptrs: Vec::new(),
                     pairs: Vec::new(),
                     xqs: Vec::new(),
                     mids: Vec::new(),
-                    gq, dq, grb, drb, ne, nf, act_op,
+                    gq,
+                    dq,
+                    grb,
+                    drb,
+                    ne,
+                    nf,
+                    act_op,
                 }
             }
 
@@ -1345,7 +1474,8 @@ mod real {
                                 let g_row = std::slice::from_raw_parts(gp.get().add(j * grb), grb);
                                 let u_row = std::slice::from_raw_parts(up_.get().add(j * grb), grb);
                                 for (pi, &(tok, w)) in pairs.iter().enumerate() {
-                                    let xq = &*(xq_ptr.get() as *const quant::cpu_dot::Q8KRow).add(tok);
+                                    let xq =
+                                        &*(xq_ptr.get() as *const quant::cpu_dot::Q8KRow).add(tok);
                                     let g = dot(gq, g_row, xq, ne);
                                     let u = dot(gq, u_row, xq, ne);
                                     *mid.get().add(pi * nf + j) = glu(g, u, act_op) * w;
@@ -1388,8 +1518,10 @@ mod real {
                             for r in lo..hi {
                                 let mut sum = 0f32;
                                 for &(dp, mi) in &list {
-                                    let row = std::slice::from_raw_parts(dp.get().add(r * drb), drb);
-                                    let mq = &*(midq_ptr.get() as *const quant::cpu_dot::Q8KRow).add(mi);
+                                    let row =
+                                        std::slice::from_raw_parts(dp.get().add(r * drb), drb);
+                                    let mq =
+                                        &*(midq_ptr.get() as *const quant::cpu_dot::Q8KRow).add(mi);
                                     sum += dot(dq, row, mq, nf);
                                 }
                                 *acc_ptr.get().add(t * ne + r) = sum;
@@ -1417,9 +1549,7 @@ mod real {
 
         pub fn dot(quant: u32, row: &[u8], xq: &quant::cpu_dot::Q8KRow, n: usize) -> f32 {
             match quant {
-                q if q == kernels::QUANT_IQ2_XS => {
-                    quant::cpu_dot::vec_dot_iq2_xs_q8_k(row, xq, n)
-                }
+                q if q == kernels::QUANT_IQ2_XS => quant::cpu_dot::vec_dot_iq2_xs_q8_k(row, xq, n),
                 q if q == kernels::QUANT_IQ3_XXS => {
                     quant::cpu_dot::vec_dot_iq3_xxs_q8_k(row, xq, n)
                 }
@@ -1481,8 +1611,7 @@ mod real {
     /// set. Returns the merged header over a virtual offset space plus the
     /// shard list ((virtual base, path); single file = one entry, base 0).
     pub fn parse_header(path: &Path) -> Result<(Vec<(u64, std::path::PathBuf)>, Gguf)> {
-        let paths = gguf::split_shards(path)
-            .unwrap_or_else(|| vec![path.to_path_buf()]);
+        let paths = gguf::split_shards(path).unwrap_or_else(|| vec![path.to_path_buf()]);
         let mut shards = Vec::with_capacity(paths.len());
         let mut bases = Vec::with_capacity(paths.len());
         let mut ggufs = Vec::with_capacity(paths.len());
@@ -1495,7 +1624,10 @@ mod real {
             base += file.metadata()?.len();
         }
         if ggufs.len() > 1 {
-            eprintln!("pulsar: split gguf: {} shards as one virtual file", ggufs.len());
+            eprintln!(
+                "pulsar: split gguf: {} shards as one virtual file",
+                ggufs.len()
+            );
         }
         Ok((shards, Gguf::merge_split(ggufs, &bases)))
     }
@@ -1513,7 +1645,9 @@ mod real {
             let e = ((h >> 10) & 0x1f) as u32;
             let m = (h & 0x3ff) as u32;
             let bits = if e == 0 {
-                if m == 0 { s << 31 } else {
+                if m == 0 {
+                    s << 31
+                } else {
                     // subnormal
                     let mut m = m;
                     let mut e = 127 - 15 + 1;
@@ -1529,6 +1663,10 @@ mod real {
                 (s << 31) | ((e + 127 - 15) << 23) | (m << 13)
             };
             f32::from_bits(bits)
+        }
+
+        pub fn bf16_to_f32(b: u16) -> f32 {
+            f32::from_bits((b as u32) << 16)
         }
 
         fn f32_to_f16(x: f32) -> u16 {
@@ -1559,6 +1697,13 @@ mod real {
         pub fn dequant_block(ty: gguf::TensorType, src: &[u8], out: &mut [f32; 256]) {
             use gguf::TensorType as T;
             match ty {
+                T::Q4_0 => {
+                    let d = f16_to_f32(u16::from_le_bytes([src[0], src[1]]));
+                    for i in 0..16 {
+                        out[i] = d * ((src[2 + i] & 0x0f) as f32 - 8.0);
+                        out[16 + i] = d * ((src[2 + i] >> 4) as f32 - 8.0);
+                    }
+                }
                 T::Q2K => {
                     let (scales, qs) = (&src[0..16], &src[16..80]);
                     let d = f16_to_f32(u16::from_le_bytes([src[80], src[81]]));
@@ -1647,10 +1792,14 @@ mod real {
                         let (ql, qh) = (&ql[chunk * 64..], &qh[chunk * 32..]);
                         let sc = &scales[chunk * 8..];
                         for l in 0..32 {
-                            let q0 = ((ql[l] & 0x0f) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
-                            let q1 = ((ql[32 + l] & 0x0f) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
+                            let q0 =
+                                ((ql[l] & 0x0f) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+                            let q1 = ((ql[32 + l] & 0x0f) as i32
+                                | (((qh[l] >> 2) & 3) as i32) << 4)
+                                - 32;
                             let q2 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
-                            let q3 = ((ql[32 + l] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
+                            let q3 =
+                                ((ql[32 + l] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
                             out[i + l] = d * sc[l / 16] as i8 as f32 * q0 as f32;
                             out[i + 32 + l] = d * sc[2 + l / 16] as i8 as f32 * q1 as f32;
                             out[i + 64 + l] = d * sc[4 + l / 16] as i8 as f32 * q2 as f32;
@@ -1702,11 +1851,17 @@ mod real {
         }
     }
 
-    fn read_tensor_bytes(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
+    fn read_tensor_bytes_raw(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let bytes = t.byte_size().ok_or_else(|| meta_err(name))?;
         let mut buf = vec![0u8; bytes as usize];
         file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+        Ok(buf)
+    }
+
+    fn read_tensor_bytes(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let buf = read_tensor_bytes_raw(file, g, name)?;
 
         // dense K-quant tensors -> q8_0 (see mod requant). output.weight
         // stays native: head_logits reads K-quants directly.
@@ -1741,6 +1896,35 @@ mod real {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
+    }
+
+    /// Returns true when PULSAR_K3_HOST=1 is set, requesting host-pinned
+    /// (mapped) memory for K3 resident weights to conserve VRAM on 24 GiB
+    /// cards. Default (unset or 0) keeps current VRAM behavior.
+    fn k3_use_host_pinned() -> bool {
+        std::env::var("PULSAR_K3_HOST").ok().as_deref() == Some("1")
+    }
+
+    /// Allocate a DeviceBuf for K3 resident weights. When PULSAR_K3_HOST=1
+    /// the buffer is mapped pinned host memory (device-visible via UVA);
+    /// otherwise normal VRAM. Activations, runtime scratch, and expert
+    /// cache/staging should NOT use this — they stay on VRAM.
+    fn upload_k3_host(bytes: &[u8]) -> Result<DeviceBuf> {
+        let mut buf = if k3_use_host_pinned() {
+            DeviceBuf::alloc_pinned(bytes.len())?
+        } else {
+            DeviceBuf::alloc(bytes.len())?
+        };
+        buf.write(0, bytes)?;
+        Ok(buf)
+    }
+
+    /// K3-aware wrapper around the generic upload path. Routes norms,
+    /// scalars, and other small K3 resident weights through `upload_k3_host`
+    /// so they respect PULSAR_K3_HOST=1.
+    fn upload_k3(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        let bytes = read_tensor_bytes(file, g, name)?;
+        upload_k3_host(&bytes)
     }
 
     fn upload(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
@@ -1788,6 +1972,226 @@ mod real {
         Ok(out)
     }
 
+    /// K3 MLA Q8_0 projection loader. Accepts Q8_0 directly (passthrough),
+    /// or converts F32/F16/BF16 to Q8_0 at load time. Rejects all other
+    /// types with an explicit error — no silent fallback.
+    /// When PULSAR_K3_HOST=1, allocates host-pinned (mapped) memory.
+    fn upload_k3_mla_q8(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let n = t.n_elements() as usize;
+        match t.ty {
+            TensorType::Q8_0 => {
+                // Passthrough: already Q8_0 bytes
+                upload_k3_host(&read_tensor_bytes(file, g, name)?)
+            }
+            TensorType::F32 => {
+                // Quantize F32 -> Q8_0
+                let f32_data = read_tensor_f32(file, g, name)?;
+                let mut q8 = Vec::with_capacity(n / 32 * 34);
+                requant::quantize_q8_0(&f32_data, &mut q8);
+                upload_k3_host(&q8)
+            }
+            TensorType::F16 => {
+                // F16 -> F32 -> Q8_0
+                let f32_data = read_f16_as_f32(file, g, name)?;
+                let mut q8 = Vec::with_capacity(n / 32 * 34);
+                requant::quantize_q8_0(&f32_data, &mut q8);
+                upload_k3_host(&q8)
+            }
+            TensorType::BF16 => {
+                // BF16 -> F32 -> Q8_0
+                let mut buf = vec![0u8; n * 2];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                let f32_data: Vec<f32> = buf
+                    .chunks_exact(2)
+                    .map(|c| requant::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let mut q8 = Vec::with_capacity(n / 32 * 34);
+                requant::quantize_q8_0(&f32_data, &mut q8);
+                upload_k3_host(&q8)
+            }
+            // K-quant types: read_tensor_bytes already converts K-quant -> Q8_0
+            TensorType::Q2K
+            | TensorType::Q3K
+            | TensorType::Q4K
+            | TensorType::Q5K
+            | TensorType::Q6K => {
+                upload_k3_host(&read_tensor_bytes(file, g, name)?)
+            }
+            other => Err(format!(
+                "{name}: K3 MLA Q8_0 path does not accept type {other:?} — expected Q8_0, F32, F16, BF16, or K-quant"
+            )
+            .into()),
+        }
+    }
+
+    /// K3 K-quant-preserving projection loader.
+    ///
+    /// Retains raw Q2_K/Q3_K bytes (no dequant → requant to Q8_0) so the
+    /// forward path can dispatch directly to `kernels::matmul_kq`.
+    /// Returns a `K3DenseWeight` with the source quant metadata.
+    ///
+    /// For Q8_0/F32/F16/BF16 sources, converts to Q8_0 and tags as Q8_0.
+    /// For Q4_K/Q5_K/Q6_K sources, converts to Q8_0 (same as the old path)
+    /// but tags as Q8_0 since matmul_kq only supports Q2_K/Q3_K today.
+    /// Absorbed MLA tensors (wk_b, wv_b) that require F32 should still use
+    /// `upload_k3_mla_absorbed_f32`.
+    fn upload_k3_mla_kq(file: &VFile, g: &Gguf, name: &str) -> Result<kimi_k3::K3DenseWeight> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let n = t.n_elements() as usize;
+        let row_elems = *t.dims.first().ok_or_else(|| meta_err(name))?;
+
+        match t.ty {
+            // Direct K-quant: retain raw bytes, tag with source quant metadata
+            TensorType::Q2K | TensorType::Q3K => {
+                let raw = read_tensor_bytes_raw(file, g, name)?;
+                let quant = kimi_k3::K3WeightQuant::from_gguf(t.ty, row_elems)
+                    .ok_or_else(|| format!("{name}: K3WeightQuant::from_gguf failed for {ty:?}", ty = t.ty))?;
+                let buf = upload_k3_host(&raw)?;
+                Ok(kimi_k3::K3DenseWeight::new(buf, quant))
+            }
+            // Q8_0 passthrough
+            TensorType::Q8_0 => {
+                let raw = read_tensor_bytes(file, g, name)?;
+                let quant = kimi_k3::K3WeightQuant::from_gguf(t.ty, row_elems)
+                    .ok_or_else(|| format!("{name}: K3WeightQuant::from_gguf failed for Q8_0"))?;
+                let buf = upload_k3_host(&raw)?;
+                Ok(kimi_k3::K3DenseWeight::new(buf, quant))
+            }
+            // F32/F16/BF16 → Q8_0 conversion
+            TensorType::F32 => {
+                let f32_data = read_tensor_f32(file, g, name)?;
+                let mut q8 = Vec::with_capacity(n / 32 * 34);
+                requant::quantize_q8_0(&f32_data, &mut q8);
+                let quant = kimi_k3::K3WeightQuant {
+                    quant: kernels::QUANT_Q8_0,
+                    row_bytes: (row_elems.div_ceil(32) * 34) as u64,
+                };
+                let buf = upload_k3_host(&q8)?;
+                Ok(kimi_k3::K3DenseWeight::new(buf, quant))
+            }
+            TensorType::F16 => {
+                let f32_data = read_f16_as_f32(file, g, name)?;
+                let mut q8 = Vec::with_capacity(n / 32 * 34);
+                requant::quantize_q8_0(&f32_data, &mut q8);
+                let quant = kimi_k3::K3WeightQuant {
+                    quant: kernels::QUANT_Q8_0,
+                    row_bytes: (row_elems.div_ceil(32) * 34) as u64,
+                };
+                let buf = upload_k3_host(&q8)?;
+                Ok(kimi_k3::K3DenseWeight::new(buf, quant))
+            }
+            TensorType::BF16 => {
+                let mut buf = vec![0u8; n * 2];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                let f32_data: Vec<f32> = buf
+                    .chunks_exact(2)
+                    .map(|c| requant::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let mut q8 = Vec::with_capacity(n / 32 * 34);
+                requant::quantize_q8_0(&f32_data, &mut q8);
+                let quant = kimi_k3::K3WeightQuant {
+                    quant: kernels::QUANT_Q8_0,
+                    row_bytes: (row_elems.div_ceil(32) * 34) as u64,
+                };
+                let buf = upload_k3_host(&q8)?;
+                Ok(kimi_k3::K3DenseWeight::new(buf, quant))
+            }
+            // Q4_K/Q5_K/Q6_K: convert to Q8_0 (same as old path), tag as Q8_0
+            TensorType::Q4K | TensorType::Q5K | TensorType::Q6K => {
+                let q8_bytes = read_tensor_bytes(file, g, name)?; // read_tensor_bytes auto-converts K-quant → Q8_0
+                let quant = kimi_k3::K3WeightQuant {
+                    quant: kernels::QUANT_Q8_0,
+                    row_bytes: (row_elems.div_ceil(32) * 34) as u64,
+                };
+                let buf = upload_k3_host(&q8_bytes)?;
+                Ok(kimi_k3::K3DenseWeight::new(buf, quant))
+            }
+            other => Err(format!(
+                "{name}: K3 K-quant path does not accept type {other:?} — expected Q2_K, Q3_K, Q8_0, F32, F16, BF16, or K-quant"
+            )
+            .into()),
+        }
+    }
+
+    /// Dequantize a Q8_0 byte stream for the custom split-absorption kernel.
+    /// Q8_0 layout is one f16 scale followed by 32 signed int8 values.
+    fn q8_0_bytes_to_f32(bytes: &[u8], n: usize) -> Result<Vec<f32>> {
+        if bytes.len() != n / 32 * 34 || n % 32 != 0 {
+            return Err(
+                format!("invalid Q8_0 byte length {} for {n} elements", bytes.len()).into(),
+            );
+        }
+        let mut out = Vec::with_capacity(n);
+        for block in bytes.chunks_exact(34) {
+            let d = requant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            for &q in &block[2..] {
+                out.push(d * (q as i8 as f32));
+            }
+        }
+        Ok(out)
+    }
+
+    /// K3 MLA absorbed-path loader (W_k_b, W_v_b). The custom kernel reads
+    /// these tensors as F32 because it performs per-head 3D indexing. Native
+    /// F32/F16/BF16 and Q8/K-quant sources are converted explicitly; packed
+    /// NVFP4 and unknown layouts fail closed.
+    fn upload_k3_mla_absorbed_f32(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let n = t.n_elements() as usize;
+        let values = match t.ty {
+            TensorType::F32 => read_tensor_f32(file, g, name)?,
+            TensorType::F16 => read_f16_as_f32(file, g, name)?,
+            TensorType::BF16 => {
+                let mut buf = vec![0u8; n * 2];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                buf.chunks_exact(2)
+                    .map(|c| requant::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect()
+            }
+            TensorType::Q8_0 => q8_0_bytes_to_f32(&read_tensor_bytes(file, g, name)?, n)?,
+            TensorType::Q4_0 => {
+                let bytes = read_tensor_bytes_raw(file, g, name)?;
+                let (block_elems, block_bytes) = t
+                    .ty
+                    .block_layout()
+                    .ok_or_else(|| meta_err(name))?;
+                let block_elems = block_elems as usize;
+                let block_bytes = block_bytes as usize;
+                if n % block_elems != 0 || bytes.len() != (n / block_elems) * block_bytes {
+                    return Err(format!(
+                        "{name}: invalid Q4_0 byte length {} for {n} elements",
+                        bytes.len()
+                    )
+                    .into());
+                }
+                let mut values = Vec::with_capacity(n);
+                for block in bytes.chunks_exact(block_bytes) {
+                    let mut decoded = [0.0f32; 256];
+                    requant::dequant_block(t.ty, block, &mut decoded);
+                    values.extend_from_slice(&decoded[..block_elems]);
+                }
+                values
+            }
+            TensorType::Q2K
+            | TensorType::Q3K
+            | TensorType::Q4K
+            | TensorType::Q5K
+            | TensorType::Q6K => {
+                // read_tensor_bytes performs the existing K-quant -> Q8_0
+                // conversion; dequantize that normalized stream here.
+                q8_0_bytes_to_f32(&read_tensor_bytes(file, g, name)?, n)?
+            }
+            other => {
+                return Err(format!(
+                    "{name}: K3 MLA absorbed path cannot dequantize type {other:?}"
+                )
+                .into())
+            }
+        };
+        Ok(upload_k3_host(kernels::as_bytes(&values))?)
+    }
+
     /// Big attention weights: VRAM while `vram_budget` lasts, then pinned
     /// host memory (zero-copy PCIe reads). Gqa attn always fits, so its
     /// budget is unlimited; Mla (GLM-class, ~12GB attn q8) spends a
@@ -1795,12 +2199,7 @@ mod real {
     /// routes here - zero-copy reads measure ~6GB/s vs VRAM's ~288GB/s, so
     /// every budgeted byte is ~50x cheaper to read each token.
     /// PULSAR_ATTN_HOST=1 forces everything pinned.
-    fn upload_attn(
-        file: &VFile,
-        g: &Gguf,
-        name: &str,
-        vram_budget: &mut i64,
-    ) -> Result<DeviceBuf> {
+    fn upload_attn(file: &VFile, g: &Gguf, name: &str, vram_budget: &mut i64) -> Result<DeviceBuf> {
         let bytes = read_tensor_bytes(file, g, name)?;
         let force_host = std::env::var("PULSAR_ATTN_HOST").ok().as_deref() == Some("1");
         let use_vram = !force_host && *vram_budget >= bytes.len() as i64;
@@ -1819,25 +2218,94 @@ mod real {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
+            let k3_layer_kinds = if shape.family == Family::KimiK3 {
+                let Value::Array(values) = gguf
+                    .arch_meta("attention.head_count_kv")
+                    .ok_or_else(|| meta_err("attention.head_count_kv"))?
+                else {
+                    return Err(meta_err("attention.head_count_kv must be an array").into());
+                };
+                let kinds = values
+                    .iter()
+                    .map(|v| match v.as_u64() {
+                        Some(0) => Ok(kimi_k3::K3LayerKind::Kda),
+                        Some(_) => Ok(kimi_k3::K3LayerKind::Mla),
+                        None => Err(meta_err("attention.head_count_kv")),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if kinds.len() != shape.n_exec_layer as usize {
+                    return Err(format!(
+                        "Kimi K3 attention layer metadata has {} entries, expected {}",
+                        kinds.len(),
+                        shape.n_exec_layer
+                    )
+                    .into());
+                }
+                kinds
+            } else {
+                Vec::new()
+            };
 
             // the embedding table is read ~one row per token - pinned
             // host is free for it and returns ~1GB of VRAM to hot weights
             let token_embd = {
-                // deepseek4 ships the table f16; embed_q8_0 wants q8_0
+                // Dense K3 embeddings are commonly Q2_K in AtomicChat. Keep
+                // the q8_0 embedding kernel contract, but normalize the
+                // source explicitly instead of assuming F32 bytes.
                 let bytes = if shape.family == Family::Dsv4 {
                     read_f16_as_q8(&file, &gguf, "token_embd.weight")?
+                } else if shape.family == Family::KimiK3 {
+                    match gguf
+                        .tensor("token_embd.weight")
+                        .ok_or_else(|| meta_err("token_embd.weight"))?
+                        .ty
+                    {
+                        TensorType::F32 => {
+                            let f32_data = read_tensor_f32(&file, &gguf, "token_embd.weight")?;
+                            let mut q8 = Vec::new();
+                            requant::quantize_q8_0(&f32_data, &mut q8);
+                            q8
+                        }
+                        TensorType::Q8_0
+                        | TensorType::Q2K
+                        | TensorType::Q3K
+                        | TensorType::Q4K
+                        | TensorType::Q5K
+                        | TensorType::Q6K => {
+                            read_tensor_bytes(&file, &gguf, "token_embd.weight")?
+                        }
+                        other => {
+                            return Err(format!(
+                                "token_embd.weight: unsupported K3 embedding type {other:?}"
+                            )
+                            .into())
+                        }
+                    }
                 } else {
                     read_tensor_bytes(&file, &gguf, "token_embd.weight")?
                 };
                 let mut buf = if matches!(shape.family, Family::Mla | Family::Dsv4) {
                     DeviceBuf::alloc_pinned(bytes.len())?
+                } else if shape.family == Family::KimiK3 {
+                    // K3 token embedding: respect PULSAR_K3_HOST=1
+                    let mut b = if k3_use_host_pinned() {
+                        DeviceBuf::alloc_pinned(bytes.len())?
+                    } else {
+                        DeviceBuf::alloc(bytes.len())?
+                    };
+                    b.write(0, &bytes)?;
+                    b
                 } else {
                     DeviceBuf::alloc(bytes.len())?
                 };
                 buf.write(0, &bytes)?;
                 buf
             };
-            let output_norm = upload(&file, &gguf, "output_norm.weight")?;
+            let output_norm = if shape.family == Family::KimiK3 {
+                upload_k3(&file, &gguf, "output_norm.weight")?
+            } else {
+                upload(&file, &gguf, "output_norm.weight")?
+            };
             // tied embeddings (gemma4): no output.weight, the lm head IS
             // the (q8_0) embedding table
             let head_name = if gguf.tensor("output.weight").is_some() {
@@ -1845,7 +2313,11 @@ mod real {
             } else {
                 "token_embd.weight"
             };
-            let output = upload(&file, &gguf, head_name)?;
+            let output = if shape.family == Family::KimiK3 {
+                upload_k3(&file, &gguf, head_name)?
+            } else {
+                upload(&file, &gguf, head_name)?
+            };
             let output_kq = {
                 let t = gguf.tensor(head_name).ok_or_else(|| meta_err(head_name))?;
                 let quant = match t.ty {
@@ -1944,9 +2416,9 @@ mod real {
                         ok
                     }),
                 },
-                // ponytail: dsv4/qwen35 v1 run everything on the primary;
+                // ponytail: dsv4/qwen35/kimi_k3 v1 run everything on the primary;
                 // attn offload comes with the perf pass
-                Family::Dsv4 | Family::Qwen35 => None,
+                Family::Dsv4 | Family::Qwen35 | Family::KimiK3 => None,
             };
             if let Some(d) = attn_dev {
                 eprintln!("pulsar: attn weights + KV resident on CUDA device {d}");
@@ -1988,10 +2460,7 @@ mod real {
                     .map(|il| {
                         let swa = swa_pat.get(il).copied().unwrap_or(false);
                         Geom {
-                            n_head_kv: kvh
-                                .get(il)
-                                .copied()
-                                .unwrap_or(shape.n_head_kv as u64)
+                            n_head_kv: kvh.get(il).copied().unwrap_or(shape.n_head_kv as u64)
                                 as u32,
                             head_dim: shape.head_dim,
                             theta: 0.0,
@@ -2010,14 +2479,16 @@ mod real {
                 };
                 let kvh = arr_u("attention.head_count_kv");
                 let swa_pat: Vec<bool> = match gguf.arch_meta("attention.sliding_window_pattern") {
-                    Some(Value::Array(a)) => a
-                        .iter()
-                        .map(|v| matches!(v, Value::Bool(true)))
-                        .collect(),
+                    Some(Value::Array(a)) => {
+                        a.iter().map(|v| matches!(v, Value::Bool(true))).collect()
+                    }
                     _ => Vec::new(),
                 };
                 let g_u = |k: &str, d: u32| -> u32 {
-                    gguf.arch_meta(k).and_then(Value::as_u64).map(|v| v as u32).unwrap_or(d)
+                    gguf.arch_meta(k)
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32)
+                        .unwrap_or(d)
                 };
                 let g_f = |k: &str, d: f32| -> f32 {
                     gguf.arch_meta(k).and_then(Value::as_f32).unwrap_or(d)
@@ -2070,6 +2541,10 @@ mod real {
                 (Family::Dsv4, _) => env_budget.unwrap_or(8 << 30),
                 // qwen35: the whole non-expert stack is ~2GB - resident
                 (Family::Qwen35, _) => env_budget.unwrap_or(i64::MAX),
+                // K3: 24 MLA layers with compact latent cache + 69 KDA
+                // layers (no KV).  The MLA attn stack is ~4GB q8; KDA
+                // attn is ~2GB.  Budget for the MLA portion resident.
+                (Family::KimiK3, _) => env_budget.unwrap_or(6 << 30),
             };
             // small Mla attn tensors always go pinned (not worth budget) -
             // except on a dedicated attn GPU, where everything is resident
@@ -2078,9 +2553,11 @@ mod real {
             let dsv4_arch = shape.family == Family::Dsv4;
             let compress_ratios: Vec<u32> = if dsv4_arch {
                 match gguf.arch_meta("attention.compress_ratios") {
-                    Some(Value::Array(a)) => {
-                        a.iter().filter_map(Value::as_u64).map(|v| v as u32).collect()
-                    }
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .map(|v| v as u32)
+                        .collect(),
                     _ => return Err(meta_err("attention.compress_ratios")),
                 }
             } else {
@@ -2095,7 +2572,13 @@ mod real {
                               no_budget: &mut i64|
              -> Result<LayerW> {
                 let t = |suffix: &str| format!("blk.{il}.{suffix}");
-                let ffn = if il < shape.n_leading_dense {
+                let ffn = if shape.family == Family::KimiK3 {
+                    Ffn::Dense {
+                        gate: DeviceBuf::alloc(4)?,
+                        up: DeviceBuf::alloc(4)?,
+                        down: DeviceBuf::alloc(4)?,
+                    }
+                } else if il < shape.n_leading_dense {
                     Ffn::Dense {
                         gate: upload(&file, &gguf, &t("ffn_gate.weight"))?,
                         up: upload(&file, &gguf, &t("ffn_up.weight"))?,
@@ -2131,7 +2614,11 @@ mod real {
                         let u = g.clone();
                         (g, u, off)
                     } else {
-                        (exps("ffn_gate_exps.weight")?, exps("ffn_up_exps.weight")?, 0)
+                        (
+                            exps("ffn_gate_exps.weight")?,
+                            exps("ffn_up_exps.weight")?,
+                            0,
+                        )
                     };
                     Ffn::Moe {
                         // deepseek4 ships the router f16; matmul_f32
@@ -2193,10 +2680,25 @@ mod real {
                 }
                 let attn = match shape.family {
                     Family::Gqa => Attn::Gqa {
-                        attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut *attn_vram_budget)?,
-                        attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"), &mut *attn_vram_budget)?,
+                        attn_q: upload_attn(
+                            &file,
+                            &gguf,
+                            &t("attn_q.weight"),
+                            &mut *attn_vram_budget,
+                        )?,
+                        attn_k: upload_attn(
+                            &file,
+                            &gguf,
+                            &t("attn_k.weight"),
+                            &mut *attn_vram_budget,
+                        )?,
                         attn_v: if gguf.tensor(&t("attn_v.weight")).is_some() {
-                            Some(upload_attn(&file, &gguf, &t("attn_v.weight"), &mut *attn_vram_budget)?)
+                            Some(upload_attn(
+                                &file,
+                                &gguf,
+                                &t("attn_v.weight"),
+                                &mut *attn_vram_budget,
+                            )?)
                         } else {
                             None // gemma attention_k_eq_v: k doubles as v
                         },
@@ -2206,8 +2708,18 @@ mod real {
                     Family::Mla => Attn::Mla {
                         q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut *no_budget)?,
                         q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
-                        q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"), &mut *attn_vram_budget)?,
-                        kv_a_mqa: upload_attn(&file, &gguf, &t("attn_kv_a_mqa.weight"), &mut *no_budget)?,
+                        q_b: upload_attn(
+                            &file,
+                            &gguf,
+                            &t("attn_q_b.weight"),
+                            &mut *attn_vram_budget,
+                        )?,
+                        kv_a_mqa: upload_attn(
+                            &file,
+                            &gguf,
+                            &t("attn_kv_a_mqa.weight"),
+                            &mut *no_budget,
+                        )?,
                         kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
                         k_b: upload_attn(&file, &gguf, &t("attn_k_b.weight"), &mut *no_budget)?,
                         v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"), &mut *no_budget)?,
@@ -2248,14 +2760,26 @@ mod real {
                             let width = ti.dims[1] as u32;
                             Ok(Dsv4CompW {
                                 kv_w: upload_f16_q8(&kv_name, budget)?,
-                                gate_w: upload_f16_q8(&t(&format!("{prefix}_gate.weight")), budget)?,
-                                ape: DeviceBuf::from_f32(&read_f16_as_f32(&file, &gguf, &t(&format!("{prefix}_ape.weight")))?)?,
-                                norm: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t(&format!("{prefix}_norm.weight")))?)?,
+                                gate_w: upload_f16_q8(
+                                    &t(&format!("{prefix}_gate.weight")),
+                                    budget,
+                                )?,
+                                ape: DeviceBuf::from_f32(&read_f16_as_f32(
+                                    &file,
+                                    &gguf,
+                                    &t(&format!("{prefix}_ape.weight")),
+                                )?)?,
+                                norm: DeviceBuf::from_f32(&read_tensor_f32(
+                                    &file,
+                                    &gguf,
+                                    &t(&format!("{prefix}_norm.weight")),
+                                )?)?,
                                 width,
                             })
                         };
                         let tid2eid = if gguf.tensor(&t("ffn_gate_tid2eid.weight")).is_some() {
-                            let bytes = read_tensor_bytes(&file, &gguf, &t("ffn_gate_tid2eid.weight"))?;
+                            let bytes =
+                                read_tensor_bytes(&file, &gguf, &t("ffn_gate_tid2eid.weight"))?;
                             Some(
                                 bytes
                                     .chunks_exact(4)
@@ -2266,19 +2790,55 @@ mod real {
                             None
                         };
                         Attn::Dsv4(Box::new(Dsv4W {
-                            q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut *attn_vram_budget)?,
+                            q_a: upload_attn(
+                                &file,
+                                &gguf,
+                                &t("attn_q_a.weight"),
+                                &mut *attn_vram_budget,
+                            )?,
                             q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
-                            q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"), &mut *attn_vram_budget)?,
-                            kv: upload_attn(&file, &gguf, &t("attn_kv.weight"), &mut *attn_vram_budget)?,
+                            q_b: upload_attn(
+                                &file,
+                                &gguf,
+                                &t("attn_q_b.weight"),
+                                &mut *attn_vram_budget,
+                            )?,
+                            kv: upload_attn(
+                                &file,
+                                &gguf,
+                                &t("attn_kv.weight"),
+                                &mut *attn_vram_budget,
+                            )?,
                             kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
-                            out_a: upload_attn(&file, &gguf, &t("attn_output_a.weight"), &mut *attn_vram_budget)?,
+                            out_a: upload_attn(
+                                &file,
+                                &gguf,
+                                &t("attn_output_a.weight"),
+                                &mut *attn_vram_budget,
+                            )?,
                             sinks: upload(&file, &gguf, &t("attn_sinks.weight"))?,
                             hc_attn_fn: upload_f16_as_f32(&file, &gguf, &t("hc_attn_fn.weight"))?,
                             hc_ffn_fn: upload_f16_as_f32(&file, &gguf, &t("hc_ffn_fn.weight"))?,
-                            hc_attn_scale: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_attn_scale.weight"))?)?,
-                            hc_attn_base: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_attn_base.weight"))?)?,
-                            hc_ffn_scale: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_ffn_scale.weight"))?)?,
-                            hc_ffn_base: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_ffn_base.weight"))?)?,
+                            hc_attn_scale: DeviceBuf::from_f32(&read_tensor_f32(
+                                &file,
+                                &gguf,
+                                &t("hc_attn_scale.weight"),
+                            )?)?,
+                            hc_attn_base: DeviceBuf::from_f32(&read_tensor_f32(
+                                &file,
+                                &gguf,
+                                &t("hc_attn_base.weight"),
+                            )?)?,
+                            hc_ffn_scale: DeviceBuf::from_f32(&read_tensor_f32(
+                                &file,
+                                &gguf,
+                                &t("hc_ffn_scale.weight"),
+                            )?)?,
+                            hc_ffn_base: DeviceBuf::from_f32(&read_tensor_f32(
+                                &file,
+                                &gguf,
+                                &t("hc_ffn_base.weight"),
+                            )?)?,
                             // absent on hash layers (selection is tid2eid
                             // there); zeros keep the top-k path harmless
                             probs_b: if gguf.tensor(&t("exp_probs_b.bias")).is_some() {
@@ -2294,8 +2854,15 @@ mod real {
                             },
                             idx: if ratio == 4 {
                                 Some(Dsv4IdxW {
-                                    q_b: upload_f16_q8(&t("indexer.attn_q_b.weight"), &mut *attn_vram_budget)?,
-                                    proj: upload_f16_as_f32(&file, &gguf, &t("indexer.proj.weight"))?,
+                                    q_b: upload_f16_q8(
+                                        &t("indexer.attn_q_b.weight"),
+                                        &mut *attn_vram_budget,
+                                    )?,
+                                    proj: upload_f16_as_f32(
+                                        &file,
+                                        &gguf,
+                                        &t("indexer.proj.weight"),
+                                    )?,
                                     comp: comp_lane("indexer_compressor", &mut *attn_vram_budget)?,
                                 })
                             } else {
@@ -2336,17 +2903,221 @@ mod real {
                             shexp_gate: upload(&file, &gguf, &t("ffn_gate_inp_shexp.weight"))?,
                         }))
                     }
+                    Family::KimiK3 => {
+                        // K3 has a different FFN/attention contract from the
+                        // generic Pulsar MoE/GQA paths. Load its dedicated
+                        // weight record and return before the generic output
+                        // projection construction below.
+                        let kind = *k3_layer_kinds
+                            .get(il as usize)
+                            .ok_or_else(|| format!("missing K3 layer kind for layer {il}"))?;
+                        let mut k3 = kimi_k3::KimiK3W {
+                            kind,
+                            attn_norm: upload_k3(&file, &gguf, &t("attn_norm.weight"))?,
+                            ffn_norm: upload_k3(&file, &gguf, &t("ffn_norm.weight"))?,
+                            attn_res_norm: upload_k3(&file, &gguf, &t("attn_res_norm.weight"))?,
+                            attn_res_proj: upload_k3(&file, &gguf, &t("attn_res_proj.weight"))?,
+                            ffn_res_norm: upload_k3(&file, &gguf, &t("ffn_res_norm.weight"))?,
+                            ffn_res_proj: upload_k3(&file, &gguf, &t("ffn_res_proj.weight"))?,
+                            ssm_q_conv: None,
+                            ssm_k_conv: None,
+                            ssm_v_conv: None,
+                            wq: None,
+                            wk: None,
+                            wv: None,
+                            ssm_f_a: None,
+                            ssm_f_b: None,
+                            ssm_beta: None,
+                            ssm_a: None,
+                            ssm_dt_b: None,
+                            wqkv_gate: None,
+                            ssm_o_norm: None,
+                            wo: None,
+                            mla_wq_a: None,
+                            mla_wq_b: None,
+                            mla_q_a_norm: None,
+                            mla_kv_a_norm: None,
+                            mla_wkv_a_mqa: None,
+                            mla_wk_b: None,
+                            mla_wv_b: None,
+                            mla_wkv_b: None,
+                            mla_wqkv_gate: None,
+                            mla_wo: None,
+                            ffn_gate: None,
+                            ffn_up: None,
+                            ffn_down: None,
+                            ffn_gate_inp: None,
+                            ffn_exp_probs_b: None,
+                            ffn_latent_down: None,
+                            ffn_latent_up: None,
+                            ffn_latent_norm: None,
+                            ffn_gate_exps: None,
+                            ffn_up_exps: None,
+                            ffn_down_exps: None,
+                            ffn_gate_shexp: None,
+                            ffn_up_shexp: None,
+                            ffn_down_shexp: None,
+                        };
+
+                        match kind {
+                            kimi_k3::K3LayerKind::Kda => {
+                                k3.ssm_q_conv =
+                                    Some(upload_k3(&file, &gguf, &t("ssm_conv1d_q.weight"))?);
+                                k3.ssm_k_conv =
+                                    Some(upload_k3(&file, &gguf, &t("ssm_conv1d_k.weight"))?);
+                                k3.ssm_v_conv =
+                                    Some(upload_k3(&file, &gguf, &t("ssm_conv1d_v.weight"))?);
+                                k3.wq = Some(upload_k3_mla_kq(&file, &gguf, &t("attn_q.weight"))?);
+                                k3.wk = Some(upload_k3_mla_kq(&file, &gguf, &t("attn_k.weight"))?);
+                                k3.wv = Some(upload_k3_mla_kq(&file, &gguf, &t("attn_v.weight"))?);
+                                k3.ssm_f_a =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("ssm_f_a.weight"))?);
+                                k3.ssm_f_b = Some(upload_k3_mla_absorbed_f32(
+                                    &file,
+                                    &gguf,
+                                    &t("ssm_f_b.weight"),
+                                )?);
+                                k3.ssm_beta =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("ssm_beta.weight"))?);
+                                k3.ssm_a = Some(upload_k3(&file, &gguf, &t("ssm_a"))?);
+                                k3.ssm_dt_b = Some(upload_k3(&file, &gguf, &t("ssm_dt.bias"))?);
+                                k3.wqkv_gate =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_gate.weight"))?);
+                                k3.ssm_o_norm = Some(upload_k3(&file, &gguf, &t("ssm_norm.weight"))?);
+                                k3.wo =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_output.weight"))?);
+                            }
+                            kimi_k3::K3LayerKind::Mla => {
+                                k3.mla_wq_a =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_q_a.weight"))?);
+                                k3.mla_q_a_norm =
+                                    Some(upload_k3(&file, &gguf, &t("attn_q_a_norm.weight"))?);
+                                k3.mla_wq_b =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_q_b.weight"))?);
+                                k3.mla_wkv_a_mqa = Some(upload_k3_mla_kq(
+                                    &file,
+                                    &gguf,
+                                    &t("attn_kv_a_mqa.weight"),
+                                )?);
+                                k3.mla_kv_a_norm =
+                                    Some(upload_k3(&file, &gguf, &t("attn_kv_a_norm.weight"))?);
+                                let optional_mla_kq = |suffix: &str| -> Result<Option<kimi_k3::K3DenseWeight>> {
+                                    let name = t(suffix);
+                                    if gguf.tensor(&name).is_some() {
+                                        Ok(Some(upload_k3_mla_kq(&file, &gguf, &name)?))
+                                    } else {
+                                        Ok(None)
+                                    }
+                                };
+                                let optional_mla_absorbed =
+                                    |suffix: &str| -> Result<Option<DeviceBuf>> {
+                                        let name = t(suffix);
+                                        if gguf.tensor(&name).is_some() {
+                                            Ok(Some(upload_k3_mla_absorbed_f32(
+                                                &file, &gguf, &name,
+                                            )?))
+                                        } else {
+                                            Ok(None)
+                                        }
+                                    };
+                                // W_k_b, W_v_b: consumed by the custom absorbed-attention kernel
+                                // which reads them as `const float *` with per-element indexing.
+                                // These MUST stay F32 — cannot be Q8_0.
+                                k3.mla_wk_b = optional_mla_absorbed("attn_k_b.weight")?;
+                                k3.mla_wv_b = optional_mla_absorbed("attn_v_b.weight")?;
+                                // W_kv_b: consumed by pulsar_matmul_f32 (caller does f32 matmul
+                                // before the fused kernel). Q8_0 is valid here since the matmul
+                                // is a standard projection.
+                                k3.mla_wkv_b = optional_mla_kq("attn_kv_b.weight")?;
+                                k3.mla_wqkv_gate =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_gate.weight"))?);
+                                k3.mla_wo =
+                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_output.weight"))?);
+                            }
+                        }
+
+                        if il < shape.n_leading_dense {
+                            k3.ffn_gate =
+                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_gate.weight"))?);
+                            k3.ffn_up = Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_up.weight"))?);
+                            k3.ffn_down =
+                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_down.weight"))?);
+                        } else {
+                            k3.ffn_gate_inp =
+                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_gate_inp.weight"))?);
+                            let bias_name = if gguf.tensor(&t("exp_probs_b.bias")).is_some() {
+                                t("exp_probs_b.bias")
+                            } else {
+                                t("exp_probs_b")
+                            };
+                            k3.ffn_exp_probs_b = Some(upload_k3(&file, &gguf, &bias_name)?);
+                            k3.ffn_latent_down = Some(upload_k3_mla_kq(
+                                &file,
+                                &gguf,
+                                &t("ffn_latent_down.weight"),
+                            )?);
+                            k3.ffn_latent_norm =
+                                Some(upload_k3(&file, &gguf, &t("ffn_latent_norm.weight"))?);
+                            k3.ffn_latent_up = Some(upload_k3_mla_q8(
+                                &file,
+                                &gguf,
+                                &t("ffn_latent_up.weight"),
+                            )?);
+                            for (slot, suffix) in [
+                                (&mut k3.ffn_gate_exps, "ffn_gate_exps.weight"),
+                                (&mut k3.ffn_up_exps, "ffn_up_exps.weight"),
+                                (&mut k3.ffn_down_exps, "ffn_down_exps.weight"),
+                            ] {
+                                let name = t(suffix);
+                                let ti = gguf.tensor(&name).ok_or_else(|| meta_err(&name))?;
+                                *slot = Some(ExpertTensor::new(&gguf, ti, shape.n_expert)?);
+                            }
+                            k3.ffn_gate_shexp =
+                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_gate_shexp.weight"))?);
+                            k3.ffn_up_shexp =
+                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_up_shexp.weight"))?);
+                            k3.ffn_down_shexp = Some(upload_k3_mla_q8(
+                                &file,
+                                &gguf,
+                                &t("ffn_down_shexp.weight"),
+                            )?);
+                        }
+
+                        return Ok(LayerW {
+                            attn_norm: DeviceBuf::alloc(4)?,
+                            attn: Attn::KimiK3(Box::new(k3)),
+                            attn_output: DeviceBuf::alloc(4)?,
+                            ffn_norm: DeviceBuf::alloc(4)?,
+                            ffn: Ffn::Dense {
+                                gate: DeviceBuf::alloc(4)?,
+                                up: DeviceBuf::alloc(4)?,
+                                down: DeviceBuf::alloc(4)?,
+                            },
+                            gemma: None,
+                            ink: None,
+                        });
+                    }
                 };
                 let attn_output = if dsv4_arch {
                     // V4's second-stage output projection
-                    upload_attn(&file, &gguf, &t("attn_output_b.weight"), &mut *attn_vram_budget)?
+                    upload_attn(
+                        &file,
+                        &gguf,
+                        &t("attn_output_b.weight"),
+                        &mut *attn_vram_budget,
+                    )?
                 } else if shape.family == Family::Qwen35
                     && gguf.tensor(&t("attn_output.weight")).is_none()
                 {
                     // GDN layers project through ssm_out instead
                     DeviceBuf::alloc(1)?
                 } else {
-                    upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?
+                    upload_attn(
+                        &file,
+                        &gguf,
+                        &t("attn_output.weight"),
+                        &mut *attn_vram_budget,
+                    )?
                 };
                 if attn_dev.is_some() {
                     kernels::set_device(primary)?;
@@ -2383,7 +3154,11 @@ mod real {
                     // fastest): transpose to [extent][d_rel] rows so
                     // matmul_f32 contracts over d_rel
                     let raw = read_tensor_f32(&file, &gguf, &t("attn_rel_proj.weight"))?;
-                    let ext = if gm.window != 0 { shape.rel_ext_swa } else { shape.rel_ext } as usize;
+                    let ext = if gm.window != 0 {
+                        shape.rel_ext_swa
+                    } else {
+                        shape.rel_ext
+                    } as usize;
                     let dr = shape.d_rel as usize;
                     if raw.len() != ext * dr {
                         return Err(format!(
@@ -2410,7 +3185,8 @@ mod real {
                     if let Some(d) = attn_dev {
                         kernels::set_device(d)?;
                     }
-                    let wr = upload_attn(&file, &gguf, &t("attn_r.weight"), &mut *attn_vram_budget)?;
+                    let wr =
+                        upload_attn(&file, &gguf, &t("attn_r.weight"), &mut *attn_vram_budget)?;
                     let mut rel_proj = DeviceBuf::alloc(tr.len() * 4)?;
                     rel_proj.write(0, kernels::as_bytes(&tr))?;
                     let sconv_k = upload_f32(&t("shortconv_k.weight"))?;
@@ -2465,7 +3241,13 @@ mod real {
                     let layer = load_layer(il, &mut attn_vram_budget, &mut no_budget)?;
                     let mut res_pool = DeviceBuf::alloc(1)?;
                     let mut res_map = std::collections::HashMap::new();
-                    if let Ffn::Moe { gate_exps, up_exps, down_exps, .. } = &layer.ffn {
+                    if let Ffn::Moe {
+                        gate_exps,
+                        up_exps,
+                        down_exps,
+                        ..
+                    } = &layer.ffn
+                    {
                         let total: usize = [gate_exps, up_exps, down_exps]
                             .iter()
                             .map(|t| t.expert_bytes as usize * shape.n_expert as usize)
@@ -2568,6 +3350,25 @@ mod real {
             } else {
                 (None, None)
             };
+            // K3 output AttnRes tensors (global, optional)
+            let k3_output_res_norm = if shape.family == Family::KimiK3 {
+                if gguf.tensor("output_res_norm.weight").is_some() {
+                    Some(upload(&file, &gguf, "output_res_norm.weight")?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let k3_output_res_proj = if shape.family == Family::KimiK3 {
+                if gguf.tensor("output_res_proj.weight").is_some() {
+                    Some(upload(&file, &gguf, "output_res_proj.weight")?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(Model {
                 path: path.to_path_buf(),
                 shards,
@@ -2583,7 +3384,11 @@ mod real {
                 output_kq,
                 geom,
                 rope_factors,
-                embd_scale: if gemma_arch { (shape.n_embd as f32).sqrt() } else { 1.0 },
+                embd_scale: if gemma_arch {
+                    (shape.n_embd as f32).sqrt()
+                } else {
+                    1.0
+                },
                 logit_softcap,
                 tok_norm,
                 logit_scale,
@@ -2591,6 +3396,9 @@ mod real {
                 compress_ratios,
                 ones_hc,
                 dsv4_out,
+                k3_layer_kinds,
+                k3_output_res_norm,
+                k3_output_res_proj,
             })
         }
     }
@@ -2618,8 +3426,10 @@ mod real {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let census: std::collections::HashMap<u64, u64> =
-            read_census(&m.path).into_iter().map(|(off, _, count)| (off, count)).collect();
+        let census: std::collections::HashMap<u64, u64> = read_census(&m.path)
+            .into_iter()
+            .map(|(off, _, count)| (off, count))
+            .collect();
         if census.is_empty() {
             eprintln!("pulsar: no warm census yet - expert tiers idle until the next run");
             return Ok(Vec::new());
@@ -2630,10 +3440,17 @@ mod real {
         // never disk-miss (the host LFU always keeps what every token
         // touches) - measured: sinks evicting routed triples cost 3%,
         // sinks filling spare tier capacity are free wins.
-        let mut triples: Vec<(u64, [ (u64, u64); 3 ])> = Vec::new();
-        let mut sink_triples: Vec<(u64, [ (u64, u64); 3 ])> = Vec::new();
+        let mut triples: Vec<(u64, [(u64, u64); 3])> = Vec::new();
+        let mut sink_triples: Vec<(u64, [(u64, u64); 3])> = Vec::new();
         for l in &m.layers {
-            let Ffn::Moe { gate_exps, up_exps, down_exps, sink, .. } = &l.ffn else {
+            let Ffn::Moe {
+                gate_exps,
+                up_exps,
+                down_exps,
+                sink,
+                ..
+            } = &l.ffn
+            else {
                 continue;
             };
             for e in 0..s.n_expert as u64 {
@@ -2663,7 +3480,9 @@ mod real {
         let mut tiers = Vec::new();
         let mut next = triples.into_iter();
         for d in candidates {
-            let Ok((free, _)) = kernels::mem_info(d) else { continue };
+            let Ok((free, _)) = kernels::mem_info(d) else {
+                continue;
+            };
             let reserve: usize = 1 << 30; // scratch + CUDA context
             if free <= reserve + (1 << 30) {
                 continue; // not worth a tier
@@ -2698,7 +3517,9 @@ mod real {
                 } else {
                     DeviceBuf::alloc(1)?
                 },
-                grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
+                grp_ptrs: DeviceBuf::alloc(
+                    s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>(),
+                )?,
                 grp_starts: DeviceBuf::alloc((s.n_expert as usize + 1) * 4)?,
                 grp_pairs: DeviceBuf::alloc(mb as usize * n_used * 4)?,
                 grp_partial: DeviceBuf::alloc(
@@ -2852,6 +3673,8 @@ mod real {
         dsv4: Option<dsv4::Dsv4Rt>,
         /// qwen35 runtime (GDN conv+delta states); None elsewhere
         qwen35: Option<qwen35::Qwen35Rt>,
+        /// Kimi K3 runtime (KDA conv+ssm states, AttnRes bank); None elsewhere
+        kimi_k3: Option<kimi_k3::KimiK3Rt>,
     }
 
     impl State {
@@ -2871,7 +3694,8 @@ mod real {
                     let avail_gb = std::fs::read_to_string("/proc/meminfo")
                         .ok()
                         .and_then(|s| {
-                            s.lines().find(|l| l.starts_with("MemAvailable:"))?
+                            s.lines()
+                                .find(|l| l.starts_with("MemAvailable:"))?
                                 .split_whitespace()
                                 .nth(1)?
                                 .parse::<usize>()
@@ -2908,11 +3732,10 @@ mod real {
             // A thin run still can't lower a hot slab, and counts stay at
             // per-run scale (a running sum would ossify the cache).
             // ponytail: rm the .warm to reset a drifted hot set.
-            let mut merged: std::collections::HashMap<u64, (u64, u64)> =
-                read_census(&m.path)
-                    .into_iter()
-                    .map(|(off, len, count)| (off, (len, count)))
-                    .collect();
+            let mut merged: std::collections::HashMap<u64, (u64, u64)> = read_census(&m.path)
+                .into_iter()
+                .map(|(off, len, count)| (off, (len, count)))
+                .collect();
             for (&off, &(count, len)) in self.dev_cache.touch.iter() {
                 let seed = self.warm_seeds.get(&off).copied().unwrap_or(0);
                 let this_run = count.saturating_sub(seed);
@@ -2949,10 +3772,11 @@ mod real {
                 entries.push((off, len, count));
             }
             // tier-resident slabs never reach the caches - don't preload them
-            let in_tier =
-                |off: u64| self.tiers.iter().any(|t| t.map.contains_key(&off));
-            let entries: Vec<_> =
-                entries.into_iter().filter(|&(off, _, _)| !in_tier(off)).collect();
+            let in_tier = |off: u64| self.tiers.iter().any(|t| t.map.contains_key(&off));
+            let entries: Vec<_> = entries
+                .into_iter()
+                .filter(|&(off, _, _)| !in_tier(off))
+                .collect();
             for &(off, len, count) in &entries {
                 self.dev_cache.touch.insert(off, (count, len));
                 self.warm_seeds.insert(off, count);
@@ -2995,12 +3819,18 @@ mod real {
             // include the MTP layer: its experts can use a DIFFERENT quant
             // (blk.80 is Q2_K on the Hy3 recipe, bigger slabs than IQ2_XXS)
             // - undersized slots make its slabs overflow into neighbors
-            let max_slab = m
+            let mut max_slab = m
                 .layers
                 .iter()
                 .chain(m.mtp.iter().map(|mt| &mt.layer))
                 .filter_map(|l| match &l.ffn {
-                    Ffn::Moe { gate_exps, up_exps, down_exps, sink, .. } => {
+                    Ffn::Moe {
+                        gate_exps,
+                        up_exps,
+                        down_exps,
+                        sink,
+                        ..
+                    } => {
                         Some(
                             gate_exps
                                 .expert_bytes
@@ -3016,6 +3846,23 @@ mod real {
                 })
                 .max()
                 .unwrap_or(0) as usize;
+            // K3 keeps its latent-MoE expert tensors inside the
+            // architecture-specific attention record rather than Ffn::Moe.
+            let k3_max_slab = m
+                .layers
+                .iter()
+                .filter_map(|l| match &l.attn {
+                    Attn::KimiK3(k3) => {
+                        let gate = k3.ffn_gate_exps.as_ref()?.expert_bytes;
+                        let up = k3.ffn_up_exps.as_ref()?.expert_bytes;
+                        let down = k3.ffn_down_exps.as_ref()?.expert_bytes;
+                        Some(gate.max(up).max(down))
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0) as usize;
+            max_slab = max_slab.max(k3_max_slab);
 
             // Gqa: kcache/vcache are per-head K/V. Mla: kcache is the
             // compact latent cache (kv_lora wide), vcache the rope tail.
@@ -3042,6 +3889,12 @@ mod real {
                     let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
                     (b, b)
                 }
+                // K3: MLA layers use compact latent cache; KDA layers have
+                // no KV cache (recurrent).  Size for the MLA upper bound.
+                Family::KimiK3 => (
+                    ctx as usize * s.n_kv_lora.max(1) as usize * 4,
+                    ctx as usize * s.qk_rope.max(1) as usize * 4,
+                ),
             };
             if kv_fp8 {
                 let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
@@ -3101,10 +3954,19 @@ mod real {
                         4
                     };
                     (k_bytes, comp)
+                } else if s.family == Family::KimiK3 {
+                    // MLA layers need the compact latent cache; KDA layers
+                    // (recurrent) need no KV cache at all
+                    let kind = m.k3_layer_kinds.get(i).copied();
+                    match kind {
+                        Some(kimi_k3::K3LayerKind::Mla) => (k_bytes, v_bytes),
+                        _ => (4, 4), // KDA: dummy 1-byte entries
+                    }
                 } else {
                     match m.geom.get(i) {
                         Some(g) => {
-                            let b = g.n_head_kv as usize * ctx as usize * kv_row(g.head_dim as usize);
+                            let b =
+                                g.n_head_kv as usize * ctx as usize * kv_row(g.head_dim as usize);
                             (b, b)
                         }
                         None => (k_bytes, v_bytes),
@@ -3144,8 +4006,16 @@ mod real {
                 });
             }
             let idx_kraw = f32s(if has_idx { mb * s.n_idx_dim } else { 1 })?;
-            let idx_q = f32s(if has_idx { mb * s.n_idx_head * s.n_idx_dim } else { 1 })?;
-            let idx_q16 = DeviceBuf::alloc(if has_idx { (mb * s.n_idx_head * s.n_idx_dim) as usize * 2 } else { 1 })?;
+            let idx_q = f32s(if has_idx {
+                mb * s.n_idx_head * s.n_idx_dim
+            } else {
+                1
+            })?;
+            let idx_q16 = DeviceBuf::alloc(if has_idx {
+                (mb * s.n_idx_head * s.n_idx_dim) as usize * 2
+            } else {
+                1
+            })?;
             let idx_w = f32s(if has_idx { mb * s.n_idx_head } else { 1 })?;
             let idx_scores = f32s(if has_idx { mb * ctx } else { 1 })?;
             let (normed_a, attn_out_a) = if m.attn_dev.is_some() {
@@ -3158,7 +4028,11 @@ mod real {
             // rel-bias buffers and the k/v-stream shortconv state+tmp
             let kbuf = f32s(mb * s.n_head_kv * s.head_dim)?;
             let vbuf = f32s(mb * s.n_head_kv * s.head_dim)?;
-            let r_buf = f32s(if s.d_rel > 0 { mb * s.n_head * s.d_rel } else { 1 })?;
+            let r_buf = f32s(if s.d_rel > 0 {
+                mb * s.n_head * s.d_rel
+            } else {
+                1
+            })?;
             let rel_buf = f32s(if s.d_rel > 0 {
                 mb * s.n_head * s.rel_ext.max(s.rel_ext_swa)
             } else {
@@ -3243,10 +4117,9 @@ mod real {
                 // ping-pong staging exists to hide PINNED attn reads; with
                 // a dedicated attn GPU nothing is pinned, so no stages
                 stages: match s.family {
-                    Family::Mla if m.attn_dev.is_none() => Some([
-                        AttnStage::new(&m.layers[0])?,
-                        AttnStage::new(&m.layers[0])?,
-                    ]),
+                    Family::Mla if m.attn_dev.is_none() => {
+                        Some([AttnStage::new(&m.layers[0])?, AttnStage::new(&m.layers[0])?])
+                    }
                     _ => None,
                 },
                 q_rank,
@@ -3264,19 +4137,29 @@ mod real {
                 idx_last_sel: 0,
                 normed_a,
                 attn_out_a,
-                tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
+                tier_ret: if tiers.is_empty() {
+                    f32s(1)?
+                } else {
+                    f32s(mb * s.n_embd)?
+                },
                 cpu_pool: cpu_tier::Pool::from_env(),
                 cpu_ret: f32s(1)?, // grows on first CPU-lane hit
                 cpu_hits: 0,
                 tiers,
-                grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
+                grp_ptrs: DeviceBuf::alloc(
+                    s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>(),
+                )?,
                 grp_starts: DeviceBuf::alloc((s.n_expert as usize + 1) * 4)?,
                 grp_pairs: DeviceBuf::alloc(mb as usize * n_used * 4)?,
                 grp_partial: f32s(1)?, // grows on first grouped prefill
                 mtp_e_raw: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_e: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_h: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
-                mtp_x: f32s(if m.mtp.is_some() { mb * 2 * s.n_embd } else { 1 })?,
+                mtp_x: f32s(if m.mtp.is_some() {
+                    mb * 2 * s.n_embd
+                } else {
+                    1
+                })?,
                 mtp_hidden: {
                     let mut b = f32s(if m.mtp.is_some() { s.n_embd } else { 1 })?;
                     // read before first write (position 0 has no prior
@@ -3290,8 +4173,7 @@ mod real {
                 mtp_accepted: 0,
                 head_xq: if m.output_kq.is_some() {
                     DeviceBuf::alloc(
-                        spec_rows as usize * s.n_embd as usize
-                            / kernels::Q8_K_BLOCK_ELEMS
+                        spec_rows as usize * s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS
                             * kernels::Q8_K_BLOCK_BYTES,
                     )?
                 } else {
@@ -3337,6 +4219,11 @@ mod real {
                 } else {
                     None
                 },
+                kimi_k3: if s.family == Family::KimiK3 {
+                    Some(kimi_k3::KimiK3Rt::new(m)?)
+                } else {
+                    None
+                },
             };
 
             // ---- capacity solver: size the VRAM budget from MEASUREMENT.
@@ -3362,11 +4249,23 @@ mod real {
                     let stage_worst = |c: usize| -> usize {
                         let mut worst = 0usize;
                         for l in m.layers.iter().chain(m.mtp.iter().map(|mt| &mt.layer)) {
-                            let Ffn::Moe { gate_exps, up_exps, down_exps, fused_up_off, sink, .. } = &l.ffn else {
+                            let Ffn::Moe {
+                                gate_exps,
+                                up_exps,
+                                down_exps,
+                                fused_up_off,
+                                sink,
+                                ..
+                            } = &l.ffn
+                            else {
                                 continue;
                             };
                             let triple = gate_exps.expert_bytes as usize
-                                + if *fused_up_off != 0 { 0 } else { up_exps.expert_bytes as usize }
+                                + if *fused_up_off != 0 {
+                                    0
+                                } else {
+                                    up_exps.expert_bytes as usize
+                                }
                                 + down_exps.expert_bytes as usize;
                             let distinct = (c * route_k.max(1)).min(s.n_expert as usize);
                             let mut b = distinct * triple;
@@ -3469,15 +4368,15 @@ mod real {
                 // GDN conv window + delta state are sequential too
                 return self.forward_qwen35(st, tokens, pos0, rows);
             }
+            if s.family == Family::KimiK3 {
+                // KDA recurrence + AttnRes snapshot bank are sequential
+                return self.forward_kimi_k3(st, tokens, pos0, rows);
+            }
             // a batch must not straddle the indexer top_k boundary: rows
             // before it use causal range selection, rows after it need
             // scored top-k - split once here so every caller inherits it
             let topk = s.n_idx_topk;
-            if topk > 0
-                && pos0 < topk
-                && pos0 + tokens.len() as u32 > topk
-                && tokens.len() > 1
-            {
+            if topk > 0 && pos0 < topk && pos0 + tokens.len() as u32 > topk && tokens.len() > 1 {
                 let split = (topk - pos0) as usize;
                 self.forward_rows(st, &tokens[..split], pos0, 0)?;
                 return self.forward_rows(st, &tokens[split..], topk, rows);
@@ -3493,7 +4392,14 @@ mod real {
             let primary = kernels::get_device();
             let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             st.tok.write(0, kernels::as_bytes(&toks_i32))?;
-            kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, n_tok)?;
+            kernels::embed_q8_0(
+                &mut st.cur,
+                &self.token_embd,
+                &st.tok,
+                s.n_embd,
+                s.n_vocab,
+                n_tok,
+            )?;
             if self.embd_scale != 1.0 {
                 // gemma scales the residual stream by sqrt(n_embd)
                 kernels::scale(&mut st.cur, n_tok * s.n_embd, self.embd_scale)?;
@@ -3530,7 +4436,8 @@ mod real {
                 // layer's compute (decode only: prefill amortizes weights
                 // over the whole batch already)
                 if n_tok == 1 {
-                    if let (Some(stages), Some(nl)) = (st.stages.as_mut(), self.layers.get(il + 1)) {
+                    if let (Some(stages), Some(nl)) = (st.stages.as_mut(), self.layers.get(il + 1))
+                    {
                         stages[(il + 1) % 2].kick(nl, il + 1)?;
                     }
                 }
@@ -3543,8 +4450,21 @@ mod real {
             let k = rows.min(n_tok);
             let t_tail = std::time::Instant::now();
             let row = s.n_embd as usize * 4;
-            kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (n_tok - k) as usize * row, k as usize * row)?;
-            kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, eps)?;
+            kernels::copy_d2d(
+                &mut st.last_row,
+                0,
+                &st.cur,
+                (n_tok - k) as usize * row,
+                k as usize * row,
+            )?;
+            kernels::rms_norm(
+                &mut st.normed,
+                &st.last_row,
+                &self.output_norm,
+                s.n_embd,
+                k,
+                eps,
+            )?;
             self.head_logits(st, k)?;
             kernels::sync()?;
             let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
@@ -3556,10 +4476,33 @@ mod real {
         fn head_logits(&self, st: &mut State, k: u32) -> Result {
             let s = self.shape;
             match self.output_kq {
-                None => kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, k)?,
+                None => kernels::matmul_q8_0(
+                    &mut st.logits,
+                    &self.output,
+                    &st.normed,
+                    s.n_embd,
+                    s.n_vocab,
+                    k,
+                )
+                .map_err(|e| {
+                    if s.family == Family::KimiK3 {
+                        format!("K3 lm_head: {e}")
+                    } else {
+                        e.to_string()
+                    }
+                })?,
                 Some((row_bytes, quant)) => {
                     kernels::quantize_q8_k(&mut st.head_xq, &st.normed, s.n_embd, k)?;
-                    kernels::matmul_kq(&mut st.logits, &self.output, &st.head_xq, s.n_embd, s.n_vocab, k, row_bytes, quant)?;
+                    kernels::matmul_kq(
+                        &mut st.logits,
+                        &self.output,
+                        &st.head_xq,
+                        s.n_embd,
+                        s.n_vocab,
+                        k,
+                        row_bytes,
+                        quant,
+                    )?;
                 }
             }
             if self.logit_softcap > 0.0 {
@@ -3572,7 +4515,13 @@ mod real {
             if self.n_vocab_out < s.n_vocab {
                 // padded vocab rows hold garbage weights - poison them so
                 // no sampler path can pick one
-                kernels::fill_row_tail(&mut st.logits, k, s.n_vocab, self.n_vocab_out, f32::NEG_INFINITY)?;
+                kernels::fill_row_tail(
+                    &mut st.logits,
+                    k,
+                    s.n_vocab,
+                    self.n_vocab_out,
+                    f32::NEG_INFINITY,
+                )?;
             }
             Ok(())
         }
@@ -3603,11 +4552,17 @@ mod real {
                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
                 let mut attn_output_w: &DeviceBuf = &l.attn_output;
                 match &l.attn {
-                    // dsv4/qwen35 have their own graphs
-                    Attn::Dsv4(_) | Attn::Qwen35(_) => {
+                    // dsv4/qwen35/kimi_k3 have their own graphs
+                    Attn::Dsv4(_) | Attn::Qwen35(_) | Attn::KimiK3(_) => {
                         return Err("hybrid-family layer in the shared eval path".into())
                     }
-                    Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm } => {
+                    Attn::Gqa {
+                        attn_q,
+                        attn_k,
+                        attn_v,
+                        q_norm,
+                        k_norm,
+                    } => {
                         let (hkv, hd, theta, window) = match gm {
                             Some(g) => (g.n_head_kv, g.head_dim, g.theta, g.window),
                             None => (s.n_head_kv, s.head_dim, s.rope_freq_base, 0),
@@ -3620,28 +4575,76 @@ mod real {
                         // over and run the whole segment on the attn card,
                         // exactly like the Mla path below
                         if let Some(d) = self.attn_dev {
-                            kernels::copy_across(&mut st.normed_a, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::copy_across(
+                                &mut st.normed_a,
+                                &st.normed,
+                                (n_tok * s.n_embd) as usize * 4,
+                            )?;
                             kernels::set_device(d)?;
                         }
-                        let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
-                        kernels::matmul_q8_0(&mut st.q, attn_q, xin, s.n_embd, s.n_head * hd, n_tok)?;
+                        let xin = if self.attn_dev.is_some() {
+                            &st.normed_a
+                        } else {
+                            &st.normed
+                        };
+                        kernels::matmul_q8_0(
+                            &mut st.q,
+                            attn_q,
+                            xin,
+                            s.n_embd,
+                            s.n_head * hd,
+                            n_tok,
+                        )?;
                         kernels::matmul_q8_0(&mut st.k, attn_k, xin, s.n_embd, hkv * hd, n_tok)?;
                         match attn_v {
-                            Some(v_w) => kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?,
+                            Some(v_w) => kernels::matmul_q8_0(
+                                &mut st.v,
+                                v_w,
+                                xin,
+                                s.n_embd,
+                                hkv * hd,
+                                n_tok,
+                            )?,
                             // attention_k_eq_v: v = the raw k projection
-                            None => kernels::copy_across(&mut st.v, &st.k, (n_tok * hkv * hd) as usize * 4)?,
+                            None => kernels::copy_across(
+                                &mut st.v,
+                                &st.k,
+                                (n_tok * hkv * hd) as usize * 4,
+                            )?,
                         }
                         if let Some(ink) = &l.ink {
                             // inkling: k/v shortconvs on the flat
                             // projections, before head norm (reference
                             // order: matmul -> sconv -> reshape -> norm)
                             let kvb = (n_tok * hkv * hd) as usize * 4;
-                            kernels::sconv(&mut st.sconv_tmp_kv, &st.k, &ink.sconv_k, &mut st.sconv_state[il][0], n_tok, hkv * hd, s.sconv_k)?;
+                            kernels::sconv(
+                                &mut st.sconv_tmp_kv,
+                                &st.k,
+                                &ink.sconv_k,
+                                &mut st.sconv_state[il][0],
+                                n_tok,
+                                hkv * hd,
+                                s.sconv_k,
+                            )?;
                             kernels::copy_across(&mut st.k, &st.sconv_tmp_kv, kvb)?;
-                            kernels::sconv(&mut st.sconv_tmp_kv, &st.v, &ink.sconv_v, &mut st.sconv_state[il][1], n_tok, hkv * hd, s.sconv_k)?;
+                            kernels::sconv(
+                                &mut st.sconv_tmp_kv,
+                                &st.v,
+                                &ink.sconv_v,
+                                &mut st.sconv_state[il][1],
+                                n_tok,
+                                hkv * hd,
+                                s.sconv_k,
+                            )?;
                             kernels::copy_across(&mut st.v, &st.sconv_tmp_kv, kvb)?;
                         }
-                        kernels::gqa_head_rms_norm(&mut st.q, Some(q_norm), n_tok * s.n_head, hd, eps)?;
+                        kernels::gqa_head_rms_norm(
+                            &mut st.q,
+                            Some(q_norm),
+                            n_tok * s.n_head,
+                            hd,
+                            eps,
+                        )?;
                         kernels::gqa_head_rms_norm(&mut st.k, Some(k_norm), n_tok * hkv, hd, eps)?;
                         if gm.is_some() && l.ink.is_none() {
                             // gemma: v gets a weightless per-head rms norm
@@ -3651,12 +4654,34 @@ mod real {
                             // inkling has no rope: position rides the
                             // relative bias below (log-N tau is identity
                             // below 128k ctx, so it is skipped here)
-                            kernels::gqa_rope(&mut st.q, n_tok, s.n_head, hd, rot, pos0, theta, factors)?;
-                            kernels::gqa_rope(&mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors)?;
+                            kernels::gqa_rope(
+                                &mut st.q, n_tok, s.n_head, hd, rot, pos0, theta, factors,
+                            )?;
+                            kernels::gqa_rope(
+                                &mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors,
+                            )?;
                         }
                         let kvq = st.kv_fp8 as u32;
-                        kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
-                        kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
+                        kernels::gqa_kv_append(
+                            &mut st.kcache[il],
+                            &st.k,
+                            n_tok,
+                            hkv,
+                            hd,
+                            st.ctx,
+                            pos0,
+                            kvq,
+                        )?;
+                        kernels::gqa_kv_append(
+                            &mut st.vcache[il],
+                            &st.v,
+                            n_tok,
+                            hkv,
+                            hd,
+                            st.ctx,
+                            pos0,
+                            kvq,
+                        )?;
                         // gemma scores at scale 1.0 (q is per-head normed);
                         // inkling at muP 1/head_dim
                         let scale = if l.ink.is_some() {
@@ -3669,24 +4694,74 @@ mod real {
                         let rel_ext = if let Some(ink) = &l.ink {
                             // rel-pos bias: rel_proj^T . (x . wr), per
                             // (token, head) a rel_extent-long bias row
-                            kernels::matmul_q8_0(&mut st.r_buf, &ink.wr, xin, s.n_embd, s.n_head * s.d_rel, n_tok)?;
-                            kernels::matmul_f32(&mut st.rel_buf, &ink.rel_proj, &st.r_buf, s.d_rel, ink.rel_extent, n_tok * s.n_head)?;
+                            kernels::matmul_q8_0(
+                                &mut st.r_buf,
+                                &ink.wr,
+                                xin,
+                                s.n_embd,
+                                s.n_head * s.d_rel,
+                                n_tok,
+                            )?;
+                            kernels::matmul_f32(
+                                &mut st.rel_buf,
+                                &ink.rel_proj,
+                                &st.r_buf,
+                                s.d_rel,
+                                ink.rel_extent,
+                                n_tok * s.n_head,
+                            )?;
                             ink.rel_extent
                         } else {
                             0
                         };
                         let rel = l.ink.as_ref().map(|_| &st.rel_buf);
-                        kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
+                        kernels::gqa_attention_rel(
+                            &mut st.heads,
+                            &st.q,
+                            &st.kcache[il],
+                            &st.vcache[il],
+                            n_tok,
+                            s.n_head,
+                            hkv,
+                            hd,
+                            st.ctx,
+                            pos0,
+                            scale,
+                            window,
+                            rel,
+                            rel_ext,
+                            kvq,
+                        )?;
 
                         // output projection on the attn card, hop back,
                         // restore the primary (mirrors the Mla path)
                         if self.attn_dev.is_some() {
-                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, s.n_head * hd, s.n_embd, n_tok)?;
-                            kernels::copy_across(&mut st.attn_out, &st.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::matmul_q8_0(
+                                &mut st.attn_out_a,
+                                attn_output_w,
+                                &st.heads,
+                                s.n_head * hd,
+                                s.n_embd,
+                                n_tok,
+                            )?;
+                            kernels::copy_across(
+                                &mut st.attn_out,
+                                &st.attn_out_a,
+                                (n_tok * s.n_embd) as usize * 4,
+                            )?;
                             kernels::set_device(primary)?;
                         }
                     }
-                    Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b, indexer } => {
+                    Attn::Mla {
+                        q_a,
+                        q_a_norm,
+                        q_b,
+                        kv_a_mqa,
+                        kv_a_norm,
+                        k_b,
+                        v_b,
+                        indexer,
+                    } => {
                         // ds4's GLM compact-KV decode path: q through the
                         // lora bottleneck, latent kv cached once for all
                         // heads, attention over all visible rows. Each
@@ -3697,11 +4772,26 @@ mod real {
                             .as_ref()
                             .map(|sg| &sg[il % 2])
                             .filter(|sg| sg.ready_for(il));
-                        let q_a_w = match stage { Some(sg) if q_a.is_pinned() => &sg.q_a, _ => q_a };
-                        let q_b_w = match stage { Some(sg) if q_b.is_pinned() => &sg.q_b, _ => q_b };
-                        let kv_a_w = match stage { Some(sg) if kv_a_mqa.is_pinned() => &sg.kv_a, _ => kv_a_mqa };
-                        let k_b_w = match stage { Some(sg) if k_b.is_pinned() => &sg.k_b, _ => k_b };
-                        let v_b_w = match stage { Some(sg) if v_b.is_pinned() => &sg.v_b, _ => v_b };
+                        let q_a_w = match stage {
+                            Some(sg) if q_a.is_pinned() => &sg.q_a,
+                            _ => q_a,
+                        };
+                        let q_b_w = match stage {
+                            Some(sg) if q_b.is_pinned() => &sg.q_b,
+                            _ => q_b,
+                        };
+                        let kv_a_w = match stage {
+                            Some(sg) if kv_a_mqa.is_pinned() => &sg.kv_a,
+                            _ => kv_a_mqa,
+                        };
+                        let k_b_w = match stage {
+                            Some(sg) if k_b.is_pinned() => &sg.k_b,
+                            _ => k_b,
+                        };
+                        let v_b_w = match stage {
+                            Some(sg) if v_b.is_pinned() => &sg.v_b,
+                            _ => v_b,
+                        };
                         if let Some(sg) = stage {
                             if l.attn_output.is_pinned() {
                                 attn_output_w = &sg.attn_output;
@@ -3713,20 +4803,83 @@ mod real {
                         // legacy-stream ordered on the issuing device, so
                         // producer kernels have landed before they run.
                         if let Some(d) = self.attn_dev {
-                            kernels::copy_across(&mut st.normed_a, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::copy_across(
+                                &mut st.normed_a,
+                                &st.normed,
+                                (n_tok * s.n_embd) as usize * 4,
+                            )?;
                             kernels::set_device(d)?;
                         }
-                        let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
+                        let xin = if self.attn_dev.is_some() {
+                            &st.normed_a
+                        } else {
+                            &st.normed
+                        };
 
                         let rope = s.rope_cfg();
                         let kv_raw_dim = s.n_kv_lora + s.qk_rope;
-                        kernels::matmul_q8_0(&mut st.q_rank, q_a_w, xin, s.n_embd, s.n_lora_q, n_tok)?;
-                        kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, q_a_norm, s.n_lora_q, n_tok, eps)?;
-                        kernels::matmul_q8_0(&mut st.q, q_b_w, &st.q_rank_norm, s.n_lora_q, s.n_head * s.qk_dim(), n_tok)?;
-                        kernels::mla_rope_tail(&mut st.q, n_tok, s.n_head, s.qk_dim(), s.qk_rope, pos0, &rope)?;
-                        kernels::matmul_q8_0(&mut st.kv_raw, kv_a_w, xin, s.n_embd, kv_raw_dim, n_tok)?;
-                        kernels::mla_kv_lora_rms_norm(&mut st.kv_norm, &st.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
-                        kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope)?;
+                        kernels::matmul_q8_0(
+                            &mut st.q_rank,
+                            q_a_w,
+                            xin,
+                            s.n_embd,
+                            s.n_lora_q,
+                            n_tok,
+                        )?;
+                        kernels::rms_norm(
+                            &mut st.q_rank_norm,
+                            &st.q_rank,
+                            q_a_norm,
+                            s.n_lora_q,
+                            n_tok,
+                            eps,
+                        )?;
+                        kernels::matmul_q8_0(
+                            &mut st.q,
+                            q_b_w,
+                            &st.q_rank_norm,
+                            s.n_lora_q,
+                            s.n_head * s.qk_dim(),
+                            n_tok,
+                        )?;
+                        kernels::mla_rope_tail(
+                            &mut st.q,
+                            n_tok,
+                            s.n_head,
+                            s.qk_dim(),
+                            s.qk_rope,
+                            pos0,
+                            &rope,
+                        )?;
+                        kernels::matmul_q8_0(
+                            &mut st.kv_raw,
+                            kv_a_w,
+                            xin,
+                            s.n_embd,
+                            kv_raw_dim,
+                            n_tok,
+                        )?;
+                        kernels::mla_kv_lora_rms_norm(
+                            &mut st.kv_norm,
+                            &st.kv_raw,
+                            kv_a_norm,
+                            n_tok,
+                            kv_raw_dim,
+                            s.n_kv_lora,
+                            eps,
+                        )?;
+                        kernels::mla_store_compact_kv(
+                            &mut st.kcache[il],
+                            &mut st.vcache[il],
+                            &st.kv_norm,
+                            &st.kv_raw,
+                            pos0,
+                            n_tok,
+                            st.ctx,
+                            kv_raw_dim,
+                            s.n_kv_lora,
+                            s.qk_rope,
+                        )?;
                         // DSA selection: within top_k every token sees the
                         // full range (bit-identical to the pre-indexer
                         // path). Beyond it, indexer layers score + top-k
@@ -3738,96 +4891,313 @@ mod real {
                         if let (Some(idx), true) = (indexer, is_idx_layer) {
                             // maintain this layer's indexer K cache (xin =
                             // the attn-device copy of normed under offload)
-                            kernels::matmul_q8_0(&mut st.idx_kraw, &idx.k, xin, s.n_embd, s.n_idx_dim, n_tok)?;
-                            kernels::idx_store_k(&st.idx_kraw, &idx.k_norm, &idx.k_norm_b, &mut st.idx_kcache[il], pos0, n_tok, st.ctx, s.n_idx_dim, s.qk_rope, s.rms_eps, &s.rope_cfg(), 0.0, 1.0)?;
+                            kernels::matmul_q8_0(
+                                &mut st.idx_kraw,
+                                &idx.k,
+                                xin,
+                                s.n_embd,
+                                s.n_idx_dim,
+                                n_tok,
+                            )?;
+                            kernels::idx_store_k(
+                                &st.idx_kraw,
+                                &idx.k_norm,
+                                &idx.k_norm_b,
+                                &mut st.idx_kcache[il],
+                                pos0,
+                                n_tok,
+                                st.ctx,
+                                s.n_idx_dim,
+                                s.qk_rope,
+                                s.rms_eps,
+                                &s.rope_cfg(),
+                                0.0,
+                                1.0,
+                            )?;
                         }
                         let n_sel = if topk == 0 || visible <= topk {
-                            kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, visible, st.ctx)?;
+                            kernels::mla_fill_selected_range(
+                                &mut st.mla_selected,
+                                n_tok,
+                                pos0,
+                                visible,
+                                st.ctx,
+                            )?;
                             st.idx_last_sel = visible;
                             visible
                         } else if is_idx_layer && indexer.is_some() {
                             let idx = indexer.as_ref().unwrap();
-                            kernels::matmul_q8_0(&mut st.idx_q, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, n_tok)?;
-                            kernels::idx_rope0(&mut st.idx_q, n_tok, s.n_idx_head, s.n_idx_dim, s.qk_rope, pos0, &s.rope_cfg(), 0.0, 1.0)?;
+                            kernels::matmul_q8_0(
+                                &mut st.idx_q,
+                                &idx.q_b,
+                                &st.q_rank_norm,
+                                s.n_lora_q,
+                                s.n_idx_head * s.n_idx_dim,
+                                n_tok,
+                            )?;
+                            kernels::idx_rope0(
+                                &mut st.idx_q,
+                                n_tok,
+                                s.n_idx_head,
+                                s.n_idx_dim,
+                                s.qk_rope,
+                                pos0,
+                                &s.rope_cfg(),
+                                0.0,
+                                1.0,
+                            )?;
                             // ds4 feeds proj the pre-norm residual (cur).
                             // Under attn offload cur is on the primary;
                             // borrow attn_out_a as the hop buffer - it is
                             // not written until the output projection.
                             if self.attn_dev.is_some() {
-                                kernels::copy_across(&mut st.attn_out_a, &st.cur, (n_tok * s.n_embd) as usize * 4)?;
-                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.attn_out_a, s.n_embd, s.n_idx_head, n_tok)?;
+                                kernels::copy_across(
+                                    &mut st.attn_out_a,
+                                    &st.cur,
+                                    (n_tok * s.n_embd) as usize * 4,
+                                )?;
+                                kernels::matmul_f32(
+                                    &mut st.idx_w,
+                                    &idx.proj,
+                                    &st.attn_out_a,
+                                    s.n_embd,
+                                    s.n_idx_head,
+                                    n_tok,
+                                )?;
                             } else {
-                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.cur, s.n_embd, s.n_idx_head, n_tok)?;
+                                kernels::matmul_f32(
+                                    &mut st.idx_w,
+                                    &idx.proj,
+                                    &st.cur,
+                                    s.n_embd,
+                                    s.n_idx_head,
+                                    n_tok,
+                                )?;
                             }
                             let scale = 1.0 / ((s.n_idx_dim * s.n_idx_head) as f32).sqrt();
                             if n_tok == 1 {
-                                kernels::idx_score_one(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale)?;
-                                kernels::idx_topk(&mut st.mla_selected, &st.idx_scores, visible, topk)?;
+                                kernels::idx_score_one(
+                                    &mut st.idx_scores,
+                                    &st.idx_q,
+                                    &st.idx_w,
+                                    &st.idx_kcache[il],
+                                    visible,
+                                    s.n_idx_head,
+                                    s.n_idx_dim,
+                                    scale,
+                                )?;
+                                kernels::idx_topk(
+                                    &mut st.mla_selected,
+                                    &st.idx_scores,
+                                    visible,
+                                    topk,
+                                )?;
                             } else {
                                 // batch: every token in a post-boundary
                                 // chunk has >= top_k visible rows (the
                                 // forward_rows split guarantees it)
-                                kernels::idx_scores_batch(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], Some(&mut st.idx_q16), visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale)?;
-                                kernels::idx_topk_batch(&mut st.mla_selected, &st.idx_scores, visible, n_tok, topk)?;
+                                kernels::idx_scores_batch(
+                                    &mut st.idx_scores,
+                                    &st.idx_q,
+                                    &st.idx_w,
+                                    &st.idx_kcache[il],
+                                    Some(&mut st.idx_q16),
+                                    visible,
+                                    n_tok,
+                                    pos0,
+                                    s.n_idx_head,
+                                    s.n_idx_dim,
+                                    scale,
+                                )?;
+                                kernels::idx_topk_batch(
+                                    &mut st.mla_selected,
+                                    &st.idx_scores,
+                                    visible,
+                                    n_tok,
+                                    topk,
+                                )?;
                             }
                             st.idx_last_sel = topk;
                             topk
                         } else {
                             // between indexer layers: reuse the last list
                             if st.idx_last_sel == 0 {
-                                return Err("indexer selection missing (no indexer weights in gguf?)".into());
+                                return Err(
+                                    "indexer selection missing (no indexer weights in gguf?)"
+                                        .into(),
+                                );
                             }
                             st.idx_last_sel
                         };
-                        kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b_w, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
-                        kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
+                        kernels::mla_qk_lowrank(
+                            &mut st.qk_low,
+                            &st.q,
+                            k_b_w,
+                            n_tok,
+                            s.n_head,
+                            s.n_kv_lora,
+                            s.qk_nope,
+                            s.qk_dim(),
+                        )?;
+                        kernels::mla_attention(
+                            &mut st.heads,
+                            &st.q,
+                            &st.qk_low,
+                            &st.kcache[il],
+                            &st.vcache[il],
+                            v_b_w,
+                            &st.mla_selected,
+                            n_tok,
+                            n_sel,
+                            st.ctx,
+                            s.n_head,
+                            s.n_kv_lora,
+                            s.qk_nope,
+                            s.qk_rope,
+                            s.value_mla,
+                            &rope,
+                        )?;
 
                         // output projection on the attn GPU, hop back,
                         // restore the primary for the ffn/expert half
                         if self.attn_dev.is_some() {
-                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
-                            kernels::copy_across(&mut st.attn_out, &st.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::matmul_q8_0(
+                                &mut st.attn_out_a,
+                                attn_output_w,
+                                &st.heads,
+                                s.heads_dim(),
+                                s.n_embd,
+                                n_tok,
+                            )?;
+                            kernels::copy_across(
+                                &mut st.attn_out,
+                                &st.attn_out_a,
+                                (n_tok * s.n_embd) as usize * 4,
+                            )?;
                             kernels::set_device(primary)?;
                         }
                     }
                 }
                 if self.attn_dev.is_none() {
-                    kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, heads_dim, s.n_embd, n_tok)?;
+                    kernels::matmul_q8_0(
+                        &mut st.attn_out,
+                        attn_output_w,
+                        &st.heads,
+                        heads_dim,
+                        s.n_embd,
+                        n_tok,
+                    )?;
                 }
                 if let Some(gw) = &l.gemma {
                     // gemma post-attention norm sits INSIDE the residual
-                    kernels::rms_norm_inplace(&mut st.attn_out, &gw.attn_post_norm, s.n_embd, n_tok, eps)?;
+                    kernels::rms_norm_inplace(
+                        &mut st.attn_out,
+                        &gw.attn_post_norm,
+                        s.n_embd,
+                        n_tok,
+                        eps,
+                    )?;
                 }
                 if let Some(ink) = &l.ink {
                     // inkling: the attention output stream gets its own
                     // shortconv before rejoining the residual
-                    kernels::sconv(&mut st.sconv_tmp, &st.attn_out, &ink.sconv_attn, &mut st.sconv_state[il][2], n_tok, s.n_embd, s.sconv_k)?;
-                    kernels::copy_across(&mut st.attn_out, &st.sconv_tmp, (n_tok * s.n_embd) as usize * 4)?;
+                    kernels::sconv(
+                        &mut st.sconv_tmp,
+                        &st.attn_out,
+                        &ink.sconv_attn,
+                        &mut st.sconv_state[il][2],
+                        n_tok,
+                        s.n_embd,
+                        s.sconv_k,
+                    )?;
+                    kernels::copy_across(
+                        &mut st.attn_out,
+                        &st.sconv_tmp,
+                        (n_tok * s.n_embd) as usize * 4,
+                    )?;
                 }
                 kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_tok * s.n_embd)?;
 
                 // ffn
-                kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, n_tok, eps)?;
+                kernels::rms_norm(
+                    &mut st.normed,
+                    &st.after_attn,
+                    &l.ffn_norm,
+                    s.n_embd,
+                    n_tok,
+                    eps,
+                )?;
                 match &l.ffn {
                     Ffn::Dense { gate, up, down } => {
-                        kernels::matmul_q8_0(&mut st.gate_act, gate, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;
-                        kernels::matmul_q8_0(&mut st.up_act, up, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;
+                        kernels::matmul_q8_0(
+                            &mut st.gate_act,
+                            gate,
+                            &st.normed,
+                            s.n_embd,
+                            s.n_ff_dense,
+                            n_tok,
+                        )?;
+                        kernels::matmul_q8_0(
+                            &mut st.up_act,
+                            up,
+                            &st.normed,
+                            s.n_embd,
+                            s.n_ff_dense,
+                            n_tok,
+                        )?;
                         // leading-dense layers share the arch's gated-FFN op
                         // (M3: swiglu_oai on dense AND experts AND shexp)
-                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_dense, 0.0, 1.0, s.moe_act_op)?;
-                        kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_dense, s.n_embd, n_tok)?;
+                        kernels::swiglu(
+                            &mut st.ffn_mid,
+                            &st.gate_act,
+                            &st.up_act,
+                            n_tok * s.n_ff_dense,
+                            0.0,
+                            1.0,
+                            s.moe_act_op,
+                        )?;
+                        kernels::matmul_q8_0(
+                            &mut st.ffn_out,
+                            down,
+                            &st.ffn_mid,
+                            s.n_ff_dense,
+                            s.n_embd,
+                            n_tok,
+                        )?;
                         if let Some(ink) = &l.ink {
                             // inkling: dense output rides gscale + its own
                             // shortconv stream before the residual
                             if ink.gscale != 1.0 {
                                 kernels::scale(&mut st.ffn_out, n_tok * s.n_embd, ink.gscale)?;
                             }
-                            kernels::sconv(&mut st.sconv_tmp, &st.ffn_out, &ink.sconv_mlp, &mut st.sconv_state[il][3], n_tok, s.n_embd, s.sconv_k)?;
-                            kernels::copy_across(&mut st.ffn_out, &st.sconv_tmp, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::sconv(
+                                &mut st.sconv_tmp,
+                                &st.ffn_out,
+                                &ink.sconv_mlp,
+                                &mut st.sconv_state[il][3],
+                                n_tok,
+                                s.n_embd,
+                                s.sconv_k,
+                            )?;
+                            kernels::copy_across(
+                                &mut st.ffn_out,
+                                &st.sconv_tmp,
+                                (n_tok * s.n_embd) as usize * 4,
+                            )?;
                         }
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
-                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink } => {
+                    Ffn::Moe {
+                        gate_inp,
+                        probs_b,
+                        shexp,
+                        gate_exps,
+                        up_exps,
+                        down_exps,
+                        fused_up_off,
+                        down_scale,
+                        sink,
+                    } => {
                         let gw = l.gemma.as_ref();
                         // inkling: shared experts ride the router as
                         // always-on slots; per-layer gscale folds into the
@@ -3835,18 +5205,39 @@ mod real {
                         // in the weights)
                         let sink_n = if sink.is_some() { s.n_shexp_sink } else { 0 };
                         let route_k = s.n_expert_used - sink_n;
-                        let route_scale = s.expert_weight_scale
-                            * l.ink.as_ref().map_or(1.0, |i| i.gscale);
+                        let route_scale =
+                            s.expert_weight_scale * l.ink.as_ref().map_or(1.0, |i| i.gscale);
                         if let Some(gw) = gw {
                             // gemma routes on rms(attn_out) * gate_inp_s /
                             // sqrt(n_embd) - one weighted rms_norm; attn_out
                             // is dead here, reuse it as the scratch row
-                            kernels::rms_norm(&mut st.attn_out, &st.after_attn, &gw.router_norm, s.n_embd, n_tok, eps)?;
-                            kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.attn_out, s.n_embd, s.n_expert, n_tok)?;
+                            kernels::rms_norm(
+                                &mut st.attn_out,
+                                &st.after_attn,
+                                &gw.router_norm,
+                                s.n_embd,
+                                n_tok,
+                                eps,
+                            )?;
+                            kernels::matmul_f32(
+                                &mut st.router_logits,
+                                gate_inp,
+                                &st.attn_out,
+                                s.n_embd,
+                                s.n_expert,
+                                n_tok,
+                            )?;
                         } else {
                             // inkling's gate matmul emits the sink logits
                             // after the n_expert routed ones
-                            kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert + sink_n, n_tok)?;
+                            kernels::matmul_f32(
+                                &mut st.router_logits,
+                                gate_inp,
+                                &st.normed,
+                                s.n_embd,
+                                s.n_expert + sink_n,
+                                n_tok,
+                            )?;
                         }
                         kernels::router_select(
                             &mut st.router_selected,
@@ -3857,7 +5248,11 @@ mod real {
                             route_k,
                             route_scale,
                             n_tok,
-                            if sink_n > 0 { 2 } else { s.router_softmax as u32 },
+                            if sink_n > 0 {
+                                2
+                            } else {
+                                s.router_softmax as u32
+                            },
                             sink_n,
                         )?;
                         if let Some(ds) = down_scale {
@@ -3876,20 +5271,31 @@ mod real {
                         // MoE layer's router on THIS layer's ffn input and
                         // ship the predicted slabs to the background
                         // fetcher. Rides the sync we need anyway.
-                        let next_moe = if n_tok == 1
-                            && std::env::var_os("PULSAR_NO_PREFETCH").is_none()
-                        {
-                            self.layers.get(il + 1).and_then(|nl| match &nl.ffn {
-                                Ffn::Moe { gate_inp, probs_b, gate_exps, up_exps, down_exps, .. } => {
-                                    Some((gate_inp, probs_b, [gate_exps, up_exps, down_exps]))
-                                }
-                                _ => None,
-                            })
-                        } else {
-                            None
-                        };
+                        let next_moe =
+                            if n_tok == 1 && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
+                                self.layers.get(il + 1).and_then(|nl| match &nl.ffn {
+                                    Ffn::Moe {
+                                        gate_inp,
+                                        probs_b,
+                                        gate_exps,
+                                        up_exps,
+                                        down_exps,
+                                        ..
+                                    } => Some((gate_inp, probs_b, [gate_exps, up_exps, down_exps])),
+                                    _ => None,
+                                })
+                            } else {
+                                None
+                            };
                         if let Some((n_gate_inp, n_probs_b, _)) = &next_moe {
-                            kernels::matmul_f32(&mut st.pred_logits, n_gate_inp, &st.normed, s.n_embd, s.n_expert + sink_n, 1)?;
+                            kernels::matmul_f32(
+                                &mut st.pred_logits,
+                                n_gate_inp,
+                                &st.normed,
+                                s.n_embd,
+                                s.n_expert + sink_n,
+                                1,
+                            )?;
                             kernels::router_select(
                                 &mut st.pred_selected,
                                 &mut st.pred_weights,
@@ -3899,7 +5305,11 @@ mod real {
                                 route_k,
                                 route_scale,
                                 1,
-                                if sink_n > 0 { 2 } else { s.router_softmax as u32 },
+                                if sink_n > 0 {
+                                    2
+                                } else {
+                                    s.router_softmax as u32
+                                },
                                 sink_n,
                             )?;
                         }
@@ -3910,13 +5320,52 @@ mod real {
                         // is the full-width dense MLP (n_ff_dense, GELU)
                         // with its own post-norm.
                         if let Some((sg, su, sd)) = shexp {
-                            let w = if gw.is_some() { s.n_ff_dense } else { s.n_ff_exp };
-                            kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, w, n_tok)?;
-                            kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, w, n_tok)?;
-                            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * w, 0.0, 1.0, s.moe_act_op)?;
-                            kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, w, s.n_embd, n_tok)?;
+                            let w = if gw.is_some() {
+                                s.n_ff_dense
+                            } else {
+                                s.n_ff_exp
+                            };
+                            kernels::matmul_q8_0(
+                                &mut st.gate_act,
+                                sg,
+                                &st.normed,
+                                s.n_embd,
+                                w,
+                                n_tok,
+                            )?;
+                            kernels::matmul_q8_0(
+                                &mut st.up_act,
+                                su,
+                                &st.normed,
+                                s.n_embd,
+                                w,
+                                n_tok,
+                            )?;
+                            kernels::swiglu(
+                                &mut st.ffn_mid,
+                                &st.gate_act,
+                                &st.up_act,
+                                n_tok * w,
+                                0.0,
+                                1.0,
+                                s.moe_act_op,
+                            )?;
+                            kernels::matmul_q8_0(
+                                &mut st.shared_out,
+                                sd,
+                                &st.ffn_mid,
+                                w,
+                                s.n_embd,
+                                n_tok,
+                            )?;
                             if let Some(gw) = gw {
-                                kernels::rms_norm_inplace(&mut st.shared_out, &gw.post_ffw_norm_1, s.n_embd, n_tok, eps)?;
+                                kernels::rms_norm_inplace(
+                                    &mut st.shared_out,
+                                    &gw.post_ffw_norm_1,
+                                    s.n_embd,
+                                    n_tok,
+                                    eps,
+                                )?;
                             }
                         } else {
                             kernels::zero(&mut st.shared_out, (n_tok * s.n_embd) as usize * 4)?;
@@ -3924,7 +5373,14 @@ mod real {
                         if let Some(gw) = gw {
                             // routed branch reads its own pre-norm of the
                             // residual, not the MLP norm
-                            kernels::rms_norm(&mut st.normed, &st.after_attn, &gw.pre_ffw_norm_2, s.n_embd, n_tok, eps)?;
+                            kernels::rms_norm(
+                                &mut st.normed,
+                                &st.after_attn,
+                                &gw.pre_ffw_norm_2,
+                                s.n_embd,
+                                n_tok,
+                                eps,
+                            )?;
                         }
                         // also quantize the routed-expert activations now;
                         // only the expert weights are still in flight
@@ -3953,7 +5409,10 @@ mod real {
                                         && !st.dev_cache.map.contains_key(&offset)
                                         && !st.tiers.iter().any(|tr| tr.map.contains_key(&offset))
                                     {
-                                        reads.push(stream::Read { offset, len: t.expert_bytes });
+                                        reads.push(stream::Read {
+                                            offset,
+                                            len: t.expert_bytes,
+                                        });
                                     }
                                 }
                             }
@@ -3971,7 +5430,10 @@ mod real {
                         // batch must not ship whole layers to the fetcher
                         if n_tok > 8 && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
                             if let Some(Ffn::Moe {
-                                gate_exps: ng, up_exps: nu, down_exps: nd, ..
+                                gate_exps: ng,
+                                up_exps: nu,
+                                down_exps: nd,
+                                ..
                             }) = self.layers.get(il + 1).map(|nl| &nl.ffn)
                             {
                                 let mut reads = Vec::with_capacity(3 * s.n_expert as usize);
@@ -3980,7 +5442,10 @@ mod real {
                                         let offset = t.abs_offset + e * t.expert_bytes;
                                         if !st.store.contains(offset)
                                             && !st.dev_cache.map.contains_key(&offset)
-                                            && !st.tiers.iter().any(|tr| tr.map.contains_key(&offset))
+                                            && !st
+                                                .tiers
+                                                .iter()
+                                                .any(|tr| tr.map.contains_key(&offset))
                                         {
                                             reads.push(stream::Read {
                                                 offset,
@@ -4013,7 +5478,11 @@ mod real {
                         // the inkling shexp bank
                         let slabs_of = |e: u32| -> [(&ExpertTensor, u64); 3] {
                             if e < s.n_expert {
-                                [(gate_exps, e as u64), (up_exps, e as u64), (down_exps, e as u64)]
+                                [
+                                    (gate_exps, e as u64),
+                                    (up_exps, e as u64),
+                                    (down_exps, e as u64),
+                                ]
                             } else {
                                 let sk = sink.as_ref().unwrap();
                                 let le = (e - s.n_expert) as u64;
@@ -4033,20 +5502,27 @@ mod real {
                             // resident MTP experts beat a tier copy (same
                             // device as the compute, no partial gather)
                             if !is_sink
-                                && self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&g))
+                                && self
+                                    .mtp
+                                    .as_ref()
+                                    .is_some_and(|mt| mt.res_map.contains_key(&g))
                             {
                                 return None;
                             }
                             st.tiers.iter().enumerate().find_map(|(ti, t)| {
                                 let gate = *t.map.get(&g)?;
-                                Some((ti, ExpertPtrs {
-                                    gate,
-                                    up: byte_off(
-                                        *t.map.get(&off_of(u3.0, u3.1))?,
-                                        if is_sink { 0 } else { *fused_up_off },
-                                    ),
-                                    down: *t.map.get(&off_of(d3.0, d3.1))?,
-                                }, is_sink))
+                                Some((
+                                    ti,
+                                    ExpertPtrs {
+                                        gate,
+                                        up: byte_off(
+                                            *t.map.get(&off_of(u3.0, u3.1))?,
+                                            if is_sink { 0 } else { *fused_up_off },
+                                        ),
+                                        down: *t.map.get(&off_of(d3.0, d3.1))?,
+                                    },
+                                    is_sink,
+                                ))
                             })
                         };
                         // CPU expert lane (PULSAR_CPU=1): iq2_xxs experts
@@ -4122,7 +5598,12 @@ mod real {
                                 ) else {
                                     continue;
                                 };
-                                lane.add(e, gp.0, unsafe { upp.0.add(*fused_up_off as usize) }, dp.0);
+                                lane.add(
+                                    e,
+                                    gp.0,
+                                    unsafe { upp.0.add(*fused_up_off as usize) },
+                                    dp.0,
+                                );
                                 pins.extend([go, uo, dno]);
                             }
                             st.store.pinned = pins;
@@ -4133,18 +5614,28 @@ mod real {
                             let pool = st.cpu_pool.as_ref().unwrap();
                             cpu_guard = Some(cpu_tier::WaitGuard {
                                 pool,
-                                n: lane.submit_a(pool, &selected, n_used, &normed_h, &rw, n_tok as usize),
+                                n: lane.submit_a(
+                                    pool,
+                                    &selected,
+                                    n_used,
+                                    &normed_h,
+                                    &rw,
+                                    n_tok as usize,
+                                ),
                             });
                         }
-                        let mut offsets =
-                            Vec::with_capacity(3 * distinct.len());
+                        let mut offsets = Vec::with_capacity(3 * distinct.len());
                         for &e in &distinct {
                             if tier_of(e).is_some() {
                                 // keep the census warm for resident slabs
                                 // or their heat freezes at placement time
                                 for (t, le) in slabs_of(e as u32) {
                                     let off = off_of(t, le);
-                                    st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
+                                    st.dev_cache
+                                        .touch
+                                        .entry(off)
+                                        .or_insert((0, t.expert_bytes))
+                                        .0 += 1;
                                 }
                                 continue;
                             }
@@ -4162,7 +5653,8 @@ mod real {
                                 };
                                 // fused gate_up: gate and up share a slab -
                                 // one read serves both
-                                if offsets.last().map(|l: &stream::Read| l.offset) != Some(r.offset) {
+                                if offsets.last().map(|l: &stream::Read| l.offset) != Some(r.offset)
+                                {
                                     offsets.push(r);
                                 }
                             }
@@ -4235,9 +5727,12 @@ mod real {
                         // bank shares quant AND row width; otherwise they
                         // run as a second NULL-masked launch below
                         let sink_same = sink.as_ref().is_none_or(|sk| {
-                            sk[0].quant == gate_exps.quant && sk[0].row_bytes == gate_exps.row_bytes
-                                && sk[1].quant == up_exps.quant && sk[1].row_bytes == up_exps.row_bytes
-                                && sk[2].quant == down_exps.quant && sk[2].row_bytes == down_exps.row_bytes
+                            sk[0].quant == gate_exps.quant
+                                && sk[0].row_bytes == gate_exps.row_bytes
+                                && sk[1].quant == up_exps.quant
+                                && sk[1].row_bytes == up_exps.row_bytes
+                                && sk[2].quant == down_exps.quant
+                                && sk[2].row_bytes == down_exps.row_bytes
                         });
                         let mut ptrs = Vec::with_capacity(selected.len());
                         let mut sink_ptrs: Vec<ExpertPtrs> = if sink_same {
@@ -4255,7 +5750,10 @@ mod real {
                         let mut tptrs_sink: Vec<Vec<ExpertPtrs>> = if sink_same {
                             Vec::new()
                         } else {
-                            st.tiers.iter().map(|_| vec![ExpertPtrs::NULL; selected.len()]).collect()
+                            st.tiers
+                                .iter()
+                                .map(|_| vec![ExpertPtrs::NULL; selected.len()])
+                                .collect()
                         };
                         let mut tier_slots = vec![0u64; st.tiers.len()];
                         let mut tier_slots_sink = vec![0u64; st.tiers.len()];
@@ -4286,7 +5784,11 @@ mod real {
                                 // rule as tier_of above)
                                 up: byte_off(
                                     resolved[&off_of(u3.0, u3.1)],
-                                    if e as u32 >= s.n_expert { 0 } else { *fused_up_off },
+                                    if e as u32 >= s.n_expert {
+                                        0
+                                    } else {
+                                        *fused_up_off
+                                    },
                                 ),
                                 down: resolved[&off_of(d3.0, d3.1)],
                             };
@@ -4331,7 +5833,8 @@ mod real {
                             n_group = gptrs.len() as u32;
                             if n_group > 0 {
                                 let mut starts = Vec::with_capacity(n_group as usize + 1);
-                                let mut pairs = Vec::with_capacity(n_tok as usize * s.n_expert_used as usize);
+                                let mut pairs =
+                                    Vec::with_capacity(n_tok as usize * s.n_expert_used as usize);
                                 starts.push(0u32);
                                 for m in &members {
                                     pairs.extend_from_slice(m);
@@ -4340,7 +5843,10 @@ mod real {
                                 st.grp_ptrs.write(0, kernels::as_bytes(&gptrs))?;
                                 st.grp_starts.write(0, kernels::as_bytes(&starts))?;
                                 st.grp_pairs.write(0, kernels::as_bytes(&pairs))?;
-                                let need = n_tok as usize * s.n_expert_used as usize * s.n_embd as usize * 4;
+                                let need = n_tok as usize
+                                    * s.n_expert_used as usize
+                                    * s.n_embd as usize
+                                    * 4;
                                 if st.grp_partial.bytes() < need {
                                     st.grp_partial = DeviceBuf::alloc(need)?;
                                 }
@@ -4359,25 +5865,55 @@ mod real {
                             }
                             let tier = &mut st.tiers[ti];
                             tier.hits += tier_slots[ti] + sink_hits;
-                            kernels::copy_across(&mut tier.xin, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
-                            kernels::copy_across(&mut tier.weights, &st.router_weights, (n_tok * s.n_expert_used) as usize * 4)?;
+                            kernels::copy_across(
+                                &mut tier.xin,
+                                &st.normed,
+                                (n_tok * s.n_embd) as usize * 4,
+                            )?;
+                            kernels::copy_across(
+                                &mut tier.weights,
+                                &st.router_weights,
+                                (n_tok * s.n_expert_used) as usize * 4,
+                            )?;
                             kernels::set_device(tier.dev)?;
                             // both ptr arrays land before any launch so the
                             // whole tier chain runs async under primary work
                             tier.ptrs.write(0, kernels::as_bytes(&tptrs[ti]))?;
                             if sink_hits > 0 {
-                                tier.ptrs_sink.write(0, kernels::as_bytes(&tptrs_sink[ti]))?;
+                                tier.ptrs_sink
+                                    .write(0, kernels::as_bytes(&tptrs_sink[ti]))?;
                             }
                             kernels::quantize_q8_k(&mut tier.xq, &tier.xin, s.n_embd, n_tok)?;
                             if tier_slots[ti] > 0 {
                                 kernels::moe_pair_swiglu(
-                                    &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
-                                    s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, s.moe_act_op,
+                                    &mut tier.mid,
+                                    &tier.ptrs,
+                                    &tier.weights,
+                                    &tier.xq,
+                                    s.n_embd,
+                                    s.n_ff_exp,
+                                    s.n_expert_used,
+                                    n_tok,
+                                    gate_exps.row_bytes,
+                                    gate_exps.quant,
+                                    s.moe_act_op,
                                 )?;
-                                kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                                kernels::quantize_q8_k(
+                                    &mut tier.midq,
+                                    &tier.mid,
+                                    s.n_ff_exp,
+                                    n_tok * s.n_expert_used,
+                                )?;
                                 kernels::moe_down(
-                                    &mut tier.out, &tier.ptrs, &tier.midq,
-                                    s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                                    &mut tier.out,
+                                    &tier.ptrs,
+                                    &tier.midq,
+                                    s.n_ff_exp,
+                                    s.n_embd,
+                                    s.n_expert_used,
+                                    n_tok,
+                                    down_exps.row_bytes,
+                                    down_exps.quant,
                                 )?;
                             }
                             if sink_hits > 0 {
@@ -4385,13 +5921,34 @@ mod real {
                                 // ordered after the routed pass consumed it
                                 let sk = sink.as_ref().unwrap();
                                 kernels::moe_pair_swiglu(
-                                    &mut tier.mid, &tier.ptrs_sink, &tier.weights, &tier.xq,
-                                    s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, sk[0].row_bytes, sk[0].quant, s.moe_act_op,
+                                    &mut tier.mid,
+                                    &tier.ptrs_sink,
+                                    &tier.weights,
+                                    &tier.xq,
+                                    s.n_embd,
+                                    s.n_ff_exp,
+                                    s.n_expert_used,
+                                    n_tok,
+                                    sk[0].row_bytes,
+                                    sk[0].quant,
+                                    s.moe_act_op,
                                 )?;
-                                kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                                kernels::quantize_q8_k(
+                                    &mut tier.midq,
+                                    &tier.mid,
+                                    s.n_ff_exp,
+                                    n_tok * s.n_expert_used,
+                                )?;
                                 kernels::moe_down(
-                                    &mut tier.out_sink, &tier.ptrs_sink, &tier.midq,
-                                    s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, sk[2].row_bytes, sk[2].quant,
+                                    &mut tier.out_sink,
+                                    &tier.ptrs_sink,
+                                    &tier.midq,
+                                    s.n_ff_exp,
+                                    s.n_embd,
+                                    s.n_expert_used,
+                                    n_tok,
+                                    sk[2].row_bytes,
+                                    sk[2].quant,
                                 )?;
                             }
                             kernels::set_device(primary)?;
@@ -4402,27 +5959,79 @@ mod real {
                         // integer dp4a dots (ds4's exact math)
                         if grouped && n_group > 0 {
                             kernels::moe_pair_swiglu_grouped(
-                                &mut st.moe_mid, &st.grp_ptrs, &st.grp_starts, &st.grp_pairs,
-                                &st.router_weights, &st.xq,
-                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_group, gate_exps.row_bytes, gate_exps.quant, s.moe_act_op,
+                                &mut st.moe_mid,
+                                &st.grp_ptrs,
+                                &st.grp_starts,
+                                &st.grp_pairs,
+                                &st.router_weights,
+                                &st.xq,
+                                s.n_embd,
+                                s.n_ff_exp,
+                                s.n_expert_used,
+                                n_group,
+                                gate_exps.row_bytes,
+                                gate_exps.quant,
+                                s.moe_act_op,
                             )?;
-                            kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
-                            let pbytes = n_tok as usize * s.n_expert_used as usize * s.n_embd as usize * 4;
+                            kernels::quantize_q8_k(
+                                &mut st.midq,
+                                &st.moe_mid,
+                                s.n_ff_exp,
+                                n_tok * s.n_expert_used,
+                            )?;
+                            let pbytes =
+                                n_tok as usize * s.n_expert_used as usize * s.n_embd as usize * 4;
                             kernels::zero(&mut st.grp_partial, pbytes)?;
                             kernels::moe_down_grouped(
-                                &mut st.grp_partial, &st.grp_ptrs, &st.grp_starts, &st.grp_pairs, &st.midq,
-                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_group, down_exps.row_bytes, down_exps.quant,
+                                &mut st.grp_partial,
+                                &st.grp_ptrs,
+                                &st.grp_starts,
+                                &st.grp_pairs,
+                                &st.midq,
+                                s.n_ff_exp,
+                                s.n_embd,
+                                s.n_expert_used,
+                                n_group,
+                                down_exps.row_bytes,
+                                down_exps.quant,
                             )?;
-                            kernels::moe_slot_sum(&mut st.moe_out, &st.grp_partial, s.n_embd, s.n_expert_used, n_tok)?;
+                            kernels::moe_slot_sum(
+                                &mut st.moe_out,
+                                &st.grp_partial,
+                                s.n_embd,
+                                s.n_expert_used,
+                                n_tok,
+                            )?;
                         } else {
                             kernels::moe_pair_swiglu(
-                                &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
-                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, s.moe_act_op,
+                                &mut st.moe_mid,
+                                &st.expert_ptrs,
+                                &st.router_weights,
+                                &st.xq,
+                                s.n_embd,
+                                s.n_ff_exp,
+                                s.n_expert_used,
+                                n_tok,
+                                gate_exps.row_bytes,
+                                gate_exps.quant,
+                                s.moe_act_op,
                             )?;
-                            kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                            kernels::quantize_q8_k(
+                                &mut st.midq,
+                                &st.moe_mid,
+                                s.n_ff_exp,
+                                n_tok * s.n_expert_used,
+                            )?;
                             kernels::moe_down(
-                                &mut st.moe_out, &st.expert_ptrs, &st.midq,
-                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                                &mut st.moe_out,
+                                &st.expert_ptrs,
+                                &st.midq,
+                                s.n_ff_exp,
+                                s.n_embd,
+                                s.n_expert_used,
+                                n_tok,
+                                down_exps.row_bytes,
+                                down_exps.quant,
                             )?;
                         }
 
@@ -4434,13 +6043,34 @@ mod real {
                             let sk = sink.as_ref().unwrap();
                             st.expert_ptrs.write(0, kernels::as_bytes(&sink_ptrs))?;
                             kernels::moe_pair_swiglu(
-                                &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
-                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, sk[0].row_bytes, sk[0].quant, s.moe_act_op,
+                                &mut st.moe_mid,
+                                &st.expert_ptrs,
+                                &st.router_weights,
+                                &st.xq,
+                                s.n_embd,
+                                s.n_ff_exp,
+                                s.n_expert_used,
+                                n_tok,
+                                sk[0].row_bytes,
+                                sk[0].quant,
+                                s.moe_act_op,
                             )?;
-                            kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                            kernels::quantize_q8_k(
+                                &mut st.midq,
+                                &st.moe_mid,
+                                s.n_ff_exp,
+                                n_tok * s.n_expert_used,
+                            )?;
                             kernels::moe_down(
-                                &mut st.ffn_out, &st.expert_ptrs, &st.midq,
-                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, sk[2].row_bytes, sk[2].quant,
+                                &mut st.ffn_out,
+                                &st.expert_ptrs,
+                                &st.midq,
+                                s.n_ff_exp,
+                                s.n_embd,
+                                s.n_expert_used,
+                                n_tok,
+                                sk[2].row_bytes,
+                                sk[2].quant,
                             )?;
                             kernels::add_assign(&mut st.moe_out, &st.ffn_out, n_tok * s.n_embd)?;
                         }
@@ -4454,15 +6084,31 @@ mod real {
                             let tier = &st.tiers[ti];
                             if routed_out {
                                 kernels::set_device(tier.dev)?;
-                                kernels::copy_across(&mut st.tier_ret, &tier.out, (n_tok * s.n_embd) as usize * 4)?;
+                                kernels::copy_across(
+                                    &mut st.tier_ret,
+                                    &tier.out,
+                                    (n_tok * s.n_embd) as usize * 4,
+                                )?;
                                 kernels::set_device(primary)?;
-                                kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+                                kernels::add_assign(
+                                    &mut st.moe_out,
+                                    &st.tier_ret,
+                                    n_tok * s.n_embd,
+                                )?;
                             }
                             if sink_out {
                                 kernels::set_device(tier.dev)?;
-                                kernels::copy_across(&mut st.tier_ret, &tier.out_sink, (n_tok * s.n_embd) as usize * 4)?;
+                                kernels::copy_across(
+                                    &mut st.tier_ret,
+                                    &tier.out_sink,
+                                    (n_tok * s.n_embd) as usize * 4,
+                                )?;
                                 kernels::set_device(primary)?;
-                                kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+                                kernels::add_assign(
+                                    &mut st.moe_out,
+                                    &st.tier_ret,
+                                    n_tok * s.n_embd,
+                                )?;
                             }
                         }
 
@@ -4489,18 +6135,47 @@ mod real {
                         // gemma sandwiches norms around the sum and scales
                         // the whole stream by layer_output_scale.
                         if let Some(gw) = gw {
-                            kernels::rms_norm_inplace(&mut st.moe_out, &gw.post_ffw_norm_2, s.n_embd, n_tok, eps)?;
+                            kernels::rms_norm_inplace(
+                                &mut st.moe_out,
+                                &gw.post_ffw_norm_2,
+                                s.n_embd,
+                                n_tok,
+                                eps,
+                            )?;
                         }
-                        kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, n_tok * s.n_embd)?;
+                        kernels::add(
+                            &mut st.ffn_out,
+                            &st.moe_out,
+                            &st.shared_out,
+                            n_tok * s.n_embd,
+                        )?;
                         if let Some(gw) = gw {
-                            kernels::rms_norm_inplace(&mut st.ffn_out, &gw.post_ffw_norm, s.n_embd, n_tok, eps)?;
+                            kernels::rms_norm_inplace(
+                                &mut st.ffn_out,
+                                &gw.post_ffw_norm,
+                                s.n_embd,
+                                n_tok,
+                                eps,
+                            )?;
                         }
                         if let Some(ink) = &l.ink {
                             // inkling: the whole MoE output (routed + sink,
                             // gscale already in the route weights) gets the
                             // mlp shortconv before the residual
-                            kernels::sconv(&mut st.sconv_tmp, &st.ffn_out, &ink.sconv_mlp, &mut st.sconv_state[il][3], n_tok, s.n_embd, s.sconv_k)?;
-                            kernels::copy_across(&mut st.ffn_out, &st.sconv_tmp, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::sconv(
+                                &mut st.sconv_tmp,
+                                &st.ffn_out,
+                                &ink.sconv_mlp,
+                                &mut st.sconv_state[il][3],
+                                n_tok,
+                                s.n_embd,
+                                s.sconv_k,
+                            )?;
+                            kernels::copy_across(
+                                &mut st.ffn_out,
+                                &st.sconv_tmp,
+                                (n_tok * s.n_embd) as usize * 4,
+                            )?;
                         }
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                         if let Some(gw) = gw {
@@ -4534,18 +6209,58 @@ mod real {
             // hidden inputs: [old mtp_hidden, cur rows 0..n-1]
             kernels::copy_d2d(&mut st.mtp_e_raw, 0, &st.mtp_hidden, 0, row)?;
             if n_tok > 1 {
-                kernels::copy_d2d(&mut st.mtp_e_raw, row, &st.cur, 0, (n_tok as usize - 1) * row)?;
+                kernels::copy_d2d(
+                    &mut st.mtp_e_raw,
+                    row,
+                    &st.cur,
+                    0,
+                    (n_tok as usize - 1) * row,
+                )?;
             }
-            kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.cur, (n_tok as usize - 1) * row, row)?;
-            kernels::rms_norm(&mut st.mtp_h, &st.mtp_e_raw, &mtp.hnorm, s.n_embd, n_tok, s.rms_eps)?;
+            kernels::copy_d2d(
+                &mut st.mtp_hidden,
+                0,
+                &st.cur,
+                (n_tok as usize - 1) * row,
+                row,
+            )?;
+            kernels::rms_norm(
+                &mut st.mtp_h,
+                &st.mtp_e_raw,
+                &mtp.hnorm,
+                s.n_embd,
+                n_tok,
+                s.rms_eps,
+            )?;
             // token embeddings (st.tok still holds the chunk)
-            kernels::embed_q8_0(&mut st.mtp_e_raw, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, n_tok)?;
-            kernels::rms_norm(&mut st.mtp_e, &st.mtp_e_raw, &mtp.enorm, s.n_embd, n_tok, s.rms_eps)?;
+            kernels::embed_q8_0(
+                &mut st.mtp_e_raw,
+                &self.token_embd,
+                &st.tok,
+                s.n_embd,
+                s.n_vocab,
+                n_tok,
+            )?;
+            kernels::rms_norm(
+                &mut st.mtp_e,
+                &st.mtp_e_raw,
+                &mtp.enorm,
+                s.n_embd,
+                n_tok,
+                s.rms_eps,
+            )?;
             for i in 0..n_tok as usize {
                 kernels::copy_d2d(&mut st.mtp_x, i * 2 * row, &st.mtp_e, i * row, row)?;
                 kernels::copy_d2d(&mut st.mtp_x, i * 2 * row + row, &st.mtp_h, i * row, row)?;
             }
-            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?;
+            kernels::matmul_q8_0(
+                &mut st.cur,
+                &mtp.eh_proj,
+                &st.mtp_x,
+                2 * s.n_embd,
+                s.n_embd,
+                n_tok,
+            )?;
             self.eval_layer(st, self.layers.len(), &mtp.layer, n_tok, pos0, primary)
         }
 
@@ -4556,13 +6271,23 @@ mod real {
             self.mtp_body(st, token, pos)?;
             let mtp = self.mtp.as_ref().ok_or("mtp_draft without an MTP layer")?;
             let s = self.shape;
-            kernels::rms_norm(&mut st.normed, &st.cur, &mtp.head_norm, s.n_embd, 1, s.rms_eps)?;
+            kernels::rms_norm(
+                &mut st.normed,
+                &st.cur,
+                &mtp.head_norm,
+                s.n_embd,
+                1,
+                s.rms_eps,
+            )?;
             self.head_logits(st, 1)?;
             kernels::sync()?;
             let logits = st.logits.read_f32(s.n_vocab as usize)?;
             if std::env::var_os("PULSAR_MTP_DEBUG").is_some() {
                 let bad = logits.iter().filter(|v| !v.is_finite()).count();
-                eprintln!("mtp-draft pos={pos}: logits nan={bad}, draft={}", argmax(&logits));
+                eprintln!(
+                    "mtp-draft pos={pos}: logits nan={bad}, draft={}",
+                    argmax(&logits)
+                );
             }
             Ok(argmax(&logits))
         }
@@ -4573,12 +6298,40 @@ mod real {
             let primary = kernels::get_device();
             let row = s.n_embd as usize * 4;
             st.tok.write(0, kernels::as_bytes(&[token as i32]))?;
-            kernels::embed_q8_0(&mut st.mtp_e_raw, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, 1)?;
-            kernels::rms_norm(&mut st.mtp_e, &st.mtp_e_raw, &mtp.enorm, s.n_embd, 1, s.rms_eps)?;
-            kernels::rms_norm(&mut st.mtp_h, &st.mtp_hidden, &mtp.hnorm, s.n_embd, 1, s.rms_eps)?;
+            kernels::embed_q8_0(
+                &mut st.mtp_e_raw,
+                &self.token_embd,
+                &st.tok,
+                s.n_embd,
+                s.n_vocab,
+                1,
+            )?;
+            kernels::rms_norm(
+                &mut st.mtp_e,
+                &st.mtp_e_raw,
+                &mtp.enorm,
+                s.n_embd,
+                1,
+                s.rms_eps,
+            )?;
+            kernels::rms_norm(
+                &mut st.mtp_h,
+                &st.mtp_hidden,
+                &mtp.hnorm,
+                s.n_embd,
+                1,
+                s.rms_eps,
+            )?;
             kernels::copy_d2d(&mut st.mtp_x, 0, &st.mtp_e, 0, row)?;
             kernels::copy_d2d(&mut st.mtp_x, row, &st.mtp_h, 0, row)?;
-            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, 1)?;
+            kernels::matmul_q8_0(
+                &mut st.cur,
+                &mtp.eh_proj,
+                &st.mtp_x,
+                2 * s.n_embd,
+                s.n_embd,
+                1,
+            )?;
             self.eval_layer(st, self.layers.len(), &mtp.layer, 1, pos, primary)
         }
     }
@@ -4792,7 +6545,12 @@ mod real {
 
     impl Sampler {
         pub fn new(temp: f32, top_p: f32, min_p: f32, seed: u64) -> Sampler {
-            Sampler { temp, top_p, min_p, state: seed | 1 }
+            Sampler {
+                temp,
+                top_p,
+                min_p,
+                state: seed | 1,
+            }
         }
 
         pub fn is_greedy(&self) -> bool {
@@ -4813,8 +6571,11 @@ mod real {
             if self.temp <= 0.0 {
                 return argmax(logits);
             }
-            let mut cand: Vec<(u32, f32)> =
-                logits.iter().enumerate().map(|(i, &l)| (i as u32, l)).collect();
+            let mut cand: Vec<(u32, f32)> = logits
+                .iter()
+                .enumerate()
+                .map(|(i, &l)| (i as u32, l))
+                .collect();
             cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
             // softmax with temperature over the sorted candidates
             let maxl = cand[0].1;
@@ -4846,6 +6607,51 @@ mod real {
                 r -= c.1;
             }
             cand[kept - 1].0
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn k3_host_upload_uses_mapped_storage_when_enabled() {
+            let _guard = ENV_LOCK.lock().unwrap();
+            // Exercise the actual DeviceBuf placement, not just env parsing.
+            // CPU-only builders have no CUDA device and skip this integration
+            // check; the real CUDA host verifies is_pinned() directly.
+            if kernels::device_count() <= 0 {
+                return;
+            }
+            let prev = std::env::var("PULSAR_K3_HOST").ok();
+            std::env::set_var("PULSAR_K3_HOST", "1");
+            let buf = upload_k3_host(&[0x5au8; 256]).expect("mapped pinned alloc");
+            assert!(buf.is_pinned(), "PULSAR_K3_HOST=1 must select pinned storage");
+            drop(buf);
+            if let Some(v) = prev {
+                std::env::set_var("PULSAR_K3_HOST", v);
+            } else {
+                std::env::remove_var("PULSAR_K3_HOST");
+            }
+        }
+
+        #[test]
+        fn k3_host_upload_keeps_vram_default() {
+            let _guard = ENV_LOCK.lock().unwrap();
+            if kernels::device_count() <= 0 {
+                return;
+            }
+            let prev = std::env::var("PULSAR_K3_HOST").ok();
+            std::env::remove_var("PULSAR_K3_HOST");
+            let buf = upload_k3_host(&[0xa5u8; 256]).expect("device alloc");
+            assert!(!buf.is_pinned(), "default K3 placement must remain VRAM");
+            drop(buf);
+            if let Some(v) = prev {
+                std::env::set_var("PULSAR_K3_HOST", v);
+            }
         }
     }
 }
