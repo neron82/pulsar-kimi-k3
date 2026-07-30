@@ -1343,6 +1343,9 @@ impl Model {
                 .into());
             }
             store.ensure_with(&wants, |off, payload| {
+                if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+                    resolved_host.insert(off, payload.to_vec());
+                }
                 let base = stage_base[&off];
                 let h2d_t0 = std::time::Instant::now();
                 staging.write(base, payload)?;
@@ -1399,6 +1402,11 @@ impl Model {
                 &selected,
                 &weights,
                 &resolved_gpu,
+                if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+                    Some(&resolved_host)
+                } else {
+                    None
+                },
                 staging,
                 ffn_gate_exps,
                 ffn_up_exps,
@@ -1654,6 +1662,7 @@ impl Model {
         selected: &[i32],
         weights: &[f32],
         resolved: &std::collections::HashMap<u64, *const std::ffi::c_void>,
+        debug_host: Option<&std::collections::HashMap<u64, Vec<u8>>>,
         _slab_staging: &DeviceBuf,
         ffn_gate_exps: &super::ExpertTensor,
         ffn_up_exps: &super::ExpertTensor,
@@ -1725,6 +1734,14 @@ impl Model {
             rt.q8k_scratch = DeviceBuf::alloc(xq_bytes)?;
         }
         kernels::quantize_q8_k(&mut rt.q8k_scratch, &rt.latent, moe_latent, 1)?;
+        let compare = std::env::var_os("PULSAR_K3_COMPARE").is_some();
+        let q8_reference = if compare {
+            let mut qbytes = vec![0u8; xq_bytes];
+            rt.q8k_scratch.read(0, &mut qbytes)?;
+            Some(k3_reconstruct_q8(&qbytes, moe_latent))
+        } else {
+            None
+        };
         if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
             let original = rt.latent.read_f32(moe_latent as usize)?;
             let mut qbytes = vec![0u8; xq_bytes];
@@ -1763,25 +1780,44 @@ impl Model {
         }
 
         let mut moe_acc = vec![0.0f32; moe_latent as usize];
+        let mut debug_cpu_acc = vec![0.0f32; moe_latent as usize];
         for (slot, (&route, &weight)) in ptrs.iter().zip(weights.iter()).enumerate() {
             if route.gate.is_null() || route.up.is_null() || route.down.is_null() {
                 continue;
             }
             ptr_buf.write(0, kernels::as_bytes(std::slice::from_ref(&route)))?;
             one_weight_buf.write(0, kernels::as_bytes(&[1.0f32]))?;
-            kernels::moe_pair_swiglu(
-                &mut rt.expert_mid,
-                &ptr_buf,
-                &one_weight_buf,
-                &rt.q8k_scratch,
-                moe_latent,
-                mid_dim,
-                n_used,
-                n_tok,
-                row_bytes,
-                quant,
-                act_op,
-            )?;
+            if compare && debug_host.is_some() {
+                kernels::moe_pair_swiglu_debug(
+                    &mut rt.expert_mid,
+                    &mut rt.expert_gate,
+                    &mut rt.expert_up,
+                    &ptr_buf,
+                    &one_weight_buf,
+                    &rt.q8k_scratch,
+                    moe_latent,
+                    mid_dim,
+                    n_used,
+                    n_tok,
+                    row_bytes,
+                    quant,
+                    act_op,
+                )?;
+            } else {
+                kernels::moe_pair_swiglu(
+                    &mut rt.expert_mid,
+                    &ptr_buf,
+                    &one_weight_buf,
+                    &rt.q8k_scratch,
+                    moe_latent,
+                    mid_dim,
+                    n_used,
+                    n_tok,
+                    row_bytes,
+                    quant,
+                    act_op,
+                )?;
+            }
             kernels::quantize_q8_k(&mut rt.expert_staging, &rt.expert_mid, mid_dim, 1)?;
             kernels::moe_down(
                 &mut rt.expert_down,
@@ -1795,11 +1831,81 @@ impl Model {
                 ffn_down_exps.quant,
             )?;
             let expert_out = rt.expert_down.read_f32(moe_latent as usize)?;
+            if compare {
+                if let Some(host) = debug_host {
+                    let ei = selected[slot] as u64;
+                    let go = host
+                        .get(&(ffn_gate_exps.abs_offset + ei * ffn_gate_exps.expert_bytes))
+                        .ok_or("missing debug gate")?;
+                    let uo = host
+                        .get(&(ffn_up_exps.abs_offset + ei * ffn_up_exps.expert_bytes))
+                        .ok_or("missing debug up")?;
+                    let dno = host
+                        .get(&(ffn_down_exps.abs_offset + ei * ffn_down_exps.expert_bytes))
+                        .ok_or("missing debug down")?;
+                    let gf = k3_dequant_expert_bytes(
+                        go,
+                        (moe_latent * n_ff_exp) as usize,
+                        ffn_gate_exps.quant,
+                    )?;
+                    let uf = k3_dequant_expert_bytes(
+                        uo,
+                        (moe_latent * n_ff_exp) as usize,
+                        ffn_up_exps.quant,
+                    )?;
+                    let df = k3_dequant_expert_bytes(
+                        dno,
+                        (n_ff_exp * moe_latent) as usize,
+                        ffn_down_exps.quant,
+                    )?;
+                    let xq = q8_reference.as_ref().unwrap();
+                    let mut cg = vec![0.0; n_ff_exp as usize];
+                    let mut cu = vec![0.0; n_ff_exp as usize];
+                    for j in 0..n_ff_exp as usize {
+                        for k in 0..moe_latent as usize {
+                            cg[j] += xq[k] * gf[j * moe_latent as usize + k];
+                            cu[j] += xq[k] * uf[j * moe_latent as usize + k];
+                        }
+                    }
+                    let mut cm = vec![0.0; n_ff_exp as usize];
+                    for j in 0..n_ff_exp as usize {
+                        let g = cg[j];
+                        let u = cu[j];
+                        cm[j] = 4.0 * (g / 4.0).tanh() / (1.0 + (-g).exp())
+                            * (25.0 * (u / 25.0).tanh());
+                    }
+                    let mut cd = vec![0.0; moe_latent as usize];
+                    let mut mid_qbytes = vec![0u8; midq_bytes];
+                    rt.expert_staging.read(0, &mut mid_qbytes)?;
+                    let mid_q = k3_reconstruct_q8(&mid_qbytes, mid_dim);
+                    let mut cd_q8 = vec![0.0; moe_latent as usize];
+                    for k in 0..moe_latent as usize {
+                        for j in 0..n_ff_exp as usize {
+                            cd[k] += cm[j] * df[k * n_ff_exp as usize + j];
+                            cd_q8[k] += mid_q[j] * df[k * n_ff_exp as usize + j];
+                        }
+                    }
+                    let gg = rt.expert_gate.read_f32(mid_dim as usize)?;
+                    let uu = rt.expert_up.read_f32(mid_dim as usize)?;
+                    let mm = rt.expert_mid.read_f32(mid_dim as usize)?;
+                    k3_report_vector("gate CPU-Q8/CUDA", &cg, &gg);
+                    k3_report_vector("up CPU-Q8/CUDA", &cu, &uu);
+                    k3_report_vector("SiTU CPU-Q8/CUDA", &cm, &mm);
+                    k3_report_vector("SiTU CPU-F32/CPU-Q8-down-input", &cm, &mid_q);
+                    k3_report_vector("down CPU-F32/CUDA", &cd, &expert_out);
+                    k3_report_vector("down CPU-Q8-mid/CUDA", &cd_q8, &expert_out);
+                    for (dst, src) in debug_cpu_acc.iter_mut().zip(&cd_q8) {
+                        *dst += weight * src;
+                    }
+                    eprintln!("pulsar: K3 debug layer expert rank={slot} global_id={} dims in={} mid={} out={} gate_quant={} up_quant={} down_quant={} gate_row_bytes={} up_row_bytes={} down_row_bytes={} gate_bytes={} up_bytes={} down_bytes={} weight={:.9}", selected[slot], moe_latent, n_ff_exp, moe_latent, ffn_gate_exps.quant, ffn_up_exps.quant, ffn_down_exps.quant, ffn_gate_exps.row_bytes, ffn_up_exps.row_bytes, ffn_down_exps.row_bytes, go.len(), uo.len(), dno.len(), weight);
+                }
+            }
             for (dst, src) in moe_acc.iter_mut().zip(expert_out) {
                 *dst += weight * src;
             }
             if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
                 eprintln!("pulsar: K3 CUDA expert slot {slot} route weight {weight:.9}");
+                k3_report_vector("accum CPU-Q8/CUDA", &debug_cpu_acc, &moe_acc);
             }
         }
         rt.latent_normed.write(0, kernels::as_bytes(&moe_acc))?;
@@ -2257,6 +2363,52 @@ fn k3_report_q8_input(original: &[f32], encoded: &[u8], n: u32) {
         saturated,
         padded,
     );
+}
+
+fn k3_reconstruct_q8(encoded: &[u8], n: u32) -> Vec<f32> {
+    let blocks = (n as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS);
+    let mut out = Vec::with_capacity(n as usize);
+    for b in 0..blocks {
+        let base = b * kernels::Q8_K_BLOCK_BYTES;
+        let d = f32::from_le_bytes(encoded[base..base + 4].try_into().unwrap());
+        for i in 0..kernels::Q8_K_BLOCK_ELEMS {
+            out.push(d * encoded[base + 4 + i] as i8 as f32);
+        }
+    }
+    out.truncate(n as usize);
+    out
+}
+
+fn k3_report_vector(label: &str, cpu: &[f32], cuda: &[f32]) {
+    let mut max = 0.0f32;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut nc = 0.0f64;
+    let mut ng = 0.0f64;
+    let mut first = None;
+    let mut nan_cpu = 0usize;
+    let mut nan_cuda = 0usize;
+    for (i, (&c, &g)) in cpu.iter().zip(cuda).enumerate() {
+        nan_cpu += usize::from(c.is_nan() || c.is_infinite());
+        nan_cuda += usize::from(g.is_nan() || g.is_infinite());
+        let d = (c - g).abs();
+        if first.is_none() && d > 1e-3 {
+            first = Some(i);
+        }
+        max = max.max(d);
+        sum += d as f64;
+        sum_sq += d as f64 * d as f64;
+        dot += c as f64 * g as f64;
+        nc += c as f64 * c as f64;
+        ng += g as f64 * g as f64;
+    }
+    let len = cpu.len().max(1) as f64;
+    if let Some(i) = first {
+        eprintln!("pulsar: K3 {label} len={} max={max:.6e} mean={:.6e} rms={:.6e} cosine={:.9} cpu_norm={:.6e} cuda_norm={:.6e} norm_ratio={:.9} first_tol={} values=({:.6e},{:.6e}) nan_inf=({}, {})", cpu.len(), sum / len, (sum_sq / len).sqrt(), dot / (nc.sqrt() * ng.sqrt()).max(f64::MIN_POSITIVE), nc.sqrt(), ng.sqrt(), (ng / nc.max(f64::MIN_POSITIVE)).sqrt(), i, cpu[i], cuda[i], nan_cpu, nan_cuda);
+    } else {
+        eprintln!("pulsar: K3 {label} len={} max={max:.6e} mean={:.6e} rms={:.6e} cosine={:.9} cpu_norm={:.6e} cuda_norm={:.6e} norm_ratio={:.9} first_tol=none nan_inf=({}, {})", cpu.len(), sum / len, (sum_sq / len).sqrt(), dot / (nc.sqrt() * ng.sqrt()).max(f64::MIN_POSITIVE), nc.sqrt(), ng.sqrt(), (ng / nc.max(f64::MIN_POSITIVE)).sqrt(), nan_cpu, nan_cuda);
+    }
 }
 
 // ── K3 typed weight representation ─────────────────────────────────────────

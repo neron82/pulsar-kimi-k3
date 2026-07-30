@@ -237,6 +237,21 @@ mod real {
             quant: u32,
             act_op: u32,
         ) -> i32;
+        fn pulsar_moe_pair_swiglu_debug(
+            mid: *mut c_void,
+            gate_out: *mut c_void,
+            up_out: *mut c_void,
+            ptrs: *const c_void,
+            weights: *const c_void,
+            x: *const c_void,
+            in_dim: u32,
+            mid_dim: u32,
+            n_used: u32,
+            n_tok: u32,
+            row_bytes: u64,
+            quant: u32,
+            act_op: u32,
+        ) -> i32;
         fn pulsar_moe_down(
             out: *mut c_void,
             ptrs: *const c_void,
@@ -989,7 +1004,7 @@ mod real {
     /// neither can lspci at idle. K3 also needs capacity for its resident
     /// trunk, so automatic selection ranks total VRAM first, then measured H2D
     /// bandwidth and compute capability. PULSAR_GPU overrides with a CUDA
-    /// device index.
+    /// device index or exact CUDA UUID.
     fn ensure_device() -> Result {
         use std::sync::OnceLock;
         static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
@@ -1000,17 +1015,25 @@ mod real {
             }
             let requested = std::env::var("PULSAR_GPU").ok();
             let dev = if let Some(value) = requested.as_deref() {
-                let dev = value
-                    .trim()
-                    .parse::<i32>()
-                    .map_err(|_| format!("PULSAR_GPU={value:?} is not a CUDA index"))?;
-                if dev < 0 || dev >= n {
-                    return Err(format!(
-                        "PULSAR_GPU={dev} is invalid: visible CUDA device indices are 0..{}",
-                        n - 1
-                    ));
+                let value = value.trim();
+                if let Ok(dev) = value.parse::<i32>() {
+                    if dev < 0 || dev >= n {
+                        return Err(format!(
+                            "PULSAR_GPU={dev} is invalid: visible CUDA device indices are 0..{}",
+                            n - 1
+                        ));
+                    }
+                    dev
+                } else {
+                    cuda_devices(false)
+                        .map_err(|e| e.to_string())?
+                        .iter()
+                        .find(|d| d.uuid == value)
+                        .map(|d| d.index)
+                        .ok_or_else(|| {
+                            format!("PULSAR_GPU={value:?} is not a visible CUDA index or UUID")
+                        })?
                 }
-                dev
             } else {
                 let devices = cuda_devices(true).map_err(|e| e.to_string())?;
                 devices
@@ -2145,6 +2168,44 @@ mod real {
                 )
             },
             "moe_pair_swiglu",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_pair_swiglu_debug(
+        mid: &mut DeviceBuf,
+        gate_out: &mut DeviceBuf,
+        up_out: &mut DeviceBuf,
+        ptrs: &DeviceBuf,
+        weights: &DeviceBuf,
+        x: &DeviceBuf,
+        in_dim: u32,
+        mid_dim: u32,
+        n_used: u32,
+        n_tok: u32,
+        row_bytes: u64,
+        quant: u32,
+        act_op: u32,
+    ) -> Result {
+        check(
+            unsafe {
+                pulsar_moe_pair_swiglu_debug(
+                    mid.ptr_mut(),
+                    gate_out.ptr_mut(),
+                    up_out.ptr_mut(),
+                    ptrs.ptr(),
+                    weights.ptr(),
+                    x.ptr(),
+                    in_dim,
+                    mid_dim,
+                    n_used,
+                    n_tok,
+                    row_bytes,
+                    quant,
+                    act_op,
+                )
+            },
+            "moe_pair_swiglu_debug",
         )
     }
 

@@ -1882,6 +1882,47 @@ __global__ static void moe_down_kernel(
     if (lane == 0) out[(uint64_t)token * out_dim + row] = acc;
 }
 
+/* Validation-only variant of the fused expert projection.  The normal kernel
+ * remains unchanged; these raw projection outputs make the first numerical
+ * boundary observable without changing production dispatch. */
+template <typename DOT>
+__global__ static void moe_pair_swiglu_debug_kernel(
+        float *mid, float *gate_out, float *up_out,
+        const pulsar_expert_ptrs *ptrs, const float *weights,
+        const block_q8_K *xq, uint32_t in_blocks, uint32_t mid_dim,
+        uint32_t n_used, uint32_t n_tok, uint64_t row_bytes, uint32_t act_op) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (row >= mid_dim || slot >= n_used || token >= n_tok) return;
+    const uint64_t slot_off = (uint64_t)token * n_used + slot;
+    const uint64_t mid_off = slot_off * mid_dim + row;
+    const pulsar_expert_ptrs p = ptrs[slot_off];
+    if (!p.gate || !p.up) {
+        if (lane == 0) { gate_out[mid_off] = 0.0f; up_out[mid_off] = 0.0f; mid[mid_off] = 0.0f; }
+        return;
+    }
+    const char *gate_row = (const char *)p.gate + (uint64_t)row * row_bytes;
+    const char *up_row = (const char *)p.up + (uint64_t)row * row_bytes;
+    const block_q8_K *token_xq = xq + (uint64_t)token * in_blocks;
+    float ag = 0.0f, au = 0.0f;
+    for (uint32_t b = lane; b < in_blocks; b += 32u) {
+        ag += DOT::block(gate_row, token_xq, b);
+        au += DOT::block(up_row, token_xq, b);
+    }
+    #pragma unroll
+    for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+        ag += __shfl_xor_sync(0xffffffffu, ag, mask);
+        au += __shfl_xor_sync(0xffffffffu, au, mask);
+    }
+    if (lane == 0) {
+        gate_out[mid_off] = ag;
+        up_out[mid_off] = au;
+        mid[mid_off] = pulsar_glu(ag, au, act_op) * weights[slot_off];
+    }
+}
+
 enum {
     PULSAR_QUANT_Q2_K = 0,
     PULSAR_QUANT_IQ2_XXS = 1,
@@ -3114,6 +3155,32 @@ extern "C" int pulsar_moe_pair_swiglu(
         return 0;
     }
     return cuda_ok(cudaGetLastError(), "moe pair swiglu launch");
+}
+
+extern "C" int pulsar_moe_pair_swiglu_debug(
+        void *mid_dev, void *gate_out_dev, void *up_out_dev,
+        const void *ptrs_dev, const void *weights_dev, const void *xq_dev,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t n_used, uint32_t n_tok,
+        uint64_t row_bytes, uint32_t quant, uint32_t act_op) {
+    if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || mid_dim == 0 ||
+        n_used == 0 || n_tok == 0 || row_bytes == 0) return 0;
+    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    dim3 block(32, 4, 1);
+    dim3 grid((mid_dim + 3u) / 4u, n_used, n_tok);
+    if (quant == PULSAR_QUANT_Q2_K) {
+        moe_pair_swiglu_debug_kernel<dot_q2_K><<<grid, block>>>(
+            (float *)mid_dev, (float *)gate_out_dev, (float *)up_out_dev,
+            (const pulsar_expert_ptrs *)ptrs_dev, (const float *)weights_dev,
+            (const block_q8_K *)xq_dev, in_blocks, mid_dim, n_used, n_tok,
+            row_bytes, act_op);
+    } else if (quant == PULSAR_QUANT_Q3_K) {
+        moe_pair_swiglu_debug_kernel<dot_q3_K><<<grid, block>>>(
+            (float *)mid_dev, (float *)gate_out_dev, (float *)up_out_dev,
+            (const pulsar_expert_ptrs *)ptrs_dev, (const float *)weights_dev,
+            (const block_q8_K *)xq_dev, in_blocks, mid_dim, n_used, n_tok,
+            row_bytes, act_op);
+    } else return 0;
+    return cuda_ok(cudaGetLastError(), "moe pair swiglu debug launch");
 }
 
 extern "C" int pulsar_moe_down(
