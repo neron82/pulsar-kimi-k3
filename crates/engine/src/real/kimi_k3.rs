@@ -1140,6 +1140,7 @@ impl Model {
         rt: &mut KimiK3Rt,
         x: &DeviceBuf, // [n_embd] f32 (normed input)
         w: &KimiK3W,
+        mut layer_prof: Option<&mut super::K3LayerProfile>,
     ) -> Result {
         let s = self.shape;
         let n_embd = s.n_embd;
@@ -1202,6 +1203,7 @@ impl Model {
         ffn_latent_down.matmul(&mut rt.latent, x, &mut rt.q8k_scratch, n_embd, moe_latent, 1)?;
 
         // 2. Router: logits = x @ W_gate_inp  [n_embd -> n_expert]
+        let router_t0 = std::time::Instant::now();
         ffn_gate_inp.matmul(&mut rt.router_logits, x, &mut rt.q8k_scratch, n_embd, n_expert, 1)?;
 
         // 3. Router select: sigmoid scores, top-k, renormalize
@@ -1216,10 +1218,18 @@ impl Model {
             s.expert_weight_scale,
             1,
         )?;
+        if let Some(p) = layer_prof.as_deref_mut() {
+            p.router_gpu += router_t0.elapsed();
+        }
 
         // 4. Read selected indices and weights from device (host roundtrip)
+        let readback_t0 = std::time::Instant::now();
         let selected = rt.expert_selected.read_i32(n_expert_used as usize)?;
         let weights = rt.expert_weights.read_f32(n_expert_used as usize)?;
+        if let Some(p) = layer_prof.as_deref_mut() {
+            p.router_sync += readback_t0.elapsed();
+            p.d2h_bytes = p.d2h_bytes.saturating_add((n_expert_used as u64) * 8);
+        }
 
         // 5. Resolve expert slabs through the generic cache/tier system
         //    instead of synchronous VFile reads.
@@ -1266,6 +1276,11 @@ impl Model {
         let mut resolved_host: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
         let mut resolved_gpu: std::collections::HashMap<u64, *const std::ffi::c_void> = std::collections::HashMap::new();
 
+        let store_before = (store.hits, store.misses, store.io_bytes, store.io_reads, store.io_max_read, store.io_wait);
+        let dev_before = (dev_cache.hits, dev_cache.misses);
+        let resolve_t0 = std::time::Instant::now();
+        let mut resolved_h2d_bytes = 0u64;
+        let mut resolved_h2d_time = std::time::Duration::ZERO;
         if use_gpu {
             // GPU path: reuse the persistent VRAM hot-set and stream only
             // misses through State::staging. Cached pointers remain valid
@@ -1296,7 +1311,10 @@ impl Model {
                         resolved_gpu.insert(off, ptr);
                     } else {
                         let base = stage_base[&off];
+                        let h2d_t0 = std::time::Instant::now();
                         staging.write(base, payload)?;
+                        resolved_h2d_time += h2d_t0.elapsed();
+                        resolved_h2d_bytes = resolved_h2d_bytes.saturating_add(payload.len() as u64);
                         resolved_gpu.insert(off, staging.ptr_at(base));
                     }
                     Ok(())
@@ -1308,6 +1326,23 @@ impl Model {
                 resolved_host.insert(off, payload.to_vec());
                 Ok(())
             })?;
+        }
+        if let Some(p) = layer_prof.as_deref_mut() {
+            p.expert_resolution += resolve_t0.elapsed();
+            p.storage += store.io_wait.saturating_sub(store_before.5);
+            p.cache += resolve_t0.elapsed().saturating_sub(p.storage);
+            p.h2d_bytes = p.h2d_bytes.saturating_add(resolved_h2d_bytes);
+            p.h2d += resolved_h2d_time;
+            p.storage_bytes = p.storage_bytes.saturating_add(store.io_bytes.saturating_sub(store_before.2));
+            p.storage_reads = p.storage_reads.saturating_add(store.io_reads.saturating_sub(store_before.3));
+            p.storage_max_read = p.storage_max_read.max(store.io_max_read.saturating_sub(store_before.4));
+            p.host_cache_hits = p.host_cache_hits.saturating_add(store.hits.saturating_sub(store_before.0));
+            p.host_cache_misses = p.host_cache_misses.saturating_add(store.misses.saturating_sub(store_before.1));
+            p.device_cache_hits = p.device_cache_hits.saturating_add(dev_cache.hits.saturating_sub(dev_before.0));
+            p.device_cache_misses = p.device_cache_misses.saturating_add(dev_cache.misses.saturating_sub(dev_before.1));
+            p.expert_requests = p.expert_requests.saturating_add(selected.len() as u64);
+            p.unique_experts = p.unique_experts.saturating_add(distinct.len() as u64);
+            p.repeated_experts = p.repeated_experts.saturating_add(selected.len().saturating_sub(distinct.len()) as u64);
         }
 
         if use_gpu {
@@ -1729,6 +1764,10 @@ impl Model {
             .ok_or("K3 forward: output_res_proj not loaded (missing from gguf)")?;
 
         // ── Embedding ──────────────────────────────────────────────────────
+        let token_t0 = std::time::Instant::now();
+        let token_index = pos0 as u64;
+        let profiling = super::Prof::enabled();
+        st.prof.begin_k3_token(token_index, if pos0 == 0 { "prefill" } else { "decode" });
         let token_i32: Vec<i32> = vec![tokens[0] as i32];
         st.tok.write(0, kernels::as_bytes(&token_i32))?;
         kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, n_embd, s.n_vocab, 1)?;
@@ -1736,6 +1775,11 @@ impl Model {
         let k3_timing = std::env::var_os("PULSAR_K3_TIMING").is_some();
         for il in 0..n_layer {
             let layer_t0 = std::time::Instant::now();
+            let mut layer_prof = super::K3LayerProfile {
+                index: il,
+                kind: if self.k3_layer_kinds[il] == K3LayerKind::Kda { "KDA" } else { "MLA" },
+                ..Default::default()
+            };
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
                 eprintln!("pulsar: K3 layer {il} begin");
             }
@@ -1746,6 +1790,7 @@ impl Model {
             };
 
             // ── AttnRes pre-attention mixture ────────────────────────────
+            let input_t0 = std::time::Instant::now();
             // h = (bank empty) ? prefix : attn_res_mix(prefix, bank, attn_res_norm, attn_res_proj)
             if rt.res_bank_len > 0 {
                 self.attn_res_mix(rt, &st.cur, &k3w.attn_res_norm, &k3w.attn_res_proj, eps)?;
@@ -1766,8 +1811,17 @@ impl Model {
 
             // ── attn_norm ─────────────────────────────────────────────────
             kernels::rms_norm(&mut st.normed, &st.cur, &k3w.attn_norm, n_embd, 1, eps)?;
+            layer_prof.input_residual_norm = input_t0.elapsed();
 
             // ── Attention (KDA or MLA) ────────────────────────────────────
+            let attention_t0 = std::time::Instant::now();
+            let attention_gpu_timer = if super::Prof::detailed() {
+                let timer = kernels::GpuTimer::new()?;
+                timer.start()?;
+                Some(timer)
+            } else {
+                None
+            };
             match k3w.kind {
                 K3LayerKind::Kda => {
                     self.kda_layer_forward(rt, &st.normed, k3w, il, eps)?;
@@ -1820,6 +1874,16 @@ impl Model {
                     )?;
                 }
             }
+            let attention_wall = attention_t0.elapsed();
+            let attention_gpu = attention_gpu_timer
+                .map(|timer| timer.stop_ms().map(|ms| std::time::Duration::from_secs_f64(ms as f64 / 1000.0)))
+                .transpose()?
+                .unwrap_or(attention_wall);
+            if k3w.kind == K3LayerKind::Kda {
+                layer_prof.kda_gpu = attention_gpu;
+            } else {
+                layer_prof.mla_gpu = attention_gpu;
+            }
 
             if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
                 let sync_result: super::Result = kernels::sync().map_err(|e| {
@@ -1829,6 +1893,7 @@ impl Model {
             }
 
             // ── Residual update (attention) ──────────────────────────────
+            let residual_t0 = std::time::Instant::now();
             // prefix = snapshot ? attn_out : prefix + attn_out
             if snapshot {
                 // Snapshot restart: prefix = attn_out (discard old prefix)
@@ -1847,13 +1912,17 @@ impl Model {
 
             // ── ffn_norm ──────────────────────────────────────────────────
             kernels::rms_norm(&mut rt.normed, &st.cur, &k3w.ffn_norm, n_embd, 1, eps)?;
+            layer_prof.output_residual = residual_t0.elapsed();
 
             // ── FFN (dense SiTU-GLU or latent Stable-MoE) ─────────────────
             if il < s.n_leading_dense as usize {
+                let ffn_t0 = std::time::Instant::now();
                 let mut ffn_input = DeviceBuf::alloc(n_embd as usize * 4)?;
                 kernels::copy_d2d(&mut ffn_input, 0, &rt.normed, 0, n_embd as usize * 4)?;
                 self.dense_ffn_forward(rt, &ffn_input, k3w)?;
+                layer_prof.dense_gpu = ffn_t0.elapsed();
             } else {
+                let ffn_t0 = std::time::Instant::now();
                 let mut ffn_input = DeviceBuf::alloc(n_embd as usize * 4)?;
                 kernels::copy_d2d(&mut ffn_input, 0, &rt.normed, 0, n_embd as usize * 4)?;
                 self.latent_moe_forward(
@@ -1863,7 +1932,13 @@ impl Model {
                     rt,
                     &ffn_input,
                     k3w,
+                    Some(&mut layer_prof),
                 )?;
+                if std::env::var_os("PULSAR_K3_GPU_MOE").is_some() {
+                    layer_prof.moe_gpu = ffn_t0.elapsed();
+                } else {
+                    layer_prof.cpu_routing = ffn_t0.elapsed();
+                }
             }
 
             // ── Residual update (FFN) ────────────────────────────────────
@@ -1878,6 +1953,14 @@ impl Model {
             if k3_timing {
                 eprintln!("pulsar: K3 layer {il} {:.3}s", layer_t0.elapsed().as_secs_f32());
             }
+            if profiling {
+                layer_prof.total = layer_t0.elapsed();
+                let classified = layer_prof.input_residual_norm
+                    + layer_prof.kda_gpu + layer_prof.mla_gpu + layer_prof.dense_gpu
+                    + layer_prof.moe_gpu + layer_prof.cpu_routing + layer_prof.output_residual;
+                layer_prof.unclassified = layer_prof.total.saturating_sub(classified);
+                st.prof.push_k3_layer(layer_prof);
+            }
         }
 
         // ── Final AttnRes mixture ─────────────────────────────────────────
@@ -1889,6 +1972,7 @@ impl Model {
 
         // ── Output norm + head ────────────────────────────────────────────
         if rows == 0 {
+            st.prof.finish_k3_token(token_t0.elapsed(), std::time::Duration::ZERO);
             return Ok(None);
         }
         let k = rows.min(1);
@@ -1898,6 +1982,7 @@ impl Model {
         kernels::sync()?;
         let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
         st.prof.tail += t_tail.elapsed();
+        st.prof.finish_k3_token(token_t0.elapsed(), t_tail.elapsed());
         Ok(Some(out))
     }
 }

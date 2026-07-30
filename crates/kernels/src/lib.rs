@@ -1251,6 +1251,50 @@ mod real {
         check_rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")
     }
 
+    /// Optional grouped GPU timer for detailed profiling. Stopping waits for
+    /// only the end event, so this mode is intentionally measurement-invasive.
+    pub struct GpuTimer {
+        start: *mut c_void,
+        end: *mut c_void,
+    }
+
+    unsafe impl Send for GpuTimer {}
+
+    impl GpuTimer {
+        pub fn new() -> Result<Self> {
+            ensure_device()?;
+            let mut start = std::ptr::null_mut();
+            let mut end = std::ptr::null_mut();
+            check_rt(unsafe { cudaEventCreateWithFlags(&mut start, 0) }, "profile event create")?;
+            if let Err(e) = check_rt(unsafe { cudaEventCreateWithFlags(&mut end, 0) }, "profile event create") {
+                unsafe { cudaEventDestroy(start) };
+                return Err(e);
+            }
+            Ok(Self { start, end })
+        }
+
+        pub fn start(&self) -> Result {
+            check_rt(unsafe { cudaEventRecord(self.start, std::ptr::null_mut()) }, "profile event start")
+        }
+
+        pub fn stop_ms(&self) -> Result<f32> {
+            check_rt(unsafe { cudaEventRecord(self.end, std::ptr::null_mut()) }, "profile event stop")?;
+            check_rt(unsafe { cudaEventSynchronize(self.end) }, "profile event wait")?;
+            let mut ms = 0.0;
+            check_rt(unsafe { cudaEventElapsedTime(&mut ms, self.start, self.end) }, "profile event elapsed")?;
+            Ok(ms)
+        }
+    }
+
+    impl Drop for GpuTimer {
+        fn drop(&mut self) {
+            unsafe {
+                cudaEventDestroy(self.start);
+                cudaEventDestroy(self.end);
+            }
+        }
+    }
+
     extern "C" {
         fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
         fn cudaMemcpyAsync(
@@ -1261,7 +1305,10 @@ mod real {
             stream: *mut c_void,
         ) -> i32;
         fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
+        fn cudaEventDestroy(e: *mut c_void) -> i32;
         fn cudaEventRecord(e: *mut c_void, stream: *mut c_void) -> i32;
+        fn cudaEventSynchronize(e: *mut c_void) -> i32;
+        fn cudaEventElapsedTime(ms: *mut f32, start: *mut c_void, end: *mut c_void) -> i32;
         fn cudaEventQuery(e: *mut c_void) -> i32;
         fn cudaStreamWaitEvent(stream: *mut c_void, e: *mut c_void, flags: u32) -> i32;
     }

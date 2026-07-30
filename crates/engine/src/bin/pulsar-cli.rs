@@ -195,6 +195,15 @@ fn run() -> engine::Result {
         model.shape.n_expert,
         model.shape.n_expert_used
     );
+    if std::env::var_os("PULSAR_PROFILE").is_some() {
+        let dev = kernels::selected_device()?;
+        let info = kernels::cuda_devices(false)?.into_iter().find(|d| d.index == dev);
+        if let Some(info) = info {
+            eprintln!("pulsar: profile device: CUDA {} {} {}", info.index, info.name, info.uuid);
+        } else {
+            eprintln!("pulsar: profile device: CUDA {dev} (identity unavailable)");
+        }
+    }
 
     if chat {
         return run_chat(&model, &tok, ctx, system, temp, top_p, min_p, seed, n_predict);
@@ -375,6 +384,9 @@ fn run() -> engine::Result {
         println!();
         if std::env::var_os("PULSAR_PROFILE").is_some() {
             eprintln!("pulsar: profile: {}", st.prof.report());
+            if engine::Prof::detailed() {
+                eprintln!("pulsar: profile detail:\n{}", st.prof.detailed_report());
+            }
         }
         st.save_warm(&model)?;
         let dt = t_first.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
@@ -425,7 +437,9 @@ fn run() -> engine::Result {
     let t2 = std::time::Instant::now();
     for _ in 0..n_predict {
         let l = logits.as_ref().ok_or("no logits")?;
+        let sample_t0 = std::time::Instant::now();
         let next = engine::argmax(l);
+        st.prof.record_sampling(sample_t0.elapsed());
         if tok.is_eog(next) {
             break;
         }
@@ -442,6 +456,9 @@ fn run() -> engine::Result {
     println!();
     if std::env::var_os("PULSAR_PROFILE").is_some() {
         eprintln!("pulsar: profile: {}", st.prof.report());
+        if engine::Prof::detailed() {
+            eprintln!("pulsar: profile detail:\n{}", st.prof.detailed_report());
+        }
     }
     st.save_warm(&model)?;
     let dt = t2.elapsed().as_secs_f32();

@@ -808,6 +808,10 @@ mod real {
         tick: u64,
         pub hits: u64,
         pub misses: u64,
+        pub io_bytes: u64,
+        pub io_reads: u64,
+        pub io_max_read: u64,
+        pub io_wait: std::time::Duration,
         /// offsets the CPU expert lane is reading right now - the evictors
         /// must not free them mid-dot (cleared after the pool joins)
         pinned: Vec<u64>,
@@ -833,12 +837,105 @@ mod real {
         pub cpu: std::time::Duration,
         pub tail: std::time::Duration,
         pub calls: u64,
+        pub k3_tokens: Vec<K3TokenProfile>,
+        current_k3: Option<K3TokenProfile>,
+    }
+
+    #[derive(Default, Clone)]
+    pub struct K3LayerProfile {
+        pub index: usize,
+        pub kind: &'static str,
+        pub total: std::time::Duration,
+        pub input_residual_norm: std::time::Duration,
+        pub dense_gpu: std::time::Duration,
+        pub kda_gpu: std::time::Duration,
+        pub mla_gpu: std::time::Duration,
+        pub router_gpu: std::time::Duration,
+        pub router_sync: std::time::Duration,
+        pub cpu_routing: std::time::Duration,
+        pub expert_resolution: std::time::Duration,
+        pub cache: std::time::Duration,
+        pub storage: std::time::Duration,
+        pub h2d: std::time::Duration,
+        pub moe_gpu: std::time::Duration,
+        pub output_residual: std::time::Duration,
+        pub synchronization: std::time::Duration,
+        pub allocation: std::time::Duration,
+        pub unclassified: std::time::Duration,
+        pub storage_bytes: u64,
+        pub storage_reads: u64,
+        pub storage_max_read: u64,
+        pub h2d_bytes: u64,
+        pub d2h_bytes: u64,
+        pub host_cache_hits: u64,
+        pub host_cache_misses: u64,
+        pub device_cache_hits: u64,
+        pub device_cache_misses: u64,
+        pub expert_requests: u64,
+        pub unique_experts: u64,
+        pub repeated_experts: u64,
+    }
+
+    #[derive(Default, Clone)]
+    pub struct K3TokenProfile {
+        pub index: u64,
+        pub phase: &'static str,
+        pub total: std::time::Duration,
+        pub layers: std::time::Duration,
+        pub output: std::time::Duration,
+        pub sampling: std::time::Duration,
+        pub unclassified: std::time::Duration,
+        pub layers_detail: Vec<K3LayerProfile>,
     }
 
     impl Prof {
+        pub fn enabled() -> bool {
+            std::env::var_os("PULSAR_PROFILE").is_some()
+        }
+
+        pub fn detailed() -> bool {
+            matches!(std::env::var("PULSAR_PROFILE_DETAIL").as_deref(), Ok("1" | "layers" | "cuda"))
+        }
+
+        pub fn begin_k3_token(&mut self, index: u64, phase: &'static str) {
+            if Self::enabled() {
+                self.current_k3 = Some(K3TokenProfile { index, phase, ..Default::default() });
+            }
+        }
+
+        pub fn finish_k3_token(&mut self, total: std::time::Duration, output: std::time::Duration) {
+            let Some(mut token) = self.current_k3.take() else { return };
+            token.total = total;
+            token.output = output;
+            token.layers = token.layers_detail.iter().map(|l| l.total).sum();
+            let classified = token.layers + output + token.sampling;
+            token.unclassified = total.saturating_sub(classified);
+            self.k3_tokens.push(token);
+        }
+
+        pub fn record_sampling(&mut self, elapsed: std::time::Duration) {
+            if let Some(token) = self.k3_tokens.last_mut() {
+                token.sampling += elapsed;
+                token.unclassified = token.total.saturating_sub(token.layers + token.output + token.sampling);
+            } else if let Some(token) = self.current_k3.as_mut() {
+                token.sampling += elapsed;
+            }
+        }
+
+        pub fn push_k3_layer(&mut self, layer: K3LayerProfile) {
+            if let Some(token) = self.current_k3.as_mut() {
+                token.layers_detail.push(layer);
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn current_for_test(&mut self, token: K3TokenProfile) {
+            self.current_k3 = Some(token);
+        }
+
         pub fn report(&self) -> String {
             let s = |d: std::time::Duration| d.as_secs_f64();
-            format!(
+            let mut report = format!(
                 "gpu-wait {:.2}s, resolve {:.2}s (h2d {:.2}s, disk/host {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
                 s(self.sync),
                 s(self.resolve),
@@ -847,7 +944,70 @@ mod real {
                 s(self.cpu),
                 s(self.tail),
                 self.calls
-            )
+            );
+            for token in &self.k3_tokens {
+                let mut gpu = std::time::Duration::ZERO;
+                let mut sync = std::time::Duration::ZERO;
+                let mut resolve = std::time::Duration::ZERO;
+                let mut storage = std::time::Duration::ZERO;
+                let mut cpu = std::time::Duration::ZERO;
+                let mut storage_bytes = 0u64;
+                let mut storage_reads = 0u64;
+                let mut h2d = 0u64;
+                let mut d2h = 0u64;
+                let mut host_hits = 0u64;
+                let mut host_misses = 0u64;
+                let mut device_hits = 0u64;
+                let mut device_misses = 0u64;
+                for l in &token.layers_detail {
+                    gpu += l.dense_gpu + l.kda_gpu + l.mla_gpu + l.router_gpu + l.moe_gpu;
+                    sync += l.router_sync + l.synchronization;
+                    resolve += l.expert_resolution;
+                    storage += l.storage;
+                    cpu += l.cpu_routing;
+                    storage_bytes = storage_bytes.saturating_add(l.storage_bytes);
+                    storage_reads = storage_reads.saturating_add(l.storage_reads);
+                    h2d = h2d.saturating_add(l.h2d_bytes);
+                    d2h = d2h.saturating_add(l.d2h_bytes);
+                    host_hits = host_hits.saturating_add(l.host_cache_hits);
+                    host_misses = host_misses.saturating_add(l.host_cache_misses);
+                    device_hits = device_hits.saturating_add(l.device_cache_hits);
+                    device_misses = device_misses.saturating_add(l.device_cache_misses);
+                }
+                report.push_str(&format!(
+                    "\nK3 token {} [{}]: total {:.3}s, layers {:.3}s, output {:.3}s, unclassified {:.3}s\n  GPU activity {:.3}s, synchronization/readback {:.3}s, expert resolution {:.3}s (storage {:.3}s), CPU work {:.3}s\n  storage: {} bytes in {} reads; H2D {} bytes; D2H {} bytes; host cache {:.1}% ({} hits/{} misses); device cache {:.1}% ({} hits/{} misses)",
+                    token.index, token.phase, token.total.as_secs_f64(), token.layers.as_secs_f64(),
+                    token.output.as_secs_f64(), token.unclassified.as_secs_f64(), gpu.as_secs_f64(),
+                    sync.as_secs_f64(), resolve.as_secs_f64(), storage.as_secs_f64(), storage_bytes,
+                    storage_reads, h2d, d2h, Self::hit_rate(host_hits, host_misses), host_hits,
+                    host_misses, Self::hit_rate(device_hits, device_misses), device_hits, device_misses
+                ));
+            }
+            report
+        }
+
+        pub fn hit_rate(hits: u64, misses: u64) -> f64 {
+            if hits.saturating_add(misses) == 0 { 0.0 } else { hits as f64 * 100.0 / (hits + misses) as f64 }
+        }
+
+        pub fn detailed_report(&self) -> String {
+            let mut out = String::new();
+            for token in &self.k3_tokens {
+                out.push_str(&format!("K3 token {} [{}]\n", token.index, token.phase));
+                out.push_str(&format!("  total wall:       {:>10.3}s\n", token.total.as_secs_f64()));
+                out.push_str(&format!("  layers total:     {:>10.3}s\n", token.layers.as_secs_f64()));
+                out.push_str(&format!("  output/lm-head:   {:>10.3}s\n", token.output.as_secs_f64()));
+                out.push_str(&format!("  unclassified:     {:>10.3}s\n", token.unclassified.as_secs_f64()));
+                for l in &token.layers_detail {
+                    out.push_str(&format!("  Layer {} [{}] total {:.3}ms input {:.3}ms KDA {:.3}ms MLA {:.3}ms router {:.3}ms resolve {:.3}ms storage {:.3}ms H2D {:.3}ms MoE {:.3}ms residual {:.3}ms sync {:.3}ms unclassified {:.3}ms\n",
+                        l.index, l.kind, l.total.as_secs_f64()*1e3, l.input_residual_norm.as_secs_f64()*1e3,
+                        l.kda_gpu.as_secs_f64()*1e3, l.mla_gpu.as_secs_f64()*1e3, l.router_gpu.as_secs_f64()*1e3,
+                        l.expert_resolution.as_secs_f64()*1e3, l.storage.as_secs_f64()*1e3, l.h2d.as_secs_f64()*1e3,
+                        l.moe_gpu.as_secs_f64()*1e3, l.output_residual.as_secs_f64()*1e3,
+                        l.synchronization.as_secs_f64()*1e3, l.unclassified.as_secs_f64()*1e3));
+                }
+            }
+            out
         }
     }
 
@@ -1042,6 +1202,10 @@ mod real {
                 touch: std::collections::HashMap::new(),
                 hits: 0,
                 misses: 0,
+                io_bytes: 0,
+                io_reads: 0,
+                io_max_read: 0,
+                io_wait: std::time::Duration::ZERO,
             })
         }
 
@@ -1180,6 +1344,9 @@ mod real {
             // ponytail: O(n) scan per eviction; heap it if the cache ever
             // holds >100k entries
             let incoming: usize = missing.iter().map(|r| r.len as usize).sum();
+            self.io_bytes = self.io_bytes.saturating_add(incoming as u64);
+            self.io_reads = self.io_reads.saturating_add(missing.len() as u64);
+            self.io_max_read = self.io_max_read.max(missing.iter().map(|r| r.len).max().unwrap_or(0));
             while self.used + incoming > self.budget && !self.cache.is_empty() {
                 let victim = self
                     .cache
@@ -1202,6 +1369,7 @@ mod real {
                 ..
             } = self;
             let mut place_err = None;
+            let io_t0 = std::time::Instant::now();
             fetcher.fetch_each(&missing, |i, slab| {
                 if place_err.is_none() {
                     if let Err(e) = place(missing[i].offset, slab.payload()) {
@@ -1219,6 +1387,7 @@ mod real {
                 );
                 Ok(())
             })?;
+            self.io_wait += io_t0.elapsed();
             match place_err {
                 Some(e) => Err(e),
                 None => Ok(()),
@@ -1250,6 +1419,10 @@ mod real {
         fn reset_stats(&mut self) {
             self.hits = 0;
             self.misses = 0;
+            self.io_bytes = 0;
+            self.io_reads = 0;
+            self.io_max_read = 0;
+            self.io_wait = std::time::Duration::ZERO;
         }
 
         fn contains(&self, offset: u64) -> bool {
@@ -6702,3 +6875,39 @@ mod real {
 
 #[cfg(target_os = "linux")]
 pub use real::*;
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::{K3LayerProfile, K3TokenProfile, Prof};
+    use std::time::Duration;
+
+    #[test]
+    fn aggregation_and_reset_shape_are_independent() {
+        let mut p = Prof::default();
+        p.current_for_test(K3TokenProfile { index: 0, phase: "decode", ..Default::default() });
+        p.push_k3_layer(K3LayerProfile { total: Duration::from_secs(2), ..Default::default() });
+        p.finish_k3_token(Duration::from_secs(3), Duration::from_millis(100));
+        assert_eq!(p.k3_tokens.len(), 1);
+        assert_eq!(p.k3_tokens[0].layers, Duration::from_secs(2));
+        assert_eq!(p.k3_tokens[0].unclassified, Duration::from_millis(900));
+        p.begin_k3_token(1, "decode");
+        assert!(p.k3_tokens[0].layers_detail.len() == 1);
+    }
+
+    #[test]
+    fn hit_rate_and_duration_noise_are_safe() {
+        assert_eq!(Prof::hit_rate(0, 0), 0.0);
+        assert_eq!(Prof::hit_rate(1, 3), 25.0);
+        let total = Duration::from_millis(1);
+        let classified = Duration::from_millis(2);
+        assert_eq!(total.saturating_sub(classified), Duration::ZERO);
+    }
+
+    #[test]
+    fn byte_counters_are_u64() {
+        let mut l = K3LayerProfile::default();
+        l.storage_bytes = u64::MAX;
+        l.storage_bytes = l.storage_bytes.saturating_add(1);
+        assert_eq!(l.storage_bytes, u64::MAX);
+    }
+}
