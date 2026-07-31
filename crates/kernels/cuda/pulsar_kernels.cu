@@ -1256,18 +1256,14 @@ __global__ static void q8_K_quantize_kernel(block_q8_K *out, const float *x, uin
     const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * PULSAR_QK_K;
     block_q8_K *yb = out + (uint64_t)row * n_blocks + b;
     __shared__ float abs_part[256];
-    __shared__ float val_part[256];
-    __shared__ float maxv_s;
     __shared__ float iscale_s;
     uint32_t tid = threadIdx.x;
     float v = tid < bn ? xr[tid] : 0.0f;
     abs_part[tid] = tid < bn ? fabsf(v) : 0.0f;
-    val_part[tid] = v;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
         if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
             abs_part[tid] = abs_part[tid + stride];
-            val_part[tid] = val_part[tid + stride];
         }
         __syncthreads();
     }
@@ -1279,8 +1275,11 @@ __global__ static void q8_K_quantize_kernel(block_q8_K *out, const float *x, uin
         return;
     }
     if (tid == 0) {
-        maxv_s = val_part[0];
-        iscale_s = -127.0f / maxv_s;
+        /* Q8_K uses a positive scale and signed int8 quants.  Keeping the
+         * selected source value's sign here produces a non-canonical but
+         * numerically equivalent representation whenever the maximum is
+         * positive (negative scale plus sign-inverted quants). */
+        iscale_s = 127.0f / amax;
     }
     __syncthreads();
     if (tid < PULSAR_QK_K) {
@@ -1295,7 +1294,7 @@ __global__ static void q8_K_quantize_kernel(block_q8_K *out, const float *x, uin
         for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
         yb->bsums[tid] = (int16_t)sum;
     }
-    if (tid == 0) yb->d = 1.0f / iscale_s;
+    if (tid == 0) yb->d = amax / 127.0f;
 }
 
 extern "C" int pulsar_quantize_q8_K(
@@ -3293,7 +3292,7 @@ static uint8_t test_randbyte(void) {
 static uint8_t h_ksigns[128];
 static uint64_t h_grid[256];
 
-/* mirror of q8_K_quantize_kernel, incl. the first-max tiebreak */
+/* mirror of q8_K_quantize_kernel */
 static void host_quantize_q8_K(block_q8_K *out, const float *x,
                                uint32_t in_dim, uint32_t n_rows) {
     const uint32_t n_blocks = (in_dim + PULSAR_QK_K - 1) / PULSAR_QK_K;
@@ -3303,16 +3302,16 @@ static void host_quantize_q8_K(block_q8_K *out, const float *x,
                     ? in_dim - b * PULSAR_QK_K : PULSAR_QK_K;
             const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * PULSAR_QK_K;
             block_q8_K *yb = out + (uint64_t)row * n_blocks + b;
-            float amax = 0.0f, maxv = 0.0f;
+            float amax = 0.0f;
             for (uint32_t i = 0; i < bn; i++) {
                 const float a = fabsf(xr[i]);
-                if (a > amax) { amax = a; maxv = xr[i]; }
+                if (a > amax) amax = a;
             }
             if (amax == 0.0f) {
                 memset(yb, 0, sizeof(*yb));
                 continue;
             }
-            const float iscale = -127.0f / maxv;
+            const float iscale = 127.0f / amax;
             for (uint32_t i = 0; i < PULSAR_QK_K; i++) {
                 int qv = i < bn ? (int)lrintf(iscale * xr[i]) : 0;
                 if (qv > 127) qv = 127;
@@ -3324,7 +3323,7 @@ static void host_quantize_q8_K(block_q8_K *out, const float *x,
                 for (int i = 0; i < 16; i++) sum += yb->qs[j * 16 + i];
                 yb->bsums[j] = (int16_t)sum;
             }
-            yb->d = 1.0f / iscale;
+            yb->d = amax / 127.0f;
         }
     }
 }

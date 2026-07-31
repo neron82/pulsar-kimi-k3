@@ -164,3 +164,118 @@ mismatch. A full 93-layer run was not repeated because the focused parity did
 not materially improve under any accumulation mode.
 
 Proposed commit message: `debug: isolate K3 routed MoE accumulation`
+
+## Expert 498 Boundary Investigation
+
+The follow-up comparison used the same model and deterministic parameters, with
+the requested RTX 3090 selected by UUID. The process-local CUDA index was `0`
+in both runs; the startup record was physical UUID
+`GPU-7ac9a486-bc2d-f429-bcab-2e6fd1aee04b`, name `NVIDIA GeForce RTX 3090`,
+PCI `0000:2b:00`. The comparison was restricted to layer `1`, token `0`,
+expert rank `0`, global expert `498`, local staging slot `0`, and stopped at
+the layer boundary.
+
+### First Divergence
+
+Before the fix, expert input F32 was bit-identical, but the first packed input
+Q8_K difference was byte offset `3`, block `0`, the scale field: CPU bytes
+`0x59`, CUDA bytes `0xbb`. The source block maximum was positive
+(`+3.2494467497e-1`); CPU emitted `d=+2.5586194824e-3`, while CUDA emitted
+`d=-2.5586194824e-3` and sign-inverted the quants. This came from the CUDA
+quantizer using the signed selected maximum in `-127/maxv`. The dequantized
+values were numerically equivalent, but the representation was not canonical
+Q8_K and the subsequent floating scaling took different paths.
+
+The production fix changes only `q8_K_quantize_kernel`: it derives a positive
+scale from the reduced absolute maximum, uses `127/amax` for the quantizer
+inverse, and stores `amax/127` as the block scale. No expert, routing,
+accumulation, attention, or performance change was made.
+
+### Post-Fix Focused Results
+
+The post-fix F32 input has length `3584`, min `-3.2944834232e-1`, max
+`3.2496976852e-1`, mean `-1.6446135755e-3`, RMS `9.2383900718e-2`, norm
+`5.5307024726`, and zero NaN/infinity values. CPU-Q8 and CUDA input F32 are
+bit-identical.
+
+| boundary | shape | max abs | RMS | cosine | first mismatch | classification |
+|---|---:|---:|---:|---:|---:|---|
+| expert input F32 | 3584 | 0 | 0 | 1.000000000000 | none | bit-identical |
+| gate Q2_K output | 3072 | 7.4505806e-8 | 1.5718988e-8 | 1.000000000000 | 0 | small floating-point variance |
+| up Q2_K output | 3072 | 2.3841858e-7 | 1.6229211e-8 | 1.000000000000 | 0 | small floating-point variance |
+| SiTU output F32 | 3072 | 7.8678131e-6 | 1.6415471e-7 | 0.999999999998 | 0 | downstream divergence |
+| down output, unweighted | 3584 | 1.4305115e-6 | 2.6323799e-7 | 0.999999999998 | 0 | downstream divergence |
+| weighted expert output | 3584 | 2.3096800e-7 | 4.3372130e-8 | 0.999999999998 | 0 | downstream divergence |
+
+The gate first values are CPU `8.682498336e-2` versus CUDA
+`8.682497591e-2`; the up first values are `-2.151191831e-1` versus
+`-2.151191682e-1`. SiTU first values are `-9.742258117e-3` versus
+`-9.742360562e-3`. Down first values are `-8.312633634e-2` versus
+`-8.312666416e-2`. The largest practical ULP distances are dominated by
+values near zero; all tensors have zero NaN/infinity values.
+
+The post-fix input Q8_K is `4088` bytes, `14` blocks, stride `292`, and has
+identical SHA-256 `abfa6ce62f3dbd6805db6a9d58dbea0275cd685232c304f4d0d54d315e85b1c7`.
+The second Q8_K has `3504` bytes, `12` blocks, stride `292`; it first differs
+at byte `0`, block `0`, scale field (`0x79` versus `0x9c`), with CPU and CUDA
+scales `5.0983537221e-4` and `5.0983740948e-4`.
+
+### Weight Identity
+
+All slices are exact byte matches between backends:
+
+| tensor | GGUF dimensions | absolute expert-498 offset | row stride | packed length | type | SHA-256 |
+|---|---|---:|---:|---:|---|---|
+| `blk.1.ffn_gate_exps.weight` | `[3584,3072,896]` | `6203672064` | `1176` | `3612672` | Q2_K | `252b407b9cb865945cf4e298e1908a43977c12807e378efc27124413ba87af8f` |
+| `blk.1.ffn_up_exps.weight` | `[3584,3072,896]` | `9497726464` | `1176` | `3612672` | Q2_K | `3a3489f552e58af8fb40af83b8453e5729ea712e15319d7a1d06dcb7f8ecf2a7` |
+| `blk.1.ffn_down_exps.weight` | `[3072,3584,896]` | `1945880064` | `1320` | `4730880` | Q3_K | `3185d0496c5061e81ed475a98bde9d569a1935696d9dc52e30168853c99ef1f5` |
+
+The CPU functions are `quant::cpu_dot::quantize_row_q8_k`,
+`k3_q8_dot` -> `vec_dot_q2_k_q8_k` for gate/up, and
+`vec_dot_q3_k_q8_k` for down. CUDA uses `pulsar_quantize_q8_K` /
+`q8_K_quantize_kernel`, `moe_pair_swiglu_kernel<dot_q2_K>`,
+`moe_down_kernel<dot_q3_K>`, and the fused `pulsar_glu` SiTU expression.
+CPU dot accumulation is serial F32 per row. CUDA dot accumulation is F32 per
+warp lane followed by XOR-shuffle reduction. CUDA is built with fast math;
+SiTU uses CUDA `tanhf`/`expf`, while CPU uses Rust F32 `tanh`/`exp`. The
+expression and constants are otherwise the K3 expression with beta `4` and
+linear beta `25`.
+
+### Controlled Confirmation And Lifetime Checks
+
+The CUDA diagnostic fed the exact CPU-generated Q8_K row into the CUDA Q2_K
+gate/up kernel. It reproduced the real-path Q2 variance: gate max
+`7.4505806e-8`, RMS `1.5718988e-8`; up max `2.3841858e-7`, RMS
+`1.6229211e-8`. This confirms the immediately following Q2 kernel arithmetic,
+rather than the original quantizer, is responsible for the remaining small
+gate/up variance.
+
+CUDA snapshots are read only after the producing launch through synchronous
+`DeviceBuf` readback on the active stream. The route pointer buffer is written
+before each expert launch; local slot `0` is logged as global expert `498`.
+Gate, up, SiTU, and down buffers are distinct; SiTU Q8_K is read before the
+next operation and down output is read before route weighting. No stale slab,
+alias, atomic, or cross-expert reduction was observed.
+
+### Focused Before/After
+
+The input packed boundary improved from a first difference at byte `3` to
+byte-identical. Routed output and hidden parity did not materially improve:
+
+| result | before fix max/RMS | after fix max/RMS |
+|---|---:|---:|
+| expert-498 down | `9.8347664e-7 / 1.7785587e-7` | `1.4305115e-6 / 2.6323799e-7` |
+| weighted expert | `1.6391277e-7 / 2.9306343e-8` | `2.3096800e-7 / 4.3372130e-8` |
+| routed-MoE | `2.1138694e-6 / 5.4687655e-7` | `3.2265671e-6 / 7.8680643e-7` |
+| layer-1 hidden | `4.5422465e-5 / 1.1665878e-5` | `4.4181943e-5 / 1.0903158e-5` |
+
+The canonical Q8_K defect is fixed, but CUDA expert parity remains unresolved
+because of the independently confirmed Q2_K reduction variance and its
+downstream SiTU/second-quantization effects. No full 93-layer run was made.
+CUDA remains non-default and is not safe to promote based on this focused
+result.
+
+Files changed for this investigation: `crates/engine/src/lib.rs`,
+`crates/engine/src/real/kimi_k3.rs`, `crates/kernels/cuda/pulsar_kernels.cu`,
+and `tests/k3_compare.py`. Proposed commit message:
+`fix: canonicalize K3 expert Q8_K scales and capture boundaries`.

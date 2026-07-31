@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare opt-in PULSAR_K3_COMPARE_DIR snapshots from three K3 runs."""
 import math
+import hashlib
 import struct
 import sys
 from pathlib import Path
@@ -30,8 +31,77 @@ def fmt(label, a, b):
           f"nan_inf=({m[6]},{m[7]})")
 
 
+def ordered_bits(v):
+    bits = struct.unpack("<I", struct.pack("<f", v))[0]
+    return bits ^ ((-(bits >> 31)) & 0x7fffffff)
+
+
+def exact_fmt(label, a, b):
+    d = [x - y for x, y in zip(a, b)]
+    ad = [abs(x) for x in d]
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    first = next((i for i, (x, y) in enumerate(zip(a, b))
+                  if struct.pack("<f", x) != struct.pack("<f", y)), None)
+    ulp = max((abs(ordered_bits(x) - ordered_bits(y)) for x, y in zip(a, b)), default=0)
+    thresholds = {t: next((i for i, x in enumerate(ad) if x > t), None)
+                  for t in (1e-8, 1e-7, 1e-6, 1e-5)}
+    print(f"{label}: shape=[{len(a)}] max={max(ad, default=0):.9e} "
+          f"mean={sum(ad) / max(1, len(ad)):.9e} "
+          f"rms={math.sqrt(sum(x * x for x in d) / max(1, len(d))):.9e} "
+          f"cosine={sum(x * y for x, y in zip(a, b)) / max(na * nb, 1e-30):.12f} "
+          f"norm_ratio={nb / max(na, 1e-30):.12f} first={first} "
+          f"thresholds={thresholds} max_ulp={ulp} "
+          f"nan_inf=({sum(not math.isfinite(x) for x in a)},"
+          f"{sum(not math.isfinite(x) for x in b)})")
+    if first is not None:
+        lo, hi = max(0, first - 2), min(len(a), first + 3)
+        for i in range(lo, hi):
+            print(f"  index={i} cpu={a[i]:.9e} cuda={b[i]:.9e} "
+                  f"ulp={abs(ordered_bits(a[i]) - ordered_bits(b[i]))}")
+
+
+def expert_report(root):
+    """Compare the focused CPU-Q8/CUDA expert-498 artifacts."""
+    root = Path(root)
+    dirs = {name: root / name for name in ("cpu-q8", "cuda")}
+    cpu_prefix = "expert_001_cpu_q8_"
+    cuda_prefix = "expert_001_cuda_"
+    cpu = {p.name[len(cpu_prefix):]: p for p in dirs["cpu-q8"].glob("expert_001_cpu_q8_*.f32")}
+    cuda = {p.name[len(cuda_prefix):]: p for p in dirs["cuda"].glob("expert_001_cuda_*.f32")}
+    print("focused expert 498: layer=1 token=0 rank=0 global_id=498 local_slot=0")
+    for name in sorted(cpu.keys() & cuda.keys()):
+        print(f"{name}:")
+        exact_fmt("  CPU-Q8 vs CUDA", load(cpu[name]), load(cuda[name]))
+
+    for cpu_path in dirs["cpu-q8"].glob("*.bin"):
+        cuda_name = cpu_path.name.replace("cpu_q8_", "cuda_", 1)
+        cuda_path = dirs["cuda"] / cuda_name
+        if not cuda_path.exists():
+            continue
+        left, right = cpu_path.read_bytes(), cuda_path.read_bytes()
+        first = next((i for i, (x, y) in enumerate(zip(left, right)) if x != y), None)
+        print(f"{cpu_path.name}: bytes={len(left)} "
+              f"sha256_cpu={hashlib.sha256(left).hexdigest()} "
+              f"sha256_cuda={hashlib.sha256(right).hexdigest()} "
+              f"differing={sum(x != y for x, y in zip(left, right))} "
+              f"first_byte={first}")
+        if first is not None:
+            block, in_block = divmod(first, 292)
+            field = "scale" if in_block < 4 else "qs" if in_block < 260 else "bsums"
+            print(f"  first_block={block} field={field} offset_in_block={in_block} "
+                  f"values=({left[first]},{right[first]})")
+
+    for name in ("moe_001_routed_moe.f32", "layer_001_hidden.f32"):
+        left, right = dirs["cpu-q8"] / name, dirs["cuda"] / name
+        if left.exists() and right.exists():
+            print(f"{name}:")
+            exact_fmt("  CPU-Q8 vs CUDA", load(left), load(right))
+
+
 def main(root):
     root = Path(root)
+    expert_report(root)
     names = ("cpu", "cpu-q8", "cuda")
     dirs = {n: root / n for n in names}
     files = sorted({p.name for d in dirs.values() if d.exists() for p in d.glob("*.f32")})

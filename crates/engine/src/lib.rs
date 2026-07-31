@@ -461,6 +461,10 @@ mod real {
     /// File location of one routed expert tensor: uniform per-expert slabs.
     #[derive(Clone)]
     struct ExpertTensor {
+        name: String,
+        row_elems: u64,
+        rows_per_expert: u64,
+        expert_count: u64,
         abs_offset: u64,
         expert_bytes: u64,
         row_bytes: u64,
@@ -490,6 +494,10 @@ mod real {
             let rows_per_expert = t.dims[1];
             let row_bytes = t.ty.row_bytes(row_elems).unwrap();
             Ok(ExpertTensor {
+                name: t.name.clone(),
+                row_elems,
+                rows_per_expert,
+                expert_count: t.dims[2],
                 abs_offset: g.data_offset + t.offset,
                 expert_bytes: row_bytes * rows_per_expert,
                 row_bytes,

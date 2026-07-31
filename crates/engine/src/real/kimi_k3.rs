@@ -1477,7 +1477,7 @@ impl Model {
                 .into());
             }
             store.ensure_with(&wants, |off, payload| {
-                if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+                if k3_compare_active(step, il) {
                     resolved_host.insert(off, payload.to_vec());
                 }
                 let base = stage_base[&off];
@@ -1536,7 +1536,7 @@ impl Model {
                 &selected,
                 &weights,
                 &resolved_gpu,
-                if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+                if k3_compare_active(step, il) {
                     Some(&resolved_host)
                 } else {
                     None
@@ -1871,8 +1871,34 @@ impl Model {
         let latent = rt.latent.read_f32(moe_latent as usize)?;
         let input_q = quant::cpu_dot::quantize_row_q8_k(&latent);
         let mut moe_acc = vec![0.0f32; moe_latent as usize];
-        let compare = std::env::var_os("PULSAR_K3_COMPARE").is_some();
+        let compare = k3_compare_active(step, il);
         let compute_t0 = std::time::Instant::now();
+
+        if compare {
+            k3_dump_host_f32(
+                step,
+                "expert",
+                il,
+                "cpu_q8_expert_498_rank_00_slot_00_input_f32",
+                &latent,
+            )?;
+            let input_q_bytes = k3_pack_q8_row(&input_q);
+            k3_dump_expert_bytes(
+                step,
+                il,
+                0,
+                498,
+                0,
+                "cpu_q8_expert_498_rank_00_slot_00_input_q8_k",
+                &input_q_bytes,
+                "Q8_K",
+                input_q.d.len(),
+                moe_latent as usize,
+                kernels::Q8_K_BLOCK_BYTES as u64,
+                "activation",
+                "quant::cpu_dot::quantize_row_q8_k",
+            )?;
+        }
 
         for si in 0..n_expert_used as usize {
             let e = selected[si];
@@ -1890,6 +1916,40 @@ impl Model {
             let down = resolved
                 .get(&down_off)
                 .ok_or("K3 CPU-Q8 down slab missing")?;
+            let focused = compare && k3_compare_expert(si, e);
+
+            if focused {
+                k3_dump_expert_weight(
+                    step,
+                    il,
+                    si,
+                    e,
+                    si,
+                    ffn_gate_exps,
+                    gate,
+                    "cpu_q8_gate_q2_k_weight",
+                )?;
+                k3_dump_expert_weight(
+                    step,
+                    il,
+                    si,
+                    e,
+                    si,
+                    ffn_up_exps,
+                    up,
+                    "cpu_q8_up_q2_k_weight",
+                )?;
+                k3_dump_expert_weight(
+                    step,
+                    il,
+                    si,
+                    e,
+                    si,
+                    ffn_down_exps,
+                    down,
+                    "cpu_q8_down_q3_k_weight",
+                )?;
+            }
 
             let mut gate_out = vec![0.0f32; n_ff_exp as usize];
             let mut up_out = vec![0.0f32; n_ff_exp as usize];
@@ -1898,6 +1958,22 @@ impl Model {
                 let uo = &up[j * ffn_up_exps.row_bytes as usize..];
                 gate_out[j] = k3_q8_dot(ffn_gate_exps.quant, go, &input_q, moe_latent as usize)?;
                 up_out[j] = k3_q8_dot(ffn_up_exps.quant, uo, &input_q, moe_latent as usize)?;
+            }
+            if focused {
+                k3_dump_host_f32(
+                    step,
+                    "expert",
+                    il,
+                    "cpu_q8_expert_498_rank_00_slot_00_gate_f32",
+                    &gate_out,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "expert",
+                    il,
+                    "cpu_q8_expert_498_rank_00_slot_00_up_f32",
+                    &up_out,
+                )?;
             }
 
             let mut mid = vec![0.0f32; n_ff_exp as usize];
@@ -1909,12 +1985,65 @@ impl Model {
                     * (self.shape.situ_linear_beta * (u / self.shape.situ_linear_beta).tanh());
             }
             let mid_q = quant::cpu_dot::quantize_row_q8_k(&mid);
+            if focused {
+                k3_dump_host_f32(
+                    step,
+                    "expert",
+                    il,
+                    "cpu_q8_expert_498_rank_00_slot_00_situ_f32",
+                    &mid,
+                )?;
+                let mid_q_bytes = k3_pack_q8_row(&mid_q);
+                k3_dump_expert_bytes(
+                    step,
+                    il,
+                    si,
+                    e,
+                    si,
+                    "cpu_q8_expert_498_rank_00_slot_00_situ_output_q8_k",
+                    &mid_q_bytes,
+                    "Q8_K",
+                    mid_q.d.len(),
+                    mid.len(),
+                    kernels::Q8_K_BLOCK_BYTES as u64,
+                    "activation",
+                    "quant::cpu_dot::quantize_row_q8_k",
+                )?;
+            }
             let mut expert_out = vec![0.0f32; moe_latent as usize];
             for k in 0..moe_latent as usize {
                 let row = &down[k * ffn_down_exps.row_bytes as usize..];
                 expert_out[k] = k3_q8_dot(ffn_down_exps.quant, row, &mid_q, n_ff_exp as usize)?;
             }
-            if compare {
+            if focused {
+                k3_dump_host_f32(
+                    step,
+                    "expert",
+                    il,
+                    "cpu_q8_expert_498_rank_00_slot_00_down_unweighted_f32",
+                    &expert_out,
+                )?;
+                let weighted: Vec<f32> = expert_out.iter().map(|&v| weights[si] * v).collect();
+                k3_dump_host_f32(
+                    step,
+                    "expert",
+                    il,
+                    "cpu_q8_expert_498_rank_00_slot_00_weighted_f32",
+                    &weighted,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "expert",
+                    il,
+                    "cpu_q8_expert_498_rank_00_slot_00_routing_weight_f32",
+                    std::slice::from_ref(&weights[si]),
+                )?;
+                eprintln!(
+                    "pulsar: K3 CPU-Q8 focused expert layer={} token={} rank={} global_id={} local_slot={} weight_bits=0x{:08x}",
+                    il, step, si, e, si, weights[si].to_bits()
+                );
+            }
+            if compare && k3_compare_expert(si, e) {
                 let before = moe_acc.clone();
                 let weighted: Vec<f32> = expert_out
                     .iter()
@@ -2028,7 +2157,7 @@ impl Model {
                 selected.len(), weights.len()
             ).into());
         }
-        if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+        if k3_compare_active(step, il) {
             for (slot, (&expert, &ptr)) in selected.iter().zip(&ptrs).enumerate() {
                 let ei = expert as u64;
                 let gate_off = ffn_gate_exps.abs_offset + ei * ffn_gate_exps.expert_bytes;
@@ -2057,7 +2186,7 @@ impl Model {
             rt.q8k_scratch = DeviceBuf::alloc(xq_bytes)?;
         }
         kernels::quantize_q8_k(&mut rt.q8k_scratch, &rt.latent, moe_latent, 1)?;
-        let compare = std::env::var_os("PULSAR_K3_COMPARE").is_some();
+        let compare = k3_compare_active(step, il);
         let q8_reference = if compare {
             let mut qbytes = vec![0u8; xq_bytes];
             rt.q8k_scratch.read(0, &mut qbytes)?;
@@ -2065,11 +2194,35 @@ impl Model {
         } else {
             None
         };
-        if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+        if compare {
             let original = rt.latent.read_f32(moe_latent as usize)?;
             let mut qbytes = vec![0u8; xq_bytes];
             rt.q8k_scratch.read(0, &mut qbytes)?;
             k3_report_q8_input(&original, &qbytes, moe_latent);
+            if compare && k3_compare_expert(0, 498) {
+                k3_dump_host_f32(
+                    step,
+                    "expert",
+                    il,
+                    "cuda_expert_498_rank_00_slot_00_input_f32",
+                    &original,
+                )?;
+                k3_dump_expert_bytes(
+                    step,
+                    il,
+                    0,
+                    498,
+                    0,
+                    "cuda_expert_498_rank_00_slot_00_input_q8_k",
+                    &qbytes,
+                    "Q8_K",
+                    xq_bytes / kernels::Q8_K_BLOCK_BYTES,
+                    moe_latent as usize,
+                    kernels::Q8_K_BLOCK_BYTES as u64,
+                    "activation",
+                    "pulsar_quantize_q8_K CUDA kernel",
+                )?;
+            }
         }
 
         // moe_pair_swiglu: mid = SiTU(gate_e @ xq, up_e @ xq).
@@ -2079,7 +2232,7 @@ impl Model {
         let row_bytes = ffn_gate_exps.row_bytes;
         let quant = ffn_gate_exps.quant;
         let act_op = 4u32; // K3 SiTU-GLU (beta=4, linear_beta=25)
-        if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
+        if compare {
             eprintln!(
                 "pulsar: K3 expert layout in_dim={} mid_dim={} out_dim={} gate(up) quant={} row_bytes={} down quant={} row_bytes={}",
                 moe_latent, n_ff_exp, moe_latent, quant, row_bytes,
@@ -2120,7 +2273,7 @@ impl Model {
             }
             ptr_buf.write(0, kernels::as_bytes(std::slice::from_ref(&route)))?;
             one_weight_buf.write(0, kernels::as_bytes(&[1.0f32]))?;
-            if compare && debug_host.is_some() {
+            if compare && k3_compare_expert(slot, selected[slot]) && debug_host.is_some() {
                 kernels::moe_pair_swiglu_debug(
                     &mut rt.expert_mid,
                     &mut rt.expert_gate,
@@ -2167,7 +2320,7 @@ impl Model {
             if capture_accum {
                 expert_outputs.extend_from_slice(&expert_out);
             }
-            if compare {
+            if compare && k3_compare_expert(slot, selected[slot]) {
                 if let Some(host) = debug_host {
                     let ei = selected[slot] as u64;
                     let go = host
@@ -2179,6 +2332,36 @@ impl Model {
                     let dno = host
                         .get(&(ffn_down_exps.abs_offset + ei * ffn_down_exps.expert_bytes))
                         .ok_or("missing debug down")?;
+                    k3_dump_expert_weight(
+                        step,
+                        il,
+                        slot,
+                        selected[slot],
+                        slot,
+                        ffn_gate_exps,
+                        go,
+                        "cuda_gate_q2_k_weight",
+                    )?;
+                    k3_dump_expert_weight(
+                        step,
+                        il,
+                        slot,
+                        selected[slot],
+                        slot,
+                        ffn_up_exps,
+                        uo,
+                        "cuda_up_q2_k_weight",
+                    )?;
+                    k3_dump_expert_weight(
+                        step,
+                        il,
+                        slot,
+                        selected[slot],
+                        slot,
+                        ffn_down_exps,
+                        dno,
+                        "cuda_down_q3_k_weight",
+                    )?;
                     let gf = k3_dequant_expert_bytes(
                         go,
                         (moe_latent * n_ff_exp) as usize,
@@ -2224,6 +2407,117 @@ impl Model {
                     let gg = rt.expert_gate.read_f32(mid_dim as usize)?;
                     let uu = rt.expert_up.read_f32(mid_dim as usize)?;
                     let mm = rt.expert_mid.read_f32(mid_dim as usize)?;
+                    k3_dump_host_f32(
+                        step,
+                        "expert",
+                        il,
+                        "cuda_expert_498_rank_00_slot_00_gate_f32",
+                        &gg,
+                    )?;
+                    k3_dump_host_f32(
+                        step,
+                        "expert",
+                        il,
+                        "cuda_expert_498_rank_00_slot_00_up_f32",
+                        &uu,
+                    )?;
+                    k3_dump_host_f32(
+                        step,
+                        "expert",
+                        il,
+                        "cuda_expert_498_rank_00_slot_00_situ_f32",
+                        &mm,
+                    )?;
+                    k3_dump_expert_bytes(
+                        step,
+                        il,
+                        slot,
+                        selected[slot],
+                        slot,
+                        "cuda_expert_498_rank_00_slot_00_situ_output_q8_k",
+                        &mid_qbytes,
+                        "Q8_K",
+                        mid_qbytes.len() / kernels::Q8_K_BLOCK_BYTES,
+                        mid_dim as usize,
+                        kernels::Q8_K_BLOCK_BYTES as u64,
+                        "activation",
+                        "pulsar_quantize_q8_K CUDA kernel",
+                    )?;
+                    k3_dump_host_f32(
+                        step,
+                        "expert",
+                        il,
+                        "cuda_expert_498_rank_00_slot_00_down_unweighted_f32",
+                        &expert_out,
+                    )?;
+                    let focused_weighted: Vec<f32> =
+                        expert_out.iter().map(|&v| weight * v).collect();
+                    k3_dump_host_f32(
+                        step,
+                        "expert",
+                        il,
+                        "cuda_expert_498_rank_00_slot_00_weighted_f32",
+                        &focused_weighted,
+                    )?;
+                    k3_dump_host_f32(
+                        step,
+                        "expert",
+                        il,
+                        "cuda_expert_498_rank_00_slot_00_routing_weight_f32",
+                        std::slice::from_ref(&weight),
+                    )?;
+
+                    // Secondary control: feed the exact CPU-Q8 packed row to
+                    // the CUDA Q2_K kernel. This is not the primary comparison;
+                    // it only tests the operation immediately after the
+                    // independently generated activation representation.
+                    let shared_input = rt.latent.read_f32(moe_latent as usize)?;
+                    let shared_q = quant::cpu_dot::quantize_row_q8_k(&shared_input);
+                    let shared_q_dev = DeviceBuf::from_bytes(&k3_pack_q8_row(&shared_q))?;
+                    let mut shared_mid = DeviceBuf::alloc(mid_bytes)?;
+                    let mut shared_gate = DeviceBuf::alloc(mid_bytes)?;
+                    let mut shared_up = DeviceBuf::alloc(mid_bytes)?;
+                    kernels::moe_pair_swiglu_debug(
+                        &mut shared_mid,
+                        &mut shared_gate,
+                        &mut shared_up,
+                        &ptr_buf,
+                        &one_weight_buf,
+                        &shared_q_dev,
+                        moe_latent,
+                        mid_dim,
+                        n_used,
+                        n_tok,
+                        row_bytes,
+                        quant,
+                        act_op,
+                    )?;
+                    let shared_gate_cuda = shared_gate.read_f32(mid_dim as usize)?;
+                    let shared_up_cuda = shared_up.read_f32(mid_dim as usize)?;
+                    let mut shared_gate_cpu = vec![0.0f32; n_ff_exp as usize];
+                    let mut shared_up_cpu = vec![0.0f32; n_ff_exp as usize];
+                    for j in 0..n_ff_exp as usize {
+                        let gate_row = &go[j * ffn_gate_exps.row_bytes as usize..];
+                        let up_row = &uo[j * ffn_up_exps.row_bytes as usize..];
+                        shared_gate_cpu[j] = k3_q8_dot(
+                            ffn_gate_exps.quant,
+                            gate_row,
+                            &shared_q,
+                            moe_latent as usize,
+                        )?;
+                        shared_up_cpu[j] =
+                            k3_q8_dot(ffn_up_exps.quant, up_row, &shared_q, moe_latent as usize)?;
+                    }
+                    k3_report_vector_exact(
+                        "controlled shared CPU-Q8 input gate CPU/CUDA",
+                        &shared_gate_cpu,
+                        &shared_gate_cuda,
+                    );
+                    k3_report_vector_exact(
+                        "controlled shared CPU-Q8 input up CPU/CUDA",
+                        &shared_up_cpu,
+                        &shared_up_cuda,
+                    );
                     k3_report_vector("gate CPU-Q8/CUDA", &cg, &gg);
                     k3_report_vector("up CPU-Q8/CUDA", &cu, &uu);
                     k3_report_vector("SiTU CPU-Q8/CUDA", &cm, &mm);
@@ -2245,7 +2539,7 @@ impl Model {
             for (dst, src) in moe_acc.iter_mut().zip(&expert_out) {
                 *dst += weight * *src;
             }
-            if compare {
+            if compare && k3_compare_expert(slot, selected[slot]) {
                 let before = before.unwrap();
                 let output =
                     &expert_outputs[slot * moe_latent as usize..(slot + 1) * moe_latent as usize];
@@ -2312,7 +2606,7 @@ impl Model {
                 nofma
             };
         }
-        if compare {
+        if compare && k3_compare_accum_enabled() {
             let mut cpu_f32 = vec![0.0f32; moe_latent as usize];
             let mut cpu_f64 = vec![0.0f64; moe_latent as usize];
             for rank in 0..n_expert_used as usize {
@@ -2882,6 +3176,23 @@ fn k3_reconstruct_q8(encoded: &[u8], n: u32) -> Vec<f32> {
     out
 }
 
+fn k3_pack_q8_row(row: &quant::cpu_dot::Q8KRow) -> Vec<u8> {
+    let blocks = row.d.len();
+    let mut out = Vec::with_capacity(blocks * kernels::Q8_K_BLOCK_BYTES);
+    for block in 0..blocks {
+        out.extend_from_slice(&row.d[block].to_le_bytes());
+        out.extend(
+            row.qs[block * quant::cpu_dot::QK_K..(block + 1) * quant::cpu_dot::QK_K]
+                .iter()
+                .map(|q| *q as u8),
+        );
+        for &sum in &row.bsums[block * 16..(block + 1) * 16] {
+            out.extend_from_slice(&(sum as i16).to_le_bytes());
+        }
+    }
+    out
+}
+
 fn k3_q8_dot(quant: u32, row: &[u8], x: &quant::cpu_dot::Q8KRow, n: usize) -> Result<f32> {
     Ok(match quant {
         kernels::QUANT_Q2_K => quant::cpu_dot::vec_dot_q2_k_q8_k(row, x, n),
@@ -2971,6 +3282,128 @@ fn k3_dump_i32(step: u32, kind: &str, layer: usize, name: &str, values: &[i32]) 
         "i32",
     )?;
     Ok(())
+}
+
+fn k3_compare_active(step: u32, layer: usize) -> bool {
+    std::env::var_os("PULSAR_K3_COMPARE_DIR").is_some() && k3_compare_enabled(step, layer)
+}
+
+fn k3_compare_expert(rank: usize, expert: i32) -> bool {
+    let rank_ok = std::env::var("PULSAR_K3_COMPARE_EXPERT_RANKS")
+        .ok()
+        .map(|ranks| {
+            ranks
+                .split(',')
+                .filter_map(|value| value.trim().parse::<usize>().ok())
+                .any(|value| value == rank)
+        })
+        .unwrap_or(true);
+    let expert_ok = std::env::var("PULSAR_K3_COMPARE_EXPERT_IDS")
+        .ok()
+        .map(|ids| {
+            ids.split(',')
+                .filter_map(|value| value.trim().parse::<i32>().ok())
+                .any(|value| value == expert)
+        })
+        .unwrap_or(true);
+    rank_ok && expert_ok
+}
+
+fn k3_compare_accum_enabled() -> bool {
+    std::env::var_os("PULSAR_K3_COMPARE_EXPERT_RANKS").is_none()
+        && std::env::var_os("PULSAR_K3_COMPARE_EXPERT_IDS").is_none()
+}
+
+fn k3_fnv1a(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn k3_dump_expert_bytes(
+    step: u32,
+    layer: usize,
+    rank: usize,
+    expert: i32,
+    slot: usize,
+    name: &str,
+    bytes: &[u8],
+    quantization: &str,
+    block_count: usize,
+    elements: usize,
+    stride: u64,
+    dtype: &str,
+    source: &str,
+) -> Result {
+    if !k3_compare_active(step, layer) {
+        return Ok(());
+    }
+    let root = std::env::var_os("PULSAR_K3_COMPARE_DIR").ok_or("comparison directory missing")?;
+    let backend = k3_expert_backend();
+    let dir = std::path::PathBuf::from(root).join(backend);
+    std::fs::create_dir_all(&dir)?;
+    let file_name = format!("{name}.bin");
+    std::fs::write(dir.join(&file_name), bytes)?;
+    use std::io::Write;
+    let mut manifest = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("manifest.jsonl"))?;
+    writeln!(
+        manifest,
+        "{{\"backend\":\"{backend}\",\"layer\":{layer},\"token_position\":{step},\"expert_rank\":{rank},\"global_expert_id\":{expert},\"local_staging_slot\":{slot},\"operation\":\"{name}\",\"dtype\":\"{dtype}\",\"quantization\":\"{quantization}\",\"elements\":{elements},\"block_count\":{block_count},\"stride_bytes\":{stride},\"packed_bytes\":{},\"hash\":\"{}\",\"source\":\"{source}\",\"file\":\"{file_name}\"}}",
+        bytes.len(),
+        k3_fnv1a(bytes),
+    )?;
+    Ok(())
+}
+
+fn k3_dump_expert_weight(
+    step: u32,
+    layer: usize,
+    rank: usize,
+    expert: i32,
+    slot: usize,
+    tensor: &super::ExpertTensor,
+    bytes: &[u8],
+    stage: &str,
+) -> Result {
+    let block_bytes = match tensor.quant {
+        kernels::QUANT_Q2_K => 84,
+        kernels::QUANT_Q3_K => 110,
+        _ => tensor.row_bytes,
+    };
+    let rows = bytes.len() as u64 / tensor.row_bytes.max(1);
+    k3_dump_expert_bytes(
+        step,
+        layer,
+        rank,
+        expert,
+        slot,
+        &format!("{stage}_expert_{expert}_rank_{rank:02}_slot_{slot:02}"),
+        bytes,
+        &format!("quant_id:{}", tensor.quant),
+        bytes.len() / block_bytes as usize,
+        rows as usize * tensor.row_elems as usize,
+        tensor.row_bytes,
+        "packed",
+        &format!(
+            "tensor={} dims=[{}, {}, {}] absolute_offset={} expert_bytes={} row_bytes={} quant_id={} block_bytes={}",
+            tensor.name,
+            tensor.row_elems,
+            tensor.rows_per_expert,
+            tensor.expert_count,
+            tensor.abs_offset,
+            tensor.expert_bytes,
+            tensor.row_bytes,
+            tensor.quant,
+            block_bytes
+        ),
+    )
 }
 
 fn k3_compare_enabled(step: u32, layer: usize) -> bool {
