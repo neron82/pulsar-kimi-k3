@@ -35,6 +35,15 @@ fn k3_expert_backend() -> &'static str {
     }
 }
 
+fn k3_accum_mode() -> &'static str {
+    match std::env::var("PULSAR_K3_ACCUM_MODE").as_deref() {
+        Ok("serial") => "serial",
+        Ok("serial-nofma") => "serial-nofma",
+        Ok("f64-reference") => "f64-reference",
+        _ => "current",
+    }
+}
+
 // ── K3 contract constants (from the reference model) ──────────────────────
 // These are the canonical K3 values; the gguf metadata is the source of truth.
 // Documented here for reference during Phase 2 forward implementation.
@@ -801,6 +810,7 @@ impl Model {
         x: &DeviceBuf, // [n_embd] f32 (residual stream input)
         w: &KimiK3W,
         il: usize,
+        step: u32,
         eps: f32,
     ) -> Result {
         let s = self.shape;
@@ -859,6 +869,10 @@ impl Model {
         wv.matmul_q8k(&mut rt.kda_v_conv, &rt.q8k_scratch, n_embd, d_inner, 1)
             .map_err(|e| format!("K3 layer {il} KDA V projection: {e}"))?;
 
+        k3_dump_device(step, "kda", il, "q_projection", &rt.kda_q_normed, d_inner)?;
+        k3_dump_device(step, "kda", il, "k_projection", &rt.kda_k_normed, d_inner)?;
+        k3_dump_device(step, "kda", il, "v_projection", &rt.kda_v_conv, d_inner)?;
+
         // 2. Causal conv1d on Q, K, V
         // sconv: out = silu(conv(x, kern, state))
         // The sconv kernel does: out = x + causal depthwise conv over last K inputs
@@ -886,6 +900,14 @@ impl Model {
 
         // Q conv
         let q_conv_state = &mut rt.conv_states[il][0];
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "conv_q_before",
+            q_conv_state,
+            d_inner * (d_conv - 1).max(1),
+        )?;
         kernels::sconv(
             &mut rt.kda_conv_out,
             &rt.kda_q_normed,
@@ -899,6 +921,14 @@ impl Model {
         // Read back, compute silu(conv_part) = silu(out - x), write back.
         let q_after_conv = rt.kda_conv_out.read_f32(d_inner as usize)?;
         let q_before_conv = rt.kda_q_normed.read_f32(d_inner as usize)?;
+        k3_dump_device(
+            step,
+            "kda",
+            il,
+            "q_sconv_residual",
+            &rt.kda_conv_out,
+            d_inner,
+        )?;
         let q_conv_only: Vec<f32> = q_after_conv
             .iter()
             .zip(q_before_conv.iter())
@@ -909,9 +939,26 @@ impl Model {
             })
             .collect();
         rt.kda_q_normed.write(0, kernels::as_bytes(&q_conv_only))?;
+        k3_dump_device(step, "kda", il, "q_conv_output", &rt.kda_q_normed, d_inner)?;
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "conv_q_after",
+            q_conv_state,
+            d_inner * (d_conv - 1).max(1),
+        )?;
 
         // K conv
         let k_conv_state = &mut rt.conv_states[il][1];
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "conv_k_before",
+            k_conv_state,
+            d_inner * (d_conv - 1).max(1),
+        )?;
         kernels::sconv(
             &mut rt.kda_conv_out,
             &rt.kda_k_normed,
@@ -923,6 +970,14 @@ impl Model {
         )?;
         let k_after_conv = rt.kda_conv_out.read_f32(d_inner as usize)?;
         let k_before_conv = rt.kda_k_normed.read_f32(d_inner as usize)?;
+        k3_dump_device(
+            step,
+            "kda",
+            il,
+            "k_sconv_residual",
+            &rt.kda_conv_out,
+            d_inner,
+        )?;
         let k_conv_only: Vec<f32> = k_after_conv
             .iter()
             .zip(k_before_conv.iter())
@@ -932,9 +987,26 @@ impl Model {
             })
             .collect();
         rt.kda_k_normed.write(0, kernels::as_bytes(&k_conv_only))?;
+        k3_dump_device(step, "kda", il, "k_conv_output", &rt.kda_k_normed, d_inner)?;
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "conv_k_after",
+            k_conv_state,
+            d_inner * (d_conv - 1).max(1),
+        )?;
 
         // V conv
         let v_conv_state = &mut rt.conv_states[il][2];
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "conv_v_before",
+            v_conv_state,
+            d_inner * (d_conv - 1).max(1),
+        )?;
         kernels::sconv(
             &mut rt.kda_conv_out,
             &rt.kda_v_conv,
@@ -946,6 +1018,14 @@ impl Model {
         )?;
         let v_after_conv = rt.kda_conv_out.read_f32(d_inner as usize)?;
         let v_before_conv = rt.kda_v_conv.read_f32(d_inner as usize)?;
+        k3_dump_device(
+            step,
+            "kda",
+            il,
+            "v_sconv_residual",
+            &rt.kda_conv_out,
+            d_inner,
+        )?;
         let v_conv_only: Vec<f32> = v_after_conv
             .iter()
             .zip(v_before_conv.iter())
@@ -955,12 +1035,23 @@ impl Model {
             })
             .collect();
         rt.kda_v_conv.write(0, kernels::as_bytes(&v_conv_only))?;
+        k3_dump_device(step, "kda", il, "v_conv_output", &rt.kda_v_conv, d_inner)?;
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "conv_v_after",
+            v_conv_state,
+            d_inner * (d_conv - 1).max(1),
+        )?;
 
         // 3. L2 norm on Q and K (per-head)
         // Reshape [d_inner] -> [n_head, kda_hd], L2 norm each head
         // Use the existing qwen35_l2_norm kernel which does per-row L2 norm
         kernels::qwen35_l2_norm(&mut rt.kda_q_normed, n_head, kda_hd, eps)?;
         kernels::qwen35_l2_norm(&mut rt.kda_k_normed, n_head, kda_hd, eps)?;
+        k3_dump_device(step, "kda", il, "q_normed", &rt.kda_q_normed, d_inner)?;
+        k3_dump_device(step, "kda", il, "k_normed", &rt.kda_k_normed, d_inner)?;
 
         // 4. Safe gate: g1 = gate_lower_bound * sigmoid(exp(A_log) * (f_a(x) @ f_b + dt_bias))
         // f_a = x @ W_f_a  [n_embd -> kda_head_dim]
@@ -988,6 +1079,7 @@ impl Model {
             *v = gate_lower_bound / (1.0 + (-*v).exp());
         }
         rt.kda_g_raw.write(0, kernels::as_bytes(&g_raw_host))?;
+        k3_dump_device(step, "kda", il, "gate_alpha", &rt.kda_g_raw, d_inner)?;
 
         // 5. Beta: sigmoid(x @ W_beta)  [n_embd -> n_head]
         ssm_beta.matmul_q8k(&mut rt.kda_gate_logits, &rt.q8k_scratch, n_embd, n_head, 1)?;
@@ -996,9 +1088,18 @@ impl Model {
             *v = 1.0 / (1.0 + (-*v).exp());
         }
         rt.kda_gate_logits.write(0, kernels::as_bytes(&beta_host))?;
+        k3_dump_device(step, "kda", il, "beta", &rt.kda_gate_logits, n_head)?;
 
         // 6. Delta-rule step: attn_out, new_state = delta_net(Q, K, V, g1, beta, state)
         let ssm_state = &mut rt.ssm_states[il];
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "recurrent_before",
+            ssm_state,
+            n_head * kda_hd * kda_hd,
+        )?;
         kernels::k3_kda_step(
             &mut rt.attn_out,
             ssm_state,
@@ -1011,6 +1112,15 @@ impl Model {
             n_head,
             kda_hd,
         )?;
+        k3_dump_device(
+            step,
+            "kda_state",
+            il,
+            "recurrent_after",
+            ssm_state,
+            n_head * kda_hd * kda_hd,
+        )?;
+        k3_dump_device(step, "kda", il, "recurrent_output", &rt.attn_out, d_inner)?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
             let sync_result: super::Result = kernels::sync()
                 .map_err(|e| format!("K3 layer {il} KDA delta-step sync: {e}").into());
@@ -1020,6 +1130,7 @@ impl Model {
         // 7. Output gate: g2 = sigmoid(x @ W_gate)
         wqkv_gate.matmul_q8k(&mut rt.kda_gate_logits, &rt.q8k_scratch, n_embd, d_inner, 1)?;
         kernels::k3_sigmoid_inplace(&mut rt.kda_gate_logits, d_inner)?;
+        k3_dump_device(step, "kda", il, "output_gate", &rt.kda_gate_logits, d_inner)?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
             let sync_result: super::Result = kernels::sync()
                 .map_err(|e| format!("K3 layer {il} KDA gate sigmoid sync: {e}").into());
@@ -1083,6 +1194,14 @@ impl Model {
             d_inner,
             n_embd,
             1,
+        )?;
+        k3_dump_device(
+            step,
+            "kda",
+            il,
+            "output_before_residual",
+            &rt.attn_out,
+            n_embd,
         )?;
 
         Ok(())
@@ -1153,6 +1272,8 @@ impl Model {
         rt: &mut KimiK3Rt,
         x: &DeviceBuf, // [n_embd] f32 (normed input)
         w: &KimiK3W,
+        il: usize,
+        step: u32,
         mut layer_prof: Option<&mut super::K3LayerProfile>,
     ) -> Result {
         let s = self.shape;
@@ -1221,6 +1342,8 @@ impl Model {
             moe_latent,
             1,
         )?;
+        k3_dump_device(step, "moe", il, "router_input", x, n_embd)?;
+        k3_dump_device(step, "moe", il, "latent_projection", &rt.latent, moe_latent)?;
 
         // 2. Router: logits = x @ W_gate_inp  [n_embd -> n_expert]
         let router_t0 = std::time::Instant::now();
@@ -1231,6 +1354,14 @@ impl Model {
             n_embd,
             n_expert,
             1,
+        )?;
+        k3_dump_device(
+            step,
+            "moe",
+            il,
+            "router_logits",
+            &rt.router_logits,
+            n_expert,
         )?;
 
         // 3. Router select: sigmoid scores, top-k, renormalize
@@ -1253,6 +1384,8 @@ impl Model {
         let readback_t0 = std::time::Instant::now();
         let selected = rt.expert_selected.read_i32(n_expert_used as usize)?;
         let weights = rt.expert_weights.read_f32(n_expert_used as usize)?;
+        k3_dump_i32(step, "moe", il, "selected_experts", &selected)?;
+        k3_dump_host_f32(step, "moe", il, "routing_weights", &weights)?;
         if let Some(p) = layer_prof.as_deref_mut() {
             p.router_sync += readback_t0.elapsed();
             p.d2h_bytes = p.d2h_bytes.saturating_add((n_expert_used as u64) * 8);
@@ -1416,6 +1549,8 @@ impl Model {
                 n_expert_used,
                 moe_latent,
                 n_ff_exp,
+                il,
+                step,
             )?;
         } else if k3_expert_backend() == "cpu-q8" {
             self.k3_cpu_q8_moe_compute(
@@ -1430,6 +1565,8 @@ impl Model {
                 n_expert_used,
                 moe_latent,
                 n_ff_exp,
+                il,
+                step,
                 layer_prof.as_deref_mut(),
             )?;
         } else {
@@ -1454,6 +1591,14 @@ impl Model {
 
         // 6. RMSNorm(moe_acc, latent_norm)
         let latent_norm_t0 = std::time::Instant::now();
+        k3_dump_device(
+            step,
+            "moe",
+            il,
+            "routed_moe_accum",
+            &rt.latent_normed,
+            moe_latent,
+        )?;
         let latent_norm_host = ffn_latent_norm.read_f32(moe_latent as usize)?;
         let moe_acc = rt.latent_normed.read_f32(moe_latent as usize)?;
         let mean_sq: f32 = moe_acc.iter().map(|v| v * v).sum::<f32>() / moe_latent as f32;
@@ -1470,6 +1615,14 @@ impl Model {
         // 7. moe_out = moe_normed @ W_latent_up  [moe_latent -> n_embd]
         // Write moe_normed to device, then matmul
         rt.latent_normed.write(0, kernels::as_bytes(&moe_normed))?;
+        k3_dump_device(
+            step,
+            "moe",
+            il,
+            "routed_moe_normed",
+            &rt.latent_normed,
+            moe_latent,
+        )?;
         kernels::matmul_q8_0(
             &mut rt.moe_out,
             ffn_latent_up,
@@ -1478,6 +1631,7 @@ impl Model {
             n_embd,
             1,
         )?;
+        k3_dump_device(step, "moe", il, "latent_up_output", &rt.moe_out, n_embd)?;
 
         // 8. Shared experts (on full hidden state, SiTU-GLU)
         // gate = x @ W_gate_sh  [n_embd -> n_ff_exp * n_expert_shared]
@@ -1517,9 +1671,25 @@ impl Model {
             n_embd,
             1,
         )?;
+        k3_dump_device(
+            step,
+            "moe",
+            il,
+            "shared_expert_output",
+            &rt.shexp_out,
+            n_embd,
+        )?;
 
         // 9. ffn_out = moe_out + shexp_out
         kernels::add(&mut rt.ffn_out, &rt.moe_out, &rt.shexp_out, n_embd)?;
+        k3_dump_device(
+            step,
+            "moe",
+            il,
+            "ffn_output_before_residual",
+            &rt.ffn_out,
+            n_embd,
+        )?;
 
         Ok(())
     }
@@ -1683,6 +1853,8 @@ impl Model {
         n_expert_used: u32,
         moe_latent: u32,
         n_ff_exp: u32,
+        il: usize,
+        step: u32,
         mut layer_prof: Option<&mut super::K3LayerProfile>,
     ) -> Result {
         let gate_up_q2 =
@@ -1699,6 +1871,7 @@ impl Model {
         let latent = rt.latent.read_f32(moe_latent as usize)?;
         let input_q = quant::cpu_dot::quantize_row_q8_k(&latent);
         let mut moe_acc = vec![0.0f32; moe_latent as usize];
+        let compare = std::env::var_os("PULSAR_K3_COMPARE").is_some();
         let compute_t0 = std::time::Instant::now();
 
         for si in 0..n_expert_used as usize {
@@ -1740,7 +1913,52 @@ impl Model {
             for k in 0..moe_latent as usize {
                 let row = &down[k * ffn_down_exps.row_bytes as usize..];
                 expert_out[k] = k3_q8_dot(ffn_down_exps.quant, row, &mid_q, n_ff_exp as usize)?;
-                moe_acc[k] += weights[si] * expert_out[k];
+            }
+            if compare {
+                let before = moe_acc.clone();
+                let weighted: Vec<f32> = expert_out
+                    .iter()
+                    .map(|&value| weights[si] * value)
+                    .collect();
+                for (acc, &value) in moe_acc.iter_mut().zip(&expert_out) {
+                    *acc += weights[si] * value;
+                }
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cpu_q8_expert_{si:02}_output"),
+                    &expert_out,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cpu_q8_expert_{si:02}_weighted"),
+                    &weighted,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cpu_q8_expert_{si:02}_accum_before"),
+                    &before,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cpu_q8_expert_{si:02}_accum_after"),
+                    &moe_acc,
+                )?;
+                eprintln!(
+                    "pulsar: K3 CPU-Q8 accumulation rank={si} global_id={} local_slot={si} weight={:.9}",
+                    selected[si], weights[si]
+                );
+            } else {
+                for (acc, &value) in moe_acc.iter_mut().zip(&expert_out) {
+                    *acc += weights[si] * value;
+                }
             }
         }
         if let Some(p) = layer_prof.as_deref_mut() {
@@ -1774,6 +1992,8 @@ impl Model {
         n_expert_used: u32,
         moe_latent: u32,
         n_ff_exp: u32,
+        il: usize,
+        step: u32,
     ) -> Result {
         // Resolve every selected slot independently.  The host reference applies
         // the route weight after the down projection; folding it into `mid`
@@ -1882,10 +2102,20 @@ impl Model {
             rt.expert_down = DeviceBuf::alloc(out_bytes)?;
         }
 
+        let accum_mode = k3_accum_mode();
+        let capture_accum = compare || accum_mode != "current";
         let mut moe_acc = vec![0.0f32; moe_latent as usize];
         let mut debug_cpu_acc = vec![0.0f32; moe_latent as usize];
+        let mut expert_outputs = if capture_accum {
+            Vec::with_capacity(n_expert_used as usize * moe_latent as usize)
+        } else {
+            Vec::new()
+        };
         for (slot, (&route, &weight)) in ptrs.iter().zip(weights.iter()).enumerate() {
             if route.gate.is_null() || route.up.is_null() || route.down.is_null() {
+                if capture_accum {
+                    expert_outputs.resize(expert_outputs.len() + moe_latent as usize, 0.0);
+                }
                 continue;
             }
             ptr_buf.write(0, kernels::as_bytes(std::slice::from_ref(&route)))?;
@@ -1934,6 +2164,9 @@ impl Model {
                 ffn_down_exps.quant,
             )?;
             let expert_out = rt.expert_down.read_f32(moe_latent as usize)?;
+            if capture_accum {
+                expert_outputs.extend_from_slice(&expert_out);
+            }
             if compare {
                 if let Some(host) = debug_host {
                     let ei = selected[slot] as u64;
@@ -2003,13 +2236,116 @@ impl Model {
                     eprintln!("pulsar: K3 debug layer expert rank={slot} global_id={} dims in={} mid={} out={} gate_quant={} up_quant={} down_quant={} gate_row_bytes={} up_row_bytes={} down_row_bytes={} gate_bytes={} up_bytes={} down_bytes={} weight={:.9}", selected[slot], moe_latent, n_ff_exp, moe_latent, ffn_gate_exps.quant, ffn_up_exps.quant, ffn_down_exps.quant, ffn_gate_exps.row_bytes, ffn_up_exps.row_bytes, ffn_down_exps.row_bytes, go.len(), uo.len(), dno.len(), weight);
                 }
             }
-            for (dst, src) in moe_acc.iter_mut().zip(expert_out) {
-                *dst += weight * src;
+            let before = if compare { Some(moe_acc.clone()) } else { None };
+            let weighted: Vec<f32> = if compare {
+                expert_out.iter().map(|&value| weight * value).collect()
+            } else {
+                Vec::new()
+            };
+            for (dst, src) in moe_acc.iter_mut().zip(&expert_out) {
+                *dst += weight * *src;
             }
-            if std::env::var_os("PULSAR_K3_COMPARE").is_some() {
-                eprintln!("pulsar: K3 CUDA expert slot {slot} route weight {weight:.9}");
-                k3_report_vector("accum CPU-Q8/CUDA", &debug_cpu_acc, &moe_acc);
+            if compare {
+                let before = before.unwrap();
+                let output =
+                    &expert_outputs[slot * moe_latent as usize..(slot + 1) * moe_latent as usize];
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cuda_expert_{slot:02}_output"),
+                    output,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cuda_expert_{slot:02}_weighted"),
+                    &weighted,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cuda_expert_{slot:02}_accum_before"),
+                    &before,
+                )?;
+                k3_dump_host_f32(
+                    step,
+                    "moe",
+                    il,
+                    &format!("cuda_expert_{slot:02}_accum_after"),
+                    &moe_acc,
+                )?;
+                eprintln!(
+                    "pulsar: K3 CUDA accumulation rank={slot} global_id={} local_slot={slot} weight={weight:.9}",
+                    selected[slot]
+                );
+                if debug_host.is_some() {
+                    k3_report_accum_progression(
+                        slot,
+                        selected[slot],
+                        weight,
+                        &debug_cpu_acc,
+                        &moe_acc,
+                    );
+                }
             }
+        }
+
+        let current_host = moe_acc.clone();
+        if accum_mode == "f64-reference" {
+            let mut f64_acc = vec![0.0f64; moe_latent as usize];
+            for rank in 0..n_expert_used as usize {
+                let base = rank * moe_latent as usize;
+                for i in 0..moe_latent as usize {
+                    f64_acc[i] += weights[rank] as f64 * expert_outputs[base + i] as f64;
+                }
+            }
+            moe_acc = f64_acc.into_iter().map(|value| value as f32).collect();
+        } else if matches!(accum_mode, "serial" | "serial-nofma") {
+            let (serial, nofma) =
+                k3_cuda_accum_variants(&expert_outputs, weights, moe_latent, n_expert_used)?;
+            moe_acc = if accum_mode == "serial" {
+                serial
+            } else {
+                nofma
+            };
+        }
+        if compare {
+            let mut cpu_f32 = vec![0.0f32; moe_latent as usize];
+            let mut cpu_f64 = vec![0.0f64; moe_latent as usize];
+            for rank in 0..n_expert_used as usize {
+                let base = rank * moe_latent as usize;
+                for i in 0..moe_latent as usize {
+                    cpu_f32[i] += weights[rank] * expert_outputs[base + i];
+                    cpu_f64[i] += weights[rank] as f64 * expert_outputs[base + i] as f64;
+                }
+            }
+            let cpu_f64: Vec<f32> = cpu_f64.into_iter().map(|value| value as f32).collect();
+            let (serial, nofma) =
+                k3_cuda_accum_variants(&expert_outputs, weights, moe_latent, n_expert_used)?;
+            k3_report_vector_exact(
+                "identical-vectors CPU-F32/current-host",
+                &cpu_f32,
+                &current_host,
+            );
+            k3_report_vector_exact(
+                "identical-vectors CPU-F32/F64-reference",
+                &cpu_f32,
+                &cpu_f64,
+            );
+            k3_report_vector_exact(
+                "identical-vectors current-host/CUDA-serial",
+                &current_host,
+                &serial,
+            );
+            k3_report_vector_exact("identical-vectors CPU-F64/CUDA-serial", &cpu_f64, &serial);
+            k3_report_vector_exact(
+                "identical-vectors CPU-F64/CUDA-serial-nofma",
+                &cpu_f64,
+                &nofma,
+            );
         }
         rt.latent_normed.write(0, kernels::as_bytes(&moe_acc))?;
 
@@ -2171,6 +2507,8 @@ impl Model {
                 return Err(format!("K3 layer {il}: expected KimiK3 weights").into());
             };
 
+            k3_dump_device(pos0, "layer", il, "residual_input", &st.cur, n_embd)?;
+
             // ── AttnRes pre-attention mixture ────────────────────────────
             let input_t0 = std::time::Instant::now();
             // h = (bank empty) ? prefix : attn_res_mix(prefix, bank, attn_res_norm, attn_res_proj)
@@ -2180,6 +2518,7 @@ impl Model {
                 // Copy mixed result to cur for attention input
                 kernels::copy_d2d(&mut st.cur, 0, mixed, 0, n_embd as usize * 4)?;
             }
+            k3_dump_device(pos0, "layer", il, "norm_input", &st.cur, n_embd)?;
 
             // ── Snapshot every attn_res_block_size layers ─────────────────
             let snapshot = il % res_block == 0;
@@ -2193,6 +2532,7 @@ impl Model {
 
             // ── attn_norm ─────────────────────────────────────────────────
             kernels::rms_norm(&mut st.normed, &st.cur, &k3w.attn_norm, n_embd, 1, eps)?;
+            k3_dump_device(pos0, "layer", il, "norm_output", &st.normed, n_embd)?;
             layer_prof.input_residual_norm = input_t0.elapsed();
 
             // ── Attention (KDA or MLA) ────────────────────────────────────
@@ -2206,7 +2546,7 @@ impl Model {
             };
             match k3w.kind {
                 K3LayerKind::Kda => {
-                    self.kda_layer_forward(rt, &st.normed, k3w, il, eps)?;
+                    self.kda_layer_forward(rt, &st.normed, k3w, il, pos0, eps)?;
                 }
                 K3LayerKind::Mla => {
                     let dims = K3MlaDims {
@@ -2276,6 +2616,14 @@ impl Model {
                     .map_err(|e| format!("K3 layer {il} attention block sync: {e}").into());
                 sync_result?;
             }
+            k3_dump_device(
+                pos0,
+                "layer",
+                il,
+                "attention_output_before_residual",
+                &rt.attn_out,
+                n_embd,
+            )?;
 
             // ── Residual update (attention) ──────────────────────────────
             let residual_t0 = std::time::Instant::now();
@@ -2287,6 +2635,14 @@ impl Model {
                 // prefix += attn_out
                 kernels::add_assign(&mut st.cur, &rt.attn_out, n_embd)?;
             }
+            k3_dump_device(
+                pos0,
+                "layer",
+                il,
+                "attention_residual_output",
+                &st.cur,
+                n_embd,
+            )?;
 
             // ── AttnRes pre-FFN mixture ───────────────────────────────────
             if rt.res_bank_len > 0 {
@@ -2297,6 +2653,7 @@ impl Model {
 
             // ── ffn_norm ──────────────────────────────────────────────────
             kernels::rms_norm(&mut rt.normed, &st.cur, &k3w.ffn_norm, n_embd, 1, eps)?;
+            k3_dump_device(pos0, "layer", il, "moe_input", &rt.normed, n_embd)?;
             layer_prof.output_residual = residual_t0.elapsed();
 
             // ── FFN (dense SiTU-GLU or latent Stable-MoE) ─────────────────
@@ -2317,6 +2674,8 @@ impl Model {
                     rt,
                     &ffn_input,
                     k3w,
+                    il,
+                    pos0,
                     Some(&mut layer_prof),
                 )?;
                 k3_dump_device(
@@ -2347,6 +2706,7 @@ impl Model {
             // ── Residual update (FFN) ────────────────────────────────────
             // prefix += ffn_out
             kernels::add_assign(&mut st.cur, &rt.ffn_out, n_embd)?;
+            k3_dump_device(pos0, "layer", il, "layer_output", &st.cur, n_embd)?;
             k3_dump_device(pos0, "layer", il, "hidden", &st.cur, n_embd)?;
             if self.k3_layer_kinds[il] == K3LayerKind::Kda {
                 for (which, state) in rt.conv_states[il].iter().enumerate() {
@@ -2541,7 +2901,7 @@ fn k3_dump_device(
     buf: &DeviceBuf,
     n: u32,
 ) -> Result {
-    if step != 0 {
+    if !k3_compare_enabled(step, layer) {
         return Ok(());
     }
     let Some(root) = std::env::var_os("PULSAR_K3_COMPARE_DIR") else {
@@ -2551,9 +2911,201 @@ fn k3_dump_device(
     let dir = std::path::PathBuf::from(root).join(backend);
     std::fs::create_dir_all(&dir)?;
     let values = buf.read_f32(n as usize)?;
-    let path = dir.join(format!("{kind}_{layer:03}_{name}.f32"));
-    std::fs::write(path, kernels::as_bytes(&values))?;
+    k3_dump_bytes(
+        &dir,
+        step,
+        kind,
+        layer,
+        name,
+        "f32",
+        &format!("[{n}]"),
+        kernels::as_bytes(&values),
+        "f32",
+    )?;
     Ok(())
+}
+
+fn k3_dump_host_f32(step: u32, kind: &str, layer: usize, name: &str, values: &[f32]) -> Result {
+    if !k3_compare_enabled(step, layer) {
+        return Ok(());
+    }
+    let Some(root) = std::env::var_os("PULSAR_K3_COMPARE_DIR") else {
+        return Ok(());
+    };
+    let backend = k3_expert_backend();
+    let dir = std::path::PathBuf::from(root).join(backend);
+    std::fs::create_dir_all(&dir)?;
+    k3_dump_bytes(
+        &dir,
+        step,
+        kind,
+        layer,
+        name,
+        "f32",
+        &format!("[{}]", values.len()),
+        kernels::as_bytes(values),
+        "f32",
+    )?;
+    Ok(())
+}
+
+fn k3_dump_i32(step: u32, kind: &str, layer: usize, name: &str, values: &[i32]) -> Result {
+    if !k3_compare_enabled(step, layer) {
+        return Ok(());
+    }
+    let Some(root) = std::env::var_os("PULSAR_K3_COMPARE_DIR") else {
+        return Ok(());
+    };
+    let backend = k3_expert_backend();
+    let dir = std::path::PathBuf::from(root).join(backend);
+    std::fs::create_dir_all(&dir)?;
+    k3_dump_bytes(
+        &dir,
+        step,
+        kind,
+        layer,
+        name,
+        "i32",
+        &format!("[{}]", values.len()),
+        kernels::as_bytes(values),
+        "i32",
+    )?;
+    Ok(())
+}
+
+fn k3_compare_enabled(step: u32, layer: usize) -> bool {
+    if step != 0 {
+        return false;
+    }
+    let Ok(layers) = std::env::var("PULSAR_K3_COMPARE_LAYERS") else {
+        return true;
+    };
+    layers
+        .split(',')
+        .filter_map(|value| value.trim().parse::<usize>().ok())
+        .any(|value| value == layer)
+}
+
+fn k3_dump_bytes(
+    dir: &std::path::Path,
+    step: u32,
+    kind: &str,
+    layer: usize,
+    name: &str,
+    extension: &str,
+    shape: &str,
+    bytes: &[u8],
+    dtype: &str,
+) -> Result {
+    let file_name = format!("{kind}_{layer:03}_{name}.{extension}");
+    let path = dir.join(&file_name);
+    std::fs::write(&path, bytes)?;
+    let state_slot = if kind == "kda_state" {
+        if name.starts_with("recurrent") {
+            "ssm"
+        } else {
+            name.strip_prefix("conv_").unwrap_or("unknown")
+        }
+    } else {
+        "none"
+    };
+    let manifest = format!(
+        "{{\"backend\":\"{}\",\"layer\":{},\"operation\":\"{}\",\"shape\":{},\"token_position\":{},\"state_slot\":\"{}\",\"dtype\":\"{}\",\"quantization\":\"{}\",\"file\":\"{}\"}}\n",
+        k3_expert_backend(), layer, name, shape, step, state_slot, dtype, dtype, file_name
+    );
+    use std::io::Write;
+    let mut manifest_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("manifest.jsonl"))?;
+    manifest_file.write_all(manifest.as_bytes())?;
+    Ok(())
+}
+
+fn k3_cuda_accum_variants(
+    expert_outputs: &[f32],
+    weights: &[f32],
+    out_dim: u32,
+    n_used: u32,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let expert_buf = DeviceBuf::from_f32(expert_outputs)?;
+    let weight_buf = DeviceBuf::from_f32(weights)?;
+    let mut serial_buf = DeviceBuf::alloc(out_dim as usize * 4)?;
+    let mut nofma_buf = DeviceBuf::alloc(out_dim as usize * 4)?;
+    kernels::moe_accum_serial(
+        &mut serial_buf,
+        &expert_buf,
+        &weight_buf,
+        out_dim,
+        n_used,
+        false,
+    )?;
+    kernels::moe_accum_serial(
+        &mut nofma_buf,
+        &expert_buf,
+        &weight_buf,
+        out_dim,
+        n_used,
+        true,
+    )?;
+    let serial = serial_buf.read_f32(out_dim as usize)?;
+    let nofma = nofma_buf.read_f32(out_dim as usize)?;
+    Ok((serial, nofma))
+}
+
+fn k3_report_accum_progression(rank: usize, expert: i32, weight: f32, cpu: &[f32], cuda: &[f32]) {
+    let (max, mean, rms, cosine, norm_ratio, first) = k3_vector_metrics(cpu, cuda);
+    eprintln!(
+        "pulsar: K3 accum rank={rank} global_id={expert} weight={weight:.9} max={max:.6e} mean={mean:.6e} rms={rms:.6e} cosine={cosine:.9} norm_ratio={norm_ratio:.9} first_mismatch={first:?}"
+    );
+    if let Some(i) = first {
+        let start = i.saturating_sub(2);
+        let end = (i + 3).min(cpu.len()).min(cuda.len());
+        for j in start..end {
+            eprintln!(
+                "pulsar: K3 accum rank={rank} around index={j} CPU-Q8={:.9e} CUDA={:.9e}",
+                cpu[j], cuda[j]
+            );
+        }
+    }
+}
+
+fn k3_vector_metrics(a: &[f32], b: &[f32]) -> (f64, f64, f64, f64, f64, Option<usize>) {
+    let mut max = 0.0f64;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    let mut first = None;
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        let d = (x as f64 - y as f64).abs();
+        max = max.max(d);
+        sum += d;
+        sum_sq += d * d;
+        dot += x as f64 * y as f64;
+        na += x as f64 * x as f64;
+        nb += y as f64 * y as f64;
+        if first.is_none() && x.to_bits() != y.to_bits() {
+            first = Some(i);
+        }
+    }
+    let n = a.len().max(1) as f64;
+    (
+        max,
+        sum / n,
+        (sum_sq / n).sqrt(),
+        dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE),
+        (nb / na.max(f64::MIN_POSITIVE)).sqrt(),
+        first,
+    )
+}
+
+fn k3_report_vector_exact(label: &str, a: &[f32], b: &[f32]) {
+    let (max, mean, rms, cosine, norm_ratio, first) = k3_vector_metrics(a, b);
+    eprintln!(
+        "pulsar: K3 {label} max={max:.6e} mean={mean:.6e} rms={rms:.6e} cosine={cosine:.9} norm_ratio={norm_ratio:.9} first_mismatch={first:?}"
+    );
 }
 
 fn k3_report_vector(label: &str, cpu: &[f32], cuda: &[f32]) {

@@ -4375,6 +4375,44 @@ extern "C" int pulsar_add(
     return cuda_ok(cudaGetLastError(), "add launch");
 }
 
+/* Diagnostic routed-MoE accumulator. There is exactly one writer per output
+ * element; the expert loop is deliberately serial and rank ordered. The
+ * explicit round-to-nearest intrinsics keep the no-FMA variant from being
+ * contracted by nvcc's fast-math policy. */
+template <bool NOFMA>
+__global__ static void moe_accum_serial_kernel(
+        float *out, const float *expert_outputs, const float *weights,
+        uint32_t out_dim, uint32_t n_used) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_dim) return;
+    float acc = 0.0f;
+    for (uint32_t rank = 0; rank < n_used; rank++) {
+        const float value = expert_outputs[(uint64_t)rank * out_dim + i];
+        const float weighted = NOFMA
+                ? __fmul_rn(weights[rank], value)
+                : weights[rank] * value;
+        acc = NOFMA ? __fadd_rn(acc, weighted) : acc + weighted;
+    }
+    out[i] = acc;
+}
+
+extern "C" int pulsar_moe_accum_serial(
+        void *out_dev, const void *expert_outputs_dev, const void *weights_dev,
+        uint32_t out_dim, uint32_t n_used, uint32_t nofma) {
+    if (out_dim == 0 || n_used == 0) return 0;
+    const dim3 grid((out_dim + 255u) / 256u, 1, 1);
+    if (nofma) {
+        moe_accum_serial_kernel<true><<<grid, 256>>>(
+                (float *)out_dev, (const float *)expert_outputs_dev,
+                (const float *)weights_dev, out_dim, n_used);
+    } else {
+        moe_accum_serial_kernel<false><<<grid, 256>>>(
+                (float *)out_dev, (const float *)expert_outputs_dev,
+                (const float *)weights_dev, out_dim, n_used);
+    }
+    return cuda_ok(cudaGetLastError(), "moe accum serial launch");
+}
+
 __global__ static void embed_tokens_q8_0_kernel(
         float *out,                /* [n_tok][n_embd] */
         const unsigned char *w,    /* q8_0 embedding matrix base */

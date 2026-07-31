@@ -206,6 +206,14 @@ mod real {
             n_expert: u32,
         ) -> i32;
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
+        fn pulsar_moe_accum_serial(
+            out: *mut c_void,
+            expert_outputs: *const c_void,
+            weights: *const c_void,
+            out_dim: u32,
+            n_used: u32,
+            nofma: u32,
+        ) -> i32;
         fn pulsar_router_select(
             selected: *mut c_void,
             weights: *mut c_void,
@@ -2087,6 +2095,31 @@ mod real {
         check(
             unsafe { pulsar_add(o, o as *const c_void, b.ptr(), n) },
             "add_assign",
+        )
+    }
+
+    /// Debug-only rank-ordered routed-MoE accumulation. Each thread owns one
+    /// output element and walks every expert slot serially.
+    pub fn moe_accum_serial(
+        out: &mut DeviceBuf,
+        expert_outputs: &DeviceBuf,
+        weights: &DeviceBuf,
+        out_dim: u32,
+        n_used: u32,
+        nofma: bool,
+    ) -> Result {
+        check(
+            unsafe {
+                pulsar_moe_accum_serial(
+                    out.ptr_mut(),
+                    expert_outputs.ptr(),
+                    weights.ptr(),
+                    out_dim,
+                    n_used,
+                    u32::from(nofma),
+                )
+            },
+            "moe_accum_serial",
         )
     }
 
