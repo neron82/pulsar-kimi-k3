@@ -3285,7 +3285,29 @@ fn k3_dump_i32(step: u32, kind: &str, layer: usize, name: &str, values: &[i32]) 
 }
 
 fn k3_compare_active(step: u32, layer: usize) -> bool {
-    std::env::var_os("PULSAR_K3_COMPARE_DIR").is_some() && k3_compare_enabled(step, layer)
+    std::env::var_os("PULSAR_K3_COMPARE_DIR").is_some()
+        && k3_compare_enabled(step, layer)
+        && k3_compare_backend_enabled()
+}
+
+fn k3_compare_backend_enabled() -> bool {
+    let backend = k3_expert_backend();
+    std::env::var("PULSAR_K3_COMPARE_BACKENDS")
+        .ok()
+        .map(|backends| backends.split(',').any(|value| value.trim() == backend))
+        .unwrap_or(true)
+}
+
+fn k3_compare_operation_enabled(operation: &str) -> bool {
+    std::env::var("PULSAR_K3_COMPARE_OPERATIONS")
+        .ok()
+        .map(|operations| {
+            operations
+                .split(',')
+                .map(str::trim)
+                .any(|value| value == "*" || value == operation)
+        })
+        .unwrap_or(true)
 }
 
 fn k3_compare_expert(rank: usize, expert: i32) -> bool {
@@ -3339,14 +3361,16 @@ fn k3_dump_expert_bytes(
     dtype: &str,
     source: &str,
 ) -> Result {
-    if !k3_compare_active(step, layer) {
+    if !k3_compare_active(step, layer) || !k3_compare_operation_enabled(name) {
         return Ok(());
     }
     let root = std::env::var_os("PULSAR_K3_COMPARE_DIR").ok_or("comparison directory missing")?;
     let backend = k3_expert_backend();
     let dir = std::path::PathBuf::from(root).join(backend);
     std::fs::create_dir_all(&dir)?;
-    let file_name = format!("{name}.bin");
+    // Captures span multiple layers; coordinates prevent later layers from
+    // overwriting an earlier packed artifact.
+    let file_name = format!("layer_{layer:03}_token_{step:03}_{name}.bin");
     std::fs::write(dir.join(&file_name), bytes)?;
     use std::io::Write;
     let mut manifest = std::fs::OpenOptions::new()
@@ -3430,6 +3454,9 @@ fn k3_dump_bytes(
     bytes: &[u8],
     dtype: &str,
 ) -> Result {
+    if !k3_compare_operation_enabled(name) {
+        return Ok(());
+    }
     let file_name = format!("{kind}_{layer:03}_{name}.{extension}");
     let path = dir.join(&file_name);
     std::fs::write(&path, bytes)?;
@@ -4054,6 +4081,15 @@ mod tests {
     }
 
     #[test]
+    fn test_k3_mla_nope_keeps_unrotated_tail() {
+        let dims = K3MlaDims::canonical();
+        assert_eq!(dims.qk_nope, 128);
+        assert_eq!(dims.qk_rope, 64);
+        assert_eq!(dims.qk_dim(), 192);
+        assert_eq!(dims.kv_a_out(), 576);
+    }
+
+    #[test]
     fn test_k3_safe_gate_lower_bound() {
         let gate_lower_bound: f32 = -5.0;
         assert!((gate_lower_bound + 5.0).abs() < f32::EPSILON);
@@ -4158,7 +4194,8 @@ mod tests {
         let f_a: Vec<f32> = (0..head_dim).map(|i| (i as f32) * 0.5).collect();
         let f_b: Vec<f32> = (0..d_inner).map(|i| (i as f32) * 0.1).collect();
         let dt_bias: Vec<f32> = vec![0.1; d_inner];
-        let a_log: Vec<f32> = (0..n_head).map(|i| 1.0 + i as f32 * 0.5).collect();
+        // The converter folds A_log as A = -exp(A_log).
+        let a_folded: Vec<f32> = (0..n_head).map(|i| -(1.0 + i as f32 * 0.5).exp()).collect();
 
         // g_raw = f_a @ f_b + dt_bias (simplified: just use f_b directly)
         let mut g_raw: Vec<f32> = f_b.clone();
@@ -4166,11 +4203,12 @@ mod tests {
             g_raw[i] += dt_bias[i];
         }
 
-        // Apply A per head
+        // Apply exp(A_log) = -A per head before the sigmoid. This is the
+        // K3 lower-bound gate used by llama.cpp.
         for h in 0..n_head {
             for d in 0..head_dim {
                 let idx = h * head_dim + d;
-                g_raw[idx] *= a_log[h];
+                g_raw[idx] *= -a_folded[h];
             }
         }
 

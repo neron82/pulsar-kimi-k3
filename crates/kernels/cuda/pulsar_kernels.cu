@@ -1283,9 +1283,12 @@ __global__ static void q8_K_quantize_kernel(block_q8_K *out, const float *x, uin
     }
     __syncthreads();
     if (tid < PULSAR_QK_K) {
-        int qv = tid < bn ? (int)lrintf(iscale_s * xr[tid]) : 0;
+        /* Rust f32::round, used by CPU-Q8, rounds half-way values away from
+         * zero.  lrintf is round-to-nearest-even under the default mode. */
+        int qv = tid < bn ? (int)roundf(iscale_s * xr[tid]) : 0;
         if (qv > 127) qv = 127;
-        if (qv < -128) qv = -128;
+        /* CPU-Q8's canonical q8_K range is symmetric: [-127, 127]. */
+        if (qv < -127) qv = -127;
         yb->qs[tid] = (int8_t)qv;
     }
     __syncthreads();
@@ -3737,10 +3740,9 @@ static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
     }
 }
 
-/* GPU q8_K quantizer vs the host mirror. Not bit-exact: both pulsar and
- * ds4 build with --use_fast_math, so device division is approximate; allow
- * +-1 on quants at rounding boundaries and last-ulp scale drift, and check
- * bsums are self-consistent with the GPU quants. */
+/* GPU q8_K quantizer vs the host mirror. The real-valued inputs are chosen
+ * away from half-way rounding boundaries, so the canonical representation
+ * must be byte-identical. */
 static int q8_K_quantize_selftest(void) {
     const uint32_t in_dim = 512, n_rows = 5;
     const uint32_t blocks = in_dim / PULSAR_QK_K;
@@ -3765,11 +3767,11 @@ static int q8_K_quantize_selftest(void) {
             const block_q8_K *r = &ref[bi], *g = &gpu[bi];
             const float dr = fabsf(g->d - r->d) / fmaxf(fabsf(r->d), 1e-30f);
             if (dr > d_maxrel) d_maxrel = dr;
-            ok = dr <= 4e-7f;
+            ok = dr == 0.0f;
             for (uint32_t i = 0; i < PULSAR_QK_K && ok; i++) {
                 const int diff = abs((int)g->qs[i] - (int)r->qs[i]);
                 if (diff > 0) q_off++;
-                ok = diff <= 1;
+                ok = diff == 0;
             }
             for (uint32_t j = 0; j < PULSAR_QK_K / 16 && ok; j++) {
                 int sum = 0;

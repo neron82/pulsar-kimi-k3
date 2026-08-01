@@ -26,7 +26,16 @@ fn main() {
         .map(|value| value.split(',').map(str::to_owned).collect())
         .unwrap_or_else(|_| default_archs());
     let mut build = cc::Build::new();
-    build.cuda(true).flag("-O3").flag("--use_fast_math");
+    // CPU-Q8 uses ordinary IEEE f32 division, sqrt, and non-contracted
+    // scalar arithmetic at its quantization boundaries.  Fast-math changes
+    // scales and nonlinear controls enough to alter packed activations and
+    // recurrent state, so keep production CUDA arithmetic precise.
+    build
+        .cuda(true)
+        .flag("-O3")
+        .flag("--fmad=false")
+        .flag("--prec-div=true")
+        .flag("--prec-sqrt=true");
     // nvcc rejects host compilers newer than its toolkit supports (e.g.
     // CUDA 12.0 caps at gcc 12 while distro c++ is gcc 13). Probe a tiny
     // compile with candidate ccbins and take the first one nvcc accepts.

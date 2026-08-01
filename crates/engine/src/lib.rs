@@ -444,7 +444,11 @@ mod real {
                 s.n_expert_shared = u("expert_shared_count").unwrap_or(2);
                 s.n_lora_q = u("attention.q_lora_rank").unwrap_or(1536);
                 s.n_kv_lora = u("attention.kv_lora_rank").unwrap_or(512);
-                s.qk_rope = 0; // K3 MLA is NoPE; no rotary sub-dimension.
+                // K3 disables the rotary operation, but it still retains the
+                // 64-wide unrotated tail in every MLA query/key.  The tail is
+                // part of the learned attention geometry and is present in
+                // attn_kv_a_mqa (512 + 64), so NoPE must not mean zero width.
+                s.qk_rope = u("rope.dimension_count").unwrap_or(64);
                 let qk_mla = u("attention.key_length_mla").unwrap_or(192);
                 s.qk_nope = qk_mla.saturating_sub(s.qk_rope);
                 s.value_mla = u("attention.value_length_mla").unwrap_or(128);

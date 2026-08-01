@@ -23,13 +23,13 @@ pub struct Q8KRow {
     pub bsums: Vec<i32>,
 }
 
-/// ggml quantize_row_q8_K: d = amax/127, q = round(x/d).
+/// ggml quantize_row_q8_K: d = amax/127, q = round(x/d). The stored row is
+/// padded to complete 256-value blocks, matching the packed CUDA layout.
 pub fn quantize_row_q8_k(x: &[f32]) -> Q8KRow {
-    debug_assert_eq!(x.len() % QK_K, 0);
-    let nb = x.len() / QK_K;
+    let nb = x.len().div_ceil(QK_K);
     let mut d = Vec::with_capacity(nb);
     let mut qs: Vec<i8> = Vec::with_capacity(x.len());
-    for b in x.chunks_exact(QK_K) {
+    for b in x.chunks(QK_K) {
         let amax = b.iter().fold(0f32, |a, &v| a.max(v.abs()));
         if amax == 0.0 {
             d.push(0.0);
@@ -42,6 +42,7 @@ pub fn quantize_row_q8_k(x: &[f32]) -> Q8KRow {
         for &v in b {
             qs.push((v * inv).round().clamp(-127.0, 127.0) as i8);
         }
+        qs.extend(std::iter::repeat(0i8).take(QK_K - b.len()));
     }
     let bsums = qs
         .chunks_exact(16)
@@ -807,6 +808,51 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((*state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    #[test]
+    fn q8_k_uses_positive_symmetric_scale_and_canonical_range() {
+        let mut values = vec![0.0f32; QK_K];
+        values[3] = -1.0;
+        values[17] = 0.5;
+        let q = quantize_row_q8_k(&values);
+        assert_eq!(q.d[0].to_bits(), (1.0f32 / 127.0).to_bits());
+        assert_eq!(q.qs[3], -127);
+        assert_eq!(q.qs[17], 64);
+
+        values.fill(0.0);
+        values[7] = 1.0;
+        let q = quantize_row_q8_k(&values);
+        assert_eq!(q.d[0].to_bits(), (1.0f32 / 127.0).to_bits());
+        assert_eq!(q.qs[7], 127);
+
+        values.fill(0.0);
+        let q = quantize_row_q8_k(&values);
+        assert_eq!(q.d[0], 0.0);
+        assert!(q.qs.iter().all(|&v| v == 0));
+        assert!(q.bsums.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn q8_k_rounds_half_away_from_zero() {
+        let mut values = vec![0.0f32; QK_K];
+        values[0] = 1.0;
+        values[1] = 0.5;
+        values[2] = -0.5;
+        let q = quantize_row_q8_k(&values);
+        assert_eq!(q.qs[0], 127);
+        assert_eq!(q.qs[1], 64);
+        assert_eq!(q.qs[2], -64);
+    }
+
+    #[test]
+    fn q8_k_pads_partial_final_block() {
+        let values = vec![0.25f32; QK_K + 3];
+        let q = quantize_row_q8_k(&values);
+        assert_eq!(q.d.len(), 2);
+        assert_eq!(q.qs.len(), 2 * QK_K);
+        assert!(q.qs[QK_K + 3..].iter().all(|&v| v == 0));
+        assert!(q.bsums.len() == 2 * QK_K / 16);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 """Compare opt-in PULSAR_K3_COMPARE_DIR snapshots from three K3 runs."""
 import math
 import hashlib
+import json
 import struct
 import sys
 from pathlib import Path
@@ -74,14 +75,36 @@ def expert_report(root):
         print(f"{name}:")
         exact_fmt("  CPU-Q8 vs CUDA", load(cpu[name]), load(cuda[name]))
 
-    for cpu_path in dirs["cpu-q8"].glob("*.bin"):
-        cuda_name = cpu_path.name.replace("cpu_q8_", "cuda_", 1)
-        cuda_path = dirs["cuda"] / cuda_name
-        if not cuda_path.exists():
-            continue
-        left, right = cpu_path.read_bytes(), cuda_path.read_bytes()
+    def packed_manifest(backend):
+        result = {}
+        path = dirs[backend] / "manifest.jsonl"
+        if not path.exists():
+            return result
+        for line in path.read_text().splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if item.get("dtype") == "packed" or item.get("packed_bytes", 0) > 0:
+                operation = item.get("operation", "")
+                for prefix in ("cpu_q8_", "cuda_"):
+                    if operation.startswith(prefix):
+                        operation = operation[len(prefix):]
+                        break
+                key = (item.get("layer"), item.get("token_position"),
+                       operation, item.get("expert_rank"),
+                       item.get("global_expert_id"), item.get("local_staging_slot"))
+                result[key] = item
+        return result
+
+    cpu_packed = packed_manifest("cpu-q8")
+    cuda_packed = packed_manifest("cuda")
+    for key in sorted(cpu_packed.keys() & cuda_packed.keys()):
+        cpu_item, cuda_item = cpu_packed[key], cuda_packed[key]
+        left = (dirs["cpu-q8"] / cpu_item["file"]).read_bytes()
+        right = (dirs["cuda"] / cuda_item["file"]).read_bytes()
         first = next((i for i, (x, y) in enumerate(zip(left, right)) if x != y), None)
-        print(f"{cpu_path.name}: bytes={len(left)} "
+        print(f"{key}: bytes={len(left)} "
               f"sha256_cpu={hashlib.sha256(left).hexdigest()} "
               f"sha256_cuda={hashlib.sha256(right).hexdigest()} "
               f"differing={sum(x != y for x, y in zip(left, right))} "
