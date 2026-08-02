@@ -44,11 +44,11 @@ Only the following are material to K3 mathematics or GGUF semantics:
 |---|---|---|---|---|
 | `src/models/kimi-k3.cpp:17-162` | `load_arch_hparams`, `load_arch_tensors` | K3 metadata and tensor shapes | `crates/engine/src/lib.rs:264-459,3231-3405` | Match after MLA tail fix; Pulsar supports the existing `moe_latent_size` GGUF alias |
 | `src/models/kimi-k3.cpp:175-183` | `kimi_k3_situ` | Exact SiTU formula | `crates/kernels/cuda/pulsar_kernels.cu:4913-4928`, host path `kimi_k3.rs:1796-1805` | Match |
-| `src/models/kimi-k3.cpp:190-247` | `res_push`, `res_stack`, `res_mix` | Attention Residual scoring and weighted retrieval | `kimi_k3.rs:693-793,2806-3074` | Match, with expected host/device precision difference |
-| `src/models/kimi-k3.cpp:291-343` | K3 layer graph | Layer ordering, checkpoint restart, residual updates | `kimi_k3.rs:2784-3003` | Match |
+| `src/models/kimi-k3.cpp:190-247` | `res_push`, `res_stack`, `res_mix` | Attention Residual scoring and weighted retrieval | `kimi_k3.rs` AttnRes helpers and layer loop | Corrected: retrieval feeds sublayers without replacing the raw residual; bank resets per token |
+| `src/models/kimi-k3.cpp:291-343` | K3 layer graph | Layer ordering, checkpoint restart, residual updates | `kimi_k3.rs` K3 layer loop | Corrected residual and sequence-reset semantics |
 | `src/models/kimi-k3.cpp:373-406` | `kimi_k3_conv1d` | Conv state layout and causal tap order | `kimi_k3.rs:876-1046`, `pulsar_kernels.cu:4178-4233` | Equivalent implementation |
-| `src/models/kimi-k3.cpp:408-495` | `build_kda_layer` | KDA gate, beta, delta state, output gate | `kimi_k3.rs:1048-1207` | One defect fixed: folded `ssm_a` sign |
-| `src/models/kimi-k3.cpp:502-579` | `build_mla_layer` | MLA Q/K/V, absorbed attention, gate and output | `kimi_k3.rs:539-690` | One defect fixed: preserve 64-wide unrotated tail |
+| `src/models/kimi-k3.cpp:408-495` | `build_kda_layer` | KDA gate, beta, delta state, output gate | `kimi_k3.rs` KDA forward | Corrected folded-sign compatibility, `1e-12` Q/K L2 epsilon, and per-head output RMSNorm |
+| `src/models/kimi-k3.cpp:502-579` | `build_mla_layer` | MLA Q/K/V, absorbed causal attention, gate and output | `kimi_k3.rs` MLA forward and `pulsar_k3_mla_cached_attn_split` | Corrected 64-wide tail and compact causal history for split weights |
 | `src/models/kimi-k3.cpp:587-635` | `build_latent_moe` | Latent projection, router, experts, norm/up, shared path | `kimi_k3.rs:1259-1694` | Match |
 | `src/llama-graph.cpp:1810-2100` | `build_moe_ffn` | Sigmoid scoring, bias selection, top-k, normalization, weighted down output | `pulsar_kernels.cu:4944-5055`, `kimi_k3.rs:1367-1378,2039-2091` | Match |
 | `conversion/kimi_k3.py:201-262` | `set_gguf_parameters` | Converter metadata contract | `Shape::from_gguf` and `crates/gguf/src/lib.rs` | PR names latent field `expert_latent_length`; existing model uses `moe_latent_size` |
@@ -82,7 +82,7 @@ for layer il = 0..92:
         g_raw = f_b(f_a(a)) + dt_bias
         g = -5 * sigmoid(exp(A_log) * g_raw)       # K3 lower-bound form
         beta = sigmoid(a @ W_beta)
-        q = L2Norm(q, eps); k = L2Norm(k, eps)
+        q = L2Norm(q, 1e-12); k = L2Norm(k, 1e-12)
         attn = delta_rule(q, k, v, g, beta, ssm_state)
         gated = RMSNorm(attn, o_norm) * sigmoid(a @ W_full_gate)
         attn_out = gated @ W_o
@@ -94,7 +94,8 @@ for layer il = 0..92:
         q = [q_nope(128), q_tail(64)]
         k = [absorbed_k_nope(kv), k_tail]
         v = kv
-        attn = causal_attention(q, k, v, scale=1/sqrt(192))
+        cache.append(RMSNorm(kv_raw[:512]), k_tail)
+        attn = causal_attention(q, cache, scale=1/sqrt(192))
         attn_out = (attn * sigmoid(a @ W_mla_gate)) @ W_o
 
     prefix = attn_out if checkpoint else prefix + attn_out
@@ -140,7 +141,7 @@ for il:
     prefix = st.cur
     retrieve AttnRes from raw bank + prefix using normalized scores
     snapshot raw prefix at il = 0, 12, 24, ...
-    RMSNorm -> KDA or MLA
+    RMSNorm -> KDA or compact-cache split-weight MLA
     checkpoint ? st.cur = attention_out : st.cur += attention_out
     retrieve FFN AttnRes
     RMSNorm
@@ -153,8 +154,9 @@ for il:
 final AttnRes -> output RMSNorm -> output head
 ```
 
-The CPU-Q8 and CUDA expert paths differ only in quantization and accumulation
-precision. Both preserve route weights after expert down projection.
+The CPU-Q8 and CUDA expert paths share the corrected attention, recurrent, and
+residual graph. They differ in expert quantization and accumulation precision.
+Both preserve route weights after expert down projection.
 
 ## Metadata Comparison
 
@@ -229,11 +231,13 @@ ID order, matching Pulsar's `abs_offset + expert_id * expert_bytes` mapping.
 | AttnRes score | RMSNorm row, multiply fused score, sum | same host formula | same host formula | equivalent |
 | AttnRes weighting | softmax over bank plus current; raw rows weighted | same | same | equivalent |
 | Conv | causal `ssm_conv`, then SiLU | `sconv` gives `x+conv`, subtract x, then SiLU | same | equivalent expression |
-| KDA decay | `A=-exp(A_log)`, then sigmoid(-A*g_raw), times -5 | now uses `-A*g_raw`, sigmoid, times -5 | same | corrected semantic defect |
+| KDA decay | positive `exp(A_log)` magnitude in bounded gate | uses `abs(ssm_a)` to accept both persisted folded-sign conventions | same | corrected semantic defect |
+| KDA Q/K norm | per-head L2 norm, epsilon `1e-12` | same | same | corrected semantic defect |
 | KDA delta update | decay state, `d=(v-S*k)*beta`, rank-1 update, output `S*q/sqrt(dim)` | same | same | equivalent |
-| KDA output | RMSNorm per head, sigmoid full gate, output projection | same | same | equivalent |
+| KDA output | RMSNorm per 128-wide head, sigmoid full gate, output projection | same | same | corrected semantic defect |
 | MLA scale | `1/sqrt(192)` | same | same | equivalent |
-| MLA tail | 64 learned unrotated coordinates included in Q/K | now preserved | now preserved | corrected semantic defect |
+| MLA tail | 64 learned unrotated coordinates included in Q/K | preserved | preserved | corrected semantic defect |
+| MLA history | compact causal KV history | cached latent and tail for split weights | same CUDA kernel | corrected semantic defect |
 | MLA gate | sigmoid of normalized-input projection before output projection | same | same | equivalent |
 | Router | sigmoid logits; bias affects selection only | same | same | equivalent |
 | Top-k | top 16, deterministic lower-ID tie break | same selection kernel | same selection kernel | equivalent |
@@ -268,6 +272,16 @@ ID order, matching Pulsar's `abs_offset + expert_id * expert_bytes` mapping.
    a CPU-only configuration but rejects the existing GGUF before graph build
    because of the latent metadata name. A temporary source alias was not
    introduced, so no external token or snapshot is claimed.
+6. **Genuine AttnRes semantic discrepancy, fixed:** retrieval had overwritten
+   the raw residual stream and the checkpoint bank survived across token
+   positions. Retrieval now only feeds the sublayer and the bank is rebuilt
+   through layer depth for every token.
+7. **Genuine MLA semantic discrepancy, fixed for split weights:** Pulsar had
+   computed only current-token attention. It now stores and consumes compact
+   causal latent/tail caches. Fused `wkv_b` remains fail-closed until it has a
+   cache-aware implementation.
+8. **Genuine KDA normalization discrepancies, fixed:** Q/K L2 epsilon is
+   `1e-12`, and output RMSNorm is independent for each 128-wide head.
 
 ## Dynamic Attempt
 
@@ -297,12 +311,12 @@ the static reference result or the exact-GGUF incompatibility.
 - No three-way llama.cpp/Pulsar tensor snapshot is possible until the PR
   loader accepts the existing `moe_latent_size` metadata alias or a compatible
   GGUF is supplied.
-- Full Pulsar CPU-Q8/CUDA reruns after these two fixes are complete and stable:
-  CPU-Q8 emits token `51960` twice, while CUDA emits token `3592` twice under
-  the required deterministic invocation. The first material focused
-  CPU-Q8/CUDA divergence is layer 3 hidden output (RMS `3.42e-4`, cosine
-  `0.999978047`); layer 1 remains at RMS `1.81e-9` and layer 2 at RMS
-  `8.06e-6`.
-- The next debugging target is the layer-3 path. Differences should continue
-  to be separated into Q8_K activation boundaries, Q2/Q3 dot accumulation,
-  and graph semantics before changing kernels. CUDA remains opt-in.
+- The old CPU-Q8 token `51960` and CUDA token `3592` comparison predates the
+  residual, cache, KDA, state-reset, and XTML corrections. It remains useful
+  historical evidence but is not an oracle for the corrected graph.
+- Corrected CPU-Q8 generated `Paris`; corrected CUDA passed the seven-prompt
+  behavioral suite in `BEHAVIOURAL_VALIDATION.md`. Exact layerwise
+  CPU-Q8/CUDA numerical parity has not been re-established, so CUDA remains
+  opt-in.
+- Fused `wkv_b` MLA is not cache-aware and is rejected explicitly. The tested
+  Q2_K checkpoint uses split `wk_b`/`wv_b` tensors.

@@ -310,7 +310,6 @@ pub struct KimiK3Rt {
     /// AttnRes snapshot bank: up to ceil(n_layer / attn_res_block_size) rows
     /// of [n_embd] f32 each, stored as a flat DeviceBuf.
     pub res_bank: DeviceBuf,
-    pub res_bank_cap: u32,
     pub res_bank_len: u32,
     /// Scratch: normed input for the attention path
     pub normed: DeviceBuf,
@@ -326,8 +325,6 @@ pub struct KimiK3Rt {
     pub moe_out: DeviceBuf,
     /// Scratch: shared expert output
     pub shexp_out: DeviceBuf,
-    /// Scratch: AttnRes mixture scores
-    pub mix_scores: DeviceBuf,
     /// Scratch: AttnRes mixture output
     pub mix_out: DeviceBuf,
     /// Scratch: KDA safe gate intermediate (f_a output)
@@ -443,7 +440,6 @@ impl KimiK3Rt {
         let mla_q = n_head * qk_dim.max(s.value_mla as usize);
         let mla_gate = n_head * s.value_mla as usize;
         let mla_kv = n_head * (qk_dim + s.value_mla as usize);
-        let max_hidden_or = |n: usize| n.max(n_embd).max(mla_gate);
         let moe_latent = s.moe_latent_size.max(1) as usize;
         let n_ff_dense = s.n_ff_dense.max(1) as usize;
         let n_ff_exp = s.n_ff_exp.max(1) as usize;
@@ -454,7 +450,6 @@ impl KimiK3Rt {
             conv_states,
             ssm_states,
             res_bank,
-            res_bank_cap: res_bank_cap as u32,
             res_bank_len: 0,
             normed: f32s(mb * n_embd)?,
             attn_out: f32s(mb * n_embd.max(mla_q))?,
@@ -463,7 +458,6 @@ impl KimiK3Rt {
             latent: f32s(mb * moe_latent.max(s.n_kv_lora as usize))?,
             moe_out: f32s(mb * n_embd.max(moe_latent).max(s.qk_rope as usize))?,
             shexp_out: f32s(mb * n_embd.max(mla_gate))?,
-            mix_scores: f32s(mb * res_bank_cap.max(mla_kv))?,
             mix_out: f32s(mb * n_embd.max(mla_gate))?,
             kda_f_a: f32s(mb * kda_hd)?,
             kda_g_raw: f32s(mb * d_inner)?,
@@ -523,14 +517,14 @@ impl KimiK3Rt {
 // ── Forward implementation ─────────────────────────────────────────────────
 
 impl Model {
-    /// K3 gated MLA single-token forward (no cache, no RoPE).
+    /// K3 gated MLA single-token forward with compact causal cache and NoPE.
     ///
     /// Computes the full gated MLA primitive for one token:
     ///   1. Q = q_b(rms_norm(q_a(x)))  (low-rank Q projection)
     ///   2. kv_cmpr_pe = x @ wkv_a_mqa  (KV compression)
     ///   3. kv_cmpr = kv_cmpr_pe[:kv_lora_rank], k_pe = kv_cmpr_pe[kv_lora_rank:]
     ///   4. kv_cmpr = rms_norm(kv_cmpr, kv_a_norm)
-    ///   5. Absorbed attention (split or fused path)
+    ///   5. Cache-aware absorbed attention (split-weight path)
     ///   6. gate = sigmoid(x @ wqkv_gate)
     ///   7. out = (attn * gate) @ wo
     ///
@@ -550,6 +544,11 @@ impl Model {
         mla_wkv_b: Option<&K3DenseWeight>, // [kv_lora_rank, n_head * (qk_nope + v_mla)] K3DenseWeight (fused path)
         mla_wqkv_gate: &K3DenseWeight,     // [n_embd, n_head * v_mla] K3DenseWeight
         mla_wo: &K3DenseWeight,            // [n_head * v_mla, n_embd] K3DenseWeight
+        kv_lora_cache: &mut DeviceBuf,     // [ctx, kv_lora_rank] f32
+        k_tail_cache: &mut DeviceBuf,      // [ctx, qk_rope] f32
+        qk_low: &mut DeviceBuf,            // [n_head, kv_lora_rank] f32
+        pos: u32,
+        ctx: u32,
         dims: &K3MlaDims,
         eps: f32,
     ) -> Result {
@@ -606,18 +605,37 @@ impl Model {
         // 4. RMSNorm kv_cmpr
         kernels::rms_norm_inplace(kv_cmpr, mla_kv_a_norm, kv_lora_rank, 1, eps)?;
 
-        // 5. Absorbed attention
+        if pos >= ctx {
+            return Err(format!("K3 MLA position {pos} exceeds context {ctx}").into());
+        }
+
+        // Store the normalized latent and unrotated tail for this position.
+        kernels::mla_store_compact_kv(
+            kv_lora_cache,
+            k_tail_cache,
+            kv_cmpr,
+            kv_pe,
+            pos,
+            1,
+            ctx,
+            kv_a_out,
+            kv_lora_rank,
+            qk_rope,
+        )?;
+
+        // 5. Absorbed causal attention
         match (mla_wk_b, mla_wv_b, mla_wkv_b) {
             (Some(wk_b), Some(wv_b), _) => {
-                // Split k_b/v_b path: loader provides explicitly dequantized
-                // F32 buffers for the custom 3D layout.
-                kernels::k3_mla_absorbed_attn_split(
+                kernels::k3_mla_cached_attn_split(
                     attn,
+                    qk_low,
                     q_full,
-                    kv_cmpr,
-                    k_pe,
+                    kv_lora_cache,
+                    k_tail_cache,
                     wk_b,
                     wv_b,
+                    pos + 1,
+                    ctx,
                     n_head,
                     qk_nope,
                     qk_rope,
@@ -627,24 +645,8 @@ impl Model {
                 )?;
             }
             (_, _, Some(wkv_b)) => {
-                // Fused wkv_b path (MLA KV cache disabled)
-                // kv = kv_cmpr @ wkv_b  [kv_lora_rank -> n_head * (qk_nope + v_mla)]
-                // wkv_b is K3DenseWeight
-                let kv_fused = &mut rt.mix_scores; // reuse mix_scores scratch
-                let kv_fused_dim = n_head * (qk_nope + v_mla);
-                wkv_b
-                    .matmul(
-                        kv_fused,
-                        kv_cmpr,
-                        &mut rt.q8k_scratch,
-                        kv_lora_rank,
-                        kv_fused_dim,
-                        1,
-                    )
-                    .map_err(|e| format!("K3 MLA wkv_b: {e}"))?;
-                kernels::k3_mla_absorbed_attn_fused(
-                    attn, q_full, kv_fused, k_pe, n_head, qk_nope, qk_rope, v_mla, scale,
-                )?;
+                let _ = wkv_b;
+                return Err("K3 MLA fused KV weights need a cache-aware implementation".into());
             }
             (None, None, None) => {
                 return Err(
@@ -1048,8 +1050,8 @@ impl Model {
         // 3. L2 norm on Q and K (per-head)
         // Reshape [d_inner] -> [n_head, kda_hd], L2 norm each head
         // Use the existing qwen35_l2_norm kernel which does per-row L2 norm
-        kernels::qwen35_l2_norm(&mut rt.kda_q_normed, n_head, kda_hd, eps)?;
-        kernels::qwen35_l2_norm(&mut rt.kda_k_normed, n_head, kda_hd, eps)?;
+        kernels::qwen35_l2_norm(&mut rt.kda_q_normed, n_head, kda_hd, 1.0e-12)?;
+        kernels::qwen35_l2_norm(&mut rt.kda_k_normed, n_head, kda_hd, 1.0e-12)?;
         k3_dump_device(step, "kda", il, "q_normed", &rt.kda_q_normed, d_inner)?;
         k3_dump_device(step, "kda", il, "k_normed", &rt.kda_k_normed, d_inner)?;
 
@@ -1065,13 +1067,19 @@ impl Model {
         for i in 0..d_inner as usize {
             g_raw_host[i] += dt_b_host[i];
         }
-        // Read A_log (exp(A_log), per head, positive)
+        // Existing K3 GGUF converters emitted both exp(A_log) and
+        // -exp(A_log). The bounded gate consumes the positive magnitude.
         let a_host = ssm_a.read_f32(n_head as usize)?;
-        // Apply A per head: g[h, d] *= A[h]
+        if il == 0 && step == 0 && std::env::var_os("PULSAR_K3_DEBUG_A").is_some() {
+            let min = a_host.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = a_host.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("pulsar: K3 loaded ssm_a range [{min:.9}, {max:.9}]");
+        }
+        // K3's bounded gate uses exp(A_log), independent of stored sign.
         for h in 0..n_head as usize {
             for d in 0..kda_hd as usize {
                 let idx = h * kda_hd as usize + d;
-                g_raw_host[idx] *= a_host[h];
+                g_raw_host[idx] *= a_host[h].abs();
             }
         }
         // sigmoid and multiply by gate_lower_bound
@@ -1137,34 +1145,15 @@ impl Model {
             sync_result?;
         }
 
-        // 8. RMSNorm(attn_out, o_norm). K3 stores o_norm per head
-        // [kda_head_dim]; expand it across heads before the elementwise kernel.
-        if ssm_o_norm.bytes() == (kda_hd as usize) * 4 && d_inner != kda_hd {
-            let head_norm = ssm_o_norm.read_f32(kda_hd as usize)?;
-            let mut expanded = Vec::with_capacity(d_inner as usize);
-            for _ in 0..n_head {
-                expanded.extend_from_slice(&head_norm);
-            }
-            let mut expanded_buf = DeviceBuf::alloc(d_inner as usize * 4)?;
-            expanded_buf.write(0, kernels::as_bytes(&expanded))?;
-            kernels::rms_norm(
-                &mut rt.kda_o_normed,
-                &rt.attn_out,
-                &expanded_buf,
-                d_inner,
-                1,
-                eps,
-            )?;
-        } else {
-            kernels::rms_norm(
-                &mut rt.kda_o_normed,
-                &rt.attn_out,
-                ssm_o_norm,
-                d_inner,
-                1,
-                eps,
-            )?;
-        }
+        // 8. RMSNorm independently over each 128-wide head.
+        kernels::rms_norm(
+            &mut rt.kda_o_normed,
+            &rt.attn_out,
+            ssm_o_norm,
+            kda_hd,
+            n_head,
+            eps,
+        )?;
         if std::env::var_os("PULSAR_DEBUG_CUDA_SYNC").is_some() {
             let sync_result: super::Result = kernels::sync()
                 .map_err(|e| format!("K3 layer {il} KDA output norm sync: {e}").into());
@@ -2659,10 +2648,17 @@ impl Model {
             return Err("empty batch".into());
         }
         if tokens.len() != 1 {
-            return Err(
-                "K3 forward: only single-token decode supported (prefill not yet implemented)"
-                    .into(),
-            );
+            let mut logits = None;
+            for (i, &token) in tokens.iter().enumerate() {
+                let last = i + 1 == tokens.len();
+                logits = self.forward_kimi_k3(
+                    st,
+                    &[token],
+                    pos0 + i as u32,
+                    if last { rows.min(1) } else { 0 },
+                )?;
+            }
+            return Ok(logits);
         }
 
         // Check CUDA is available
@@ -2678,6 +2674,12 @@ impl Model {
 
         // Get K3 runtime state
         let rt = st.kimi_k3.as_mut().ok_or("K3 forward: missing KimiK3Rt")?;
+
+        if pos0 == 0 {
+            rt.reset()?;
+        }
+        // AttnRes checkpoints span layer depth for one token only.
+        rt.res_bank_len = 0;
 
         // All K3 compute and primary-side state must stay on the resolved
         // process-local device. Pinned weights are explicitly reported as
@@ -2806,13 +2808,13 @@ impl Model {
             // ── AttnRes pre-attention mixture ────────────────────────────
             let input_t0 = std::time::Instant::now();
             // h = (bank empty) ? prefix : attn_res_mix(prefix, bank, attn_res_norm, attn_res_proj)
-            if rt.res_bank_len > 0 {
+            let attn_input = if rt.res_bank_len > 0 {
                 self.attn_res_mix(rt, &st.cur, &k3w.attn_res_norm, &k3w.attn_res_proj, eps)?;
-                let mixed = &rt.mix_out;
-                // Copy mixed result to cur for attention input
-                kernels::copy_d2d(&mut st.cur, 0, mixed, 0, n_embd as usize * 4)?;
-            }
-            k3_dump_device(pos0, "layer", il, "norm_input", &st.cur, n_embd)?;
+                &rt.mix_out
+            } else {
+                &st.cur
+            };
+            k3_dump_device(pos0, "layer", il, "norm_input", attn_input, n_embd)?;
 
             // ── Snapshot every attn_res_block_size layers ─────────────────
             let snapshot = il % res_block == 0;
@@ -2825,7 +2827,7 @@ impl Model {
             }
 
             // ── attn_norm ─────────────────────────────────────────────────
-            kernels::rms_norm(&mut st.normed, &st.cur, &k3w.attn_norm, n_embd, 1, eps)?;
+            kernels::rms_norm(&mut st.normed, attn_input, &k3w.attn_norm, n_embd, 1, eps)?;
             k3_dump_device(pos0, "layer", il, "norm_output", &st.normed, n_embd)?;
             layer_prof.input_residual_norm = input_t0.elapsed();
 
@@ -2885,6 +2887,11 @@ impl Model {
                         k3w.mla_wkv_b.as_ref(),
                         mla_wqkv_gate,
                         mla_wo,
+                        &mut st.kcache[il],
+                        &mut st.vcache[il],
+                        &mut st.qk_low,
+                        pos0,
+                        st.ctx,
                         &dims,
                         eps,
                     )?;
@@ -2939,14 +2946,15 @@ impl Model {
             )?;
 
             // ── AttnRes pre-FFN mixture ───────────────────────────────────
-            if rt.res_bank_len > 0 {
+            let ffn_input = if rt.res_bank_len > 0 {
                 self.attn_res_mix(rt, &st.cur, &k3w.ffn_res_norm, &k3w.ffn_res_proj, eps)?;
-                let mixed = &rt.mix_out;
-                kernels::copy_d2d(&mut st.cur, 0, mixed, 0, n_embd as usize * 4)?;
-            }
+                &rt.mix_out
+            } else {
+                &st.cur
+            };
 
             // ── ffn_norm ──────────────────────────────────────────────────
-            kernels::rms_norm(&mut rt.normed, &st.cur, &k3w.ffn_norm, n_embd, 1, eps)?;
+            kernels::rms_norm(&mut rt.normed, ffn_input, &k3w.ffn_norm, n_embd, 1, eps)?;
             k3_dump_device(pos0, "layer", il, "moe_input", &rt.normed, n_embd)?;
             layer_prof.output_residual = residual_t0.elapsed();
 
@@ -3087,6 +3095,20 @@ impl Model {
         kernels::sync()?;
         k3_dump_device(pos0, "final", 0, "logits", &st.logits, s.n_vocab)?;
         let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
+        if std::env::var_os("PULSAR_DEBUG_LOGITS").is_some() {
+            let mut ids: Vec<usize> = (0..out.len()).collect();
+            ids.sort_unstable_by(|&a, &b| out[b].total_cmp(&out[a]));
+            let top: Vec<(usize, f32)> = ids.into_iter().take(10).map(|id| (id, out[id])).collect();
+            let nan = out.iter().filter(|v| v.is_nan()).count();
+            let inf = out.iter().filter(|v| v.is_infinite()).count();
+            let margin = top
+                .get(0)
+                .zip(top.get(1))
+                .map_or(f32::NAN, |(a, b)| a.1 - b.1);
+            eprintln!(
+                "pulsar: K3 logits pos {pos0}: top10 {top:?}, top1-top2 {margin:.9}, NaN {nan}, Inf {inf}"
+            );
+        }
         st.prof.tail += t_tail.elapsed();
         st.prof
             .finish_k3_token(token_t0.elapsed(), t_tail.elapsed());
@@ -4191,11 +4213,12 @@ mod tests {
         let gate_lower_bound = -5.0;
 
         // Synthetic data
-        let f_a: Vec<f32> = (0..head_dim).map(|i| (i as f32) * 0.5).collect();
         let f_b: Vec<f32> = (0..d_inner).map(|i| (i as f32) * 0.1).collect();
         let dt_bias: Vec<f32> = vec![0.1; d_inner];
-        // The converter folds A_log as A = -exp(A_log).
-        let a_folded: Vec<f32> = (0..n_head).map(|i| -(1.0 + i as f32 * 0.5).exp()).collect();
+        // Persisted GGUFs exist with both converter sign conventions.
+        let a_folded: Vec<f32> = (0..n_head)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 } * (1.0 + i as f32 * 0.5).exp())
+            .collect();
 
         // g_raw = f_a @ f_b + dt_bias (simplified: just use f_b directly)
         let mut g_raw: Vec<f32> = f_b.clone();
@@ -4203,12 +4226,11 @@ mod tests {
             g_raw[i] += dt_bias[i];
         }
 
-        // Apply exp(A_log) = -A per head before the sigmoid. This is the
-        // K3 lower-bound gate used by llama.cpp.
+        // Apply the positive exp(A_log) magnitude per head.
         for h in 0..n_head {
             for d in 0..head_dim {
                 let idx = h * head_dim + d;
-                g_raw[idx] *= -a_folded[h];
+                g_raw[idx] *= a_folded[h].abs();
             }
         }
 
@@ -4261,20 +4283,18 @@ mod tests {
     /// Test KDA output gate formula on host.
     #[test]
     fn test_kda_output_gate_formula() {
-        let n = 32;
-        let attn_out: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
-        let o_norm_w: Vec<f32> = vec![1.0; n];
-        let g2: Vec<f32> = (0..n).map(|i| (i as f32 - 16.0) * 0.2).collect();
+        let head_dim = 4;
+        let attn_out = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let o_norm_w = vec![1.0; head_dim];
+        let g2 = vec![0.0f32; attn_out.len()];
         let eps = 1e-6;
 
-        // RMSNorm
-        let mean_sq: f32 = attn_out.iter().map(|v| v * v).sum::<f32>() / n as f32;
-        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-        let normed: Vec<f32> = attn_out
-            .iter()
-            .zip(o_norm_w.iter())
-            .map(|(v, w)| v * inv_rms * w)
-            .collect();
+        let mut normed = Vec::with_capacity(attn_out.len());
+        for head in attn_out.chunks_exact(head_dim) {
+            let mean_sq = head.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            normed.extend(head.iter().zip(&o_norm_w).map(|(v, w)| v * inv_rms * w));
+        }
 
         // gated = normed * sigmoid(g2)
         let gated: Vec<f32> = normed
@@ -4284,7 +4304,7 @@ mod tests {
             .collect();
 
         // Verify: gated values are bounded by normed values
-        for i in 0..n {
+        for i in 0..attn_out.len() {
             assert!(
                 gated[i].abs() <= normed[i].abs() + 1e-5,
                 "gated[{i}] = {} exceeds normed[{i}] = {}",
@@ -4294,6 +4314,51 @@ mod tests {
         }
 
         println!("✅ KDA output gate formula: gated bounded by normed");
+    }
+
+    #[test]
+    fn test_k3_mla_split_gguf_axis_order() {
+        let (nope, lora, heads) = (2usize, 3usize, 2usize);
+        let mut wk = vec![0.0f32; nope * lora * heads];
+        for h in 0..heads {
+            for j in 0..lora {
+                for i in 0..nope {
+                    let idx = i + nope * (j + lora * h);
+                    wk[idx] = (100 * h + 10 * j + i) as f32;
+                }
+            }
+        }
+        let q = [2.0f32, 3.0];
+        let h = 1usize;
+        let got: Vec<f32> = (0..lora)
+            .map(|j| {
+                (0..nope)
+                    .map(|i| q[i] * wk[i + nope * (j + lora * h)])
+                    .sum()
+            })
+            .collect();
+        assert_eq!(got, vec![503.0, 553.0, 603.0]);
+    }
+
+    #[test]
+    fn test_attn_res_retrieval_does_not_replace_prefix() {
+        let prefix = [3.0f32, 5.0];
+        let retrieved = [1.0f32, 2.0];
+        let attention = [0.5f32, -0.5];
+        let ffn = [4.0f32, 6.0];
+
+        // Retrieval feeds normalization/sublayers, while residual updates
+        // continue from the raw prefix stream.
+        let layer_out = [
+            prefix[0] + attention[0] + ffn[0],
+            prefix[1] + attention[1] + ffn[1],
+        ];
+        let overwritten_bug = [
+            retrieved[0] + attention[0] + ffn[0],
+            retrieved[1] + attention[1] + ffn[1],
+        ];
+        assert_eq!(layer_out, [7.5, 10.5]);
+        assert_ne!(layer_out, overwritten_bug);
     }
 
     /// Test latent MoE router formula on host.
@@ -4306,7 +4371,7 @@ mod tests {
         let bias: Vec<f32> = vec![0.1; n_expert];
 
         // Sigmoid scores with bias
-        let mut sig_scores: Vec<f32> = scores
+        let sig_scores: Vec<f32> = scores
             .iter()
             .zip(bias.iter())
             .map(|(s, b)| 1.0 / (1.0 + (-(s + b)).exp()))

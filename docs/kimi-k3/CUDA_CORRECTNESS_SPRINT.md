@@ -78,13 +78,17 @@ PULSAR_GPU=GPU-7ac9a486-bc2d-f429-bcab-2e6fd1aee04b \
   --tokens 1 -n 1 --ctx 2048 --temp 0 --top-p 1 --min-p 0 --seed 1
 ```
 
-## Decision
+## Historical Decision
 
 CUDA remains opt-in. The full-model token mismatch is a correctness failure,
 despite the small focused layer-1 and layer-2 numerical differences. The
 first material divergence currently appears at layer 3. The CPU reference
 path remains the default until that later-layer divergence is explained and
 fixed.
+
+This was the decision for the graph and prompts tested in that sprint. It is
+retained as historical evidence and is superseded for behavioral use by the
+2026-08-02 recovery below.
 
 ## Validation Notes
 
@@ -96,3 +100,33 @@ fixed.
 - `cargo build --release -p engine` and `cargo build --release -p serve`:
   passed.
 - `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+## 2026-08-02 Semantic Recovery
+
+Subsequent cross-reference against WASTE, llama.cpp, and the official K3
+implementation found shared graph defects that invalidated treating the old
+CPU-Q8 output as a semantic oracle:
+
+- AttnRes retrieval overwrote the raw residual prefix and its checkpoint bank
+  persisted across tokens.
+- MLA ignored causal history despite allocated compact caches.
+- KDA output RMSNorm was global rather than per-head; Q/K L2 normalization
+  used the wrong epsilon; folded `ssm_a` sign handling was not robust across
+  persisted converter conventions.
+- New sequences did not explicitly clear all K3 recurrent/cache state.
+- Instruction tests did not use the required K3 XTML prompt protocol.
+
+Those defects are corrected. Cache-aware split-weight MLA now has a dedicated
+CUDA kernel, K3 XTML is rendered by the tokenizer, and response generation
+stops at the structural close marker.
+
+The final mostly resident CUDA configuration answered all seven deterministic
+smokes correctly: `Paris`, `4`, `red`, `Cold`, `Oxygen`,
+`William Shakespeare`, and `Earth`. The release workspace test suite and all
+17 CUDA self-tests passed. Exact prompts and token counts are recorded in
+`BEHAVIOURAL_VALIDATION.md`.
+
+CUDA remains opt-in because exact layerwise CPU-Q8/CUDA numerical parity has
+not been re-established. It is no longer classified as behaviorally broken
+for the tested split-weight Q2_K model. Fused `wkv_b` MLA remains explicitly
+unsupported until it receives a cache-aware path.

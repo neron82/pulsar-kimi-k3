@@ -5495,6 +5495,148 @@ extern "C" int pulsar_k3_kda_step_selftest(void) {
      return cuda_ok(cudaGetLastError(), "k3_mla_absorbed_attn_split launch");
  }
 
+/* ---- K3 NoPE MLA over the compact causal cache -------------------------
+ *
+ * GGUF dimensions are fastest-axis-first. For wk_b [nope, lora, head] and
+ * wv_b [lora, value, head], the first dimension is contiguous. */
+__global__ static void k3_mla_qk_lowrank_f32_kernel(
+        float *qk_low,
+        const float *q,
+        const float *wk_b,
+        uint32_t n_head,
+        uint32_t qk_nope,
+        uint32_t qk_tail,
+        uint32_t kv_lora_rank) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t j = threadIdx.x;
+    if (h >= n_head || j >= kv_lora_rank) return;
+    const uint32_t qk_dim = qk_nope + qk_tail;
+    const float *qh = q + (uint64_t)h * qk_dim;
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < qk_nope; i++) {
+        const uint64_t wi = i + (uint64_t)qk_nope * (j + (uint64_t)kv_lora_rank * h);
+        acc += qh[i] * wk_b[wi];
+    }
+    qk_low[(uint64_t)h * kv_lora_rank + j] = acc;
+}
+
+__global__ static void k3_mla_cached_attn_f32_kernel(
+        float *out,
+        const float *q,
+        const float *qk_low,
+        const float *kv_lora_cache,
+        const float *k_tail_cache,
+        const float *wv_b,
+        uint32_t n_kv,
+        uint32_t cache_cap,
+        uint32_t n_head,
+        uint32_t qk_nope,
+        uint32_t qk_tail,
+        uint32_t kv_lora_rank,
+        uint32_t v_mla,
+        float scale) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (h >= n_head || n_kv == 0 || n_kv > cache_cap) return;
+
+    extern __shared__ float sm[];
+    float *red = sm;
+    float *scores = sm + 256u;
+    float *latent = scores + n_kv;
+    const uint32_t qk_dim = qk_nope + qk_tail;
+    const float *qh = q + (uint64_t)h * qk_dim;
+    const float *low = qk_low + (uint64_t)h * kv_lora_rank;
+
+    float local_max = -INFINITY;
+    for (uint32_t t = tid; t < n_kv; t += blockDim.x) {
+        float score = 0.0f;
+        const float *kc = kv_lora_cache + (uint64_t)t * kv_lora_rank;
+        for (uint32_t j = 0; j < kv_lora_rank; j++) score += low[j] * kc[j];
+        const float *kt = k_tail_cache + (uint64_t)t * qk_tail;
+        for (uint32_t r = 0; r < qk_tail; r++) score += qh[qk_nope + r] * kt[r];
+        score *= scale;
+        scores[t] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    red[tid] = local_max;
+    __syncthreads();
+    for (uint32_t step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+    const float max_score = red[0];
+
+    float local_sum = 0.0f;
+    for (uint32_t t = tid; t < n_kv; t += blockDim.x) {
+        const float w = expf(scores[t] - max_score);
+        scores[t] = w;
+        local_sum += w;
+    }
+    red[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+    const float denom = fmaxf(red[0], 1.0e-20f);
+    __syncthreads();
+
+    for (uint32_t j = tid; j < kv_lora_rank; j += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t t = 0; t < n_kv; t++) {
+            acc += scores[t] * kv_lora_cache[(uint64_t)t * kv_lora_rank + j];
+        }
+        latent[j] = acc / denom;
+    }
+    __syncthreads();
+
+    for (uint32_t d = tid; d < v_mla; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t j = 0; j < kv_lora_rank; j++) {
+            const uint64_t wi = j + (uint64_t)kv_lora_rank * (d + (uint64_t)v_mla * h);
+            acc += latent[j] * wv_b[wi];
+        }
+        out[(uint64_t)h * v_mla + d] = acc;
+    }
+}
+
+extern "C" int pulsar_k3_mla_cached_attn_split(
+        void *out_dev,
+        void *qk_low_dev,
+        const void *q_dev,
+        const void *kv_lora_cache_dev,
+        const void *k_tail_cache_dev,
+        const void *wk_b_dev,
+        const void *wv_b_dev,
+        uint32_t n_kv,
+        uint32_t cache_cap,
+        uint32_t n_head,
+        uint32_t qk_nope,
+        uint32_t qk_tail,
+        uint32_t kv_lora_rank,
+        uint32_t v_mla,
+        float scale) {
+    if (!out_dev || !qk_low_dev || !q_dev || !kv_lora_cache_dev ||
+        !k_tail_cache_dev || !wk_b_dev || !wv_b_dev || n_kv == 0 ||
+        n_kv > cache_cap || n_head == 0 || qk_nope == 0 || qk_tail == 0 ||
+        kv_lora_rank == 0 || kv_lora_rank > 1024u || v_mla == 0) {
+        return 0;
+    }
+    k3_mla_qk_lowrank_f32_kernel<<<n_head, kv_lora_rank>>>(
+            (float *)qk_low_dev, (const float *)q_dev, (const float *)wk_b_dev,
+            n_head, qk_nope, qk_tail, kv_lora_rank);
+    if (!cuda_ok(cudaGetLastError(), "k3 mla qk lowrank f32 launch")) return 0;
+    const uint64_t smem = (256u + (uint64_t)n_kv + kv_lora_rank) * sizeof(float);
+    if (!mla_smem_ok((const void *)k3_mla_cached_attn_f32_kernel, smem,
+                     "k3 mla cached attention smem opt-in")) return 0;
+    k3_mla_cached_attn_f32_kernel<<<n_head, 256, (size_t)smem>>>(
+            (float *)out_dev, (const float *)q_dev, (const float *)qk_low_dev,
+            (const float *)kv_lora_cache_dev, (const float *)k_tail_cache_dev,
+            (const float *)wv_b_dev, n_kv, cache_cap, n_head, qk_nope, qk_tail,
+            kv_lora_rank, v_mla, scale);
+    return cuda_ok(cudaGetLastError(), "k3 mla cached attention f32 launch");
+}
+
  /* Q8_0 variant: W_k_b, W_v_b are q8_0 bytes, dequantized on the fly.
   * W_k_b layout: [qk_nope][kv_lora_rank][n_head] rows of q8_0 bytes
   *   row (i, j, h) = W_k_b + ((i * kv_lora_rank + j) * n_head + h) * q8_row_bytes(qk_nope)

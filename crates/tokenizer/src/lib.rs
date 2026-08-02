@@ -77,6 +77,9 @@ enum ChatStyle {
     Hy3,
     /// <|im_user|>user<|im_middle|>text<|im_end|> ... (Kimi K2 family)
     Kimi,
+    /// Kimi K3 XTML. Structural markers are pushed by id while every plain
+    /// segment is BPE-encoded independently.
+    KimiK3,
     /// <|im_start|>user\ntext<|im_end|>\n ... (Qwen ChatML; no bos)
     ChatMl,
     /// <start_of_turn>user\ntext<end_of_turn>\n ... (Gemma; roles are
@@ -118,6 +121,20 @@ pub struct ChatMarkers {
 impl ChatMarkers {
     pub fn resolve(t: &Tokenizer) -> Result<ChatMarkers, Error> {
         let find = |s: &'static str| t.find_token(s).ok_or(Error::MissingKey(s));
+        if t.find_token("<|open|>").is_some() {
+            let end = find("<|end_of_msg|>")?;
+            return Ok(ChatMarkers {
+                style: ChatStyle::KimiK3,
+                bos: None,
+                eos: end,
+                eot: Some(end),
+                user: find("<|open|>")?,
+                assistant: find("<|open|>")?,
+                aux0: find("<|close|>")?,
+                aux1: find("<|sep|>")?,
+                stops: t.stop_ids.clone(),
+            });
+        }
         if t.find_token("<|im_middle|>").is_some() {
             return Ok(ChatMarkers {
                 style: ChatStyle::Kimi,
@@ -273,6 +290,7 @@ impl ChatMarkers {
                 v.extend(self.eot);
                 v
             }
+            ChatStyle::KimiK3 => self.k3_message(t, "system", text),
             ChatStyle::MiniMax => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(&format!("system\n{text}")));
@@ -313,6 +331,7 @@ impl ChatMarkers {
                 v.extend(self.eot);
                 v
             }
+            ChatStyle::KimiK3 => self.k3_message(t, "user", text),
             ChatStyle::ChatMl | ChatStyle::Gemma => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(&format!("user\n{text}")));
@@ -355,6 +374,16 @@ impl ChatMarkers {
                 v.extend(t.encode("<think></think>"));
                 v
             }
+            ChatStyle::KimiK3 => {
+                let mut v = self.k3_open_message(t, "assistant");
+                // Non-thinking XTML is the correctness/smoke-test mode: the
+                // response channel starts immediately instead of spending an
+                // unbounded local generation in the thinking channel.
+                v.push(self.user);
+                v.extend(t.encode("response"));
+                v.push(self.aux1);
+                v
+            }
             ChatStyle::ChatMl => {
                 let mut v = vec![self.assistant];
                 v.extend(t.encode("assistant\n"));
@@ -389,6 +418,21 @@ impl ChatMarkers {
 
     /// A completed assistant turn from history (opener + content + stop).
     pub fn render_assistant_history(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
+        if self.style == ChatStyle::KimiK3 {
+            let mut v = self.k3_open_message(t, "assistant");
+            v.push(self.user);
+            v.extend(t.encode("response"));
+            v.push(self.aux1);
+            v.extend(t.encode(text));
+            v.push(self.aux0);
+            v.extend(t.encode("response"));
+            v.push(self.aux1);
+            v.push(self.aux0);
+            v.extend(t.encode("message"));
+            v.push(self.aux1);
+            v.push(self.eos);
+            return v;
+        }
         if self.style == ChatStyle::Inkling {
             // history closes with <|end_message|>, not the sampling stop
             let mut v = vec![self.assistant, self.aux1];
@@ -419,7 +463,29 @@ impl ChatMarkers {
     }
 
     pub fn is_stop(&self, id: u32) -> bool {
-        id == self.eos || Some(id) == self.eot || self.stops.binary_search(&id).is_ok()
+        (self.style == ChatStyle::KimiK3 && id == self.aux0)
+            || id == self.eos
+            || Some(id) == self.eot
+            || self.stops.binary_search(&id).is_ok()
+    }
+
+    fn k3_open_message(&self, t: &Tokenizer, role: &str) -> Vec<u32> {
+        let mut v = vec![self.user];
+        for segment in ["message", " role", "=\"", role, "\""] {
+            v.extend(t.encode(segment));
+        }
+        v.push(self.aux1);
+        v
+    }
+
+    fn k3_message(&self, t: &Tokenizer, role: &str, text: &str) -> Vec<u32> {
+        let mut v = self.k3_open_message(t, role);
+        v.extend(t.encode(text));
+        v.push(self.aux0);
+        v.extend(t.encode("message"));
+        v.push(self.aux1);
+        v.push(self.eos);
+        v
     }
 }
 
@@ -490,6 +556,7 @@ impl Tokenizer {
             "<end_of_turn>",
             "<|endofturn|>",
             "<|content_model_end_sampling|>",
+            "<|end_of_msg|>",
             "[e~[",
             "<|user|>",
             "<|observation|>",

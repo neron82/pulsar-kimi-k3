@@ -713,6 +713,23 @@ mod real {
             v_mla: u32,
             scale: f32,
         ) -> i32;
+        fn pulsar_k3_mla_cached_attn_split(
+            out: *mut c_void,
+            qk_low: *mut c_void,
+            q: *const c_void,
+            kv_lora_cache: *const c_void,
+            k_tail_cache: *const c_void,
+            wk_b: *const c_void,
+            wv_b: *const c_void,
+            n_kv: u32,
+            cache_cap: u32,
+            n_head: u32,
+            qk_nope: u32,
+            qk_tail: u32,
+            kv_lora_rank: u32,
+            v_mla: u32,
+            scale: f32,
+        ) -> i32;
         fn pulsar_k3_mla_absorbed_attn_split_q8(
             out: *mut c_void,
             q: *const c_void,
@@ -3295,6 +3312,50 @@ mod real {
                 )
             },
             "k3_mla_absorbed_attn_split",
+        )
+    }
+
+    /// K3 NoPE MLA over the compact cache. The split K/V weights are F32
+    /// tensors in GGUF's fastest-axis-first layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k3_mla_cached_attn_split(
+        out: &mut DeviceBuf,
+        qk_low: &mut DeviceBuf,
+        q: &DeviceBuf,
+        kv_lora_cache: &DeviceBuf,
+        k_tail_cache: &DeviceBuf,
+        wk_b: &DeviceBuf,
+        wv_b: &DeviceBuf,
+        n_kv: u32,
+        cache_cap: u32,
+        n_head: u32,
+        qk_nope: u32,
+        qk_tail: u32,
+        kv_lora_rank: u32,
+        v_mla: u32,
+        scale: f32,
+    ) -> Result {
+        check(
+            unsafe {
+                pulsar_k3_mla_cached_attn_split(
+                    out.ptr_mut(),
+                    qk_low.ptr_mut(),
+                    q.ptr(),
+                    kv_lora_cache.ptr(),
+                    k_tail_cache.ptr(),
+                    wk_b.ptr(),
+                    wv_b.ptr(),
+                    n_kv,
+                    cache_cap,
+                    n_head,
+                    qk_nope,
+                    qk_tail,
+                    kv_lora_rank,
+                    v_mla,
+                    scale,
+                )
+            },
+            "k3_mla_cached_attn_split",
         )
     }
 

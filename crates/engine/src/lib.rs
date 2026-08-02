@@ -2192,7 +2192,7 @@ mod real {
     /// otherwise normal VRAM. Activations, runtime scratch, and expert
     /// cache/staging should NOT use this — they stay on VRAM.
     fn upload_k3_host(bytes: &[u8]) -> Result<DeviceBuf> {
-        const K3_VRAM_RESERVE: usize = 1536 << 20;
+        const K3_VRAM_RESERVE: usize = 2048 << 20;
         let force_host = k3_use_host_pinned();
         let use_host = force_host
             || kernels::selected_device()
