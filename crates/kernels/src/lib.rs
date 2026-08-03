@@ -716,6 +716,7 @@ mod real {
         fn pulsar_k3_mla_cached_attn_split(
             out: *mut c_void,
             qk_low: *mut c_void,
+            score_scratch: *mut c_void,
             q: *const c_void,
             kv_lora_cache: *const c_void,
             k_tail_cache: *const c_void,
@@ -756,6 +757,7 @@ mod real {
             scale: f32,
         ) -> i32;
         fn pulsar_k3_mla_absorbed_attn_split_selftest() -> i32;
+        fn pulsar_k3_mla_cached_attn_32k_selftest() -> i32;
         fn pulsar_k3_mla_absorbed_attn_split_q8_selftest() -> i32;
         fn pulsar_k3_mla_absorbed_attn_fused_selftest() -> i32;
         fn pulsar_k3_sigmoid_inplace(x: *mut c_void, n: u32) -> i32;
@@ -3321,6 +3323,7 @@ mod real {
     pub fn k3_mla_cached_attn_split(
         out: &mut DeviceBuf,
         qk_low: &mut DeviceBuf,
+        score_scratch: &mut DeviceBuf,
         q: &DeviceBuf,
         kv_lora_cache: &DeviceBuf,
         k_tail_cache: &DeviceBuf,
@@ -3335,11 +3338,22 @@ mod real {
         v_mla: u32,
         scale: f32,
     ) -> Result {
+        let score_bytes = (n_head as usize)
+            .checked_mul(cache_cap as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| Error("k3_mla_cached_attn_split score size overflow".into()))?;
+        if score_scratch.bytes() < score_bytes {
+            return Err(Error(format!(
+                "k3_mla_cached_attn_split score scratch is {} bytes, need {score_bytes}",
+                score_scratch.bytes()
+            )));
+        }
         check(
             unsafe {
                 pulsar_k3_mla_cached_attn_split(
                     out.ptr_mut(),
                     qk_low.ptr_mut(),
+                    score_scratch.ptr_mut(),
                     q.ptr(),
                     kv_lora_cache.ptr(),
                     k_tail_cache.ptr(),
@@ -3432,6 +3446,10 @@ mod real {
 
     pub fn k3_mla_absorbed_attn_split_selftest() -> bool {
         unsafe { pulsar_k3_mla_absorbed_attn_split_selftest() != 0 }
+    }
+
+    pub fn k3_mla_cached_attn_32k_selftest() -> bool {
+        unsafe { pulsar_k3_mla_cached_attn_32k_selftest() != 0 }
     }
 
     pub fn k3_mla_absorbed_attn_split_q8_selftest() -> bool {

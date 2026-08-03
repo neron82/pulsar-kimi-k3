@@ -798,6 +798,12 @@ mod real {
         /// Kimi K3 output AttnRes norm and projection (global tensors)
         pub k3_output_res_norm: Option<DeviceBuf>,
         pub k3_output_res_proj: Option<DeviceBuf>,
+        /// Context used to reserve mandatory K3 runtime VRAM during model
+        /// loading. Non-K3 models leave this unset; `Model::load` gives K3 a
+        /// conservative 8K compatibility plan.
+        k3_planned_ctx: Option<u32>,
+        k3_planned_batch: Option<u32>,
+        k3_planned_cuda_experts: Option<bool>,
         k3_device_log: std::sync::OnceLock<()>,
     }
 
@@ -824,6 +830,7 @@ mod real {
         pub io_reads: u64,
         pub io_max_read: u64,
         pub io_wait: std::time::Duration,
+        pub io_read_wait: std::time::Duration,
         /// offsets the CPU expert lane is reading right now - the evictors
         /// must not free them mid-dot (cleared after the pool joins)
         pinned: Vec<u64>,
@@ -882,6 +889,7 @@ mod real {
         pub storage: std::time::Duration,
         pub h2d: std::time::Duration,
         pub moe_gpu: std::time::Duration,
+        pub shared_expert: std::time::Duration,
         pub output_residual: std::time::Duration,
         pub synchronization: std::time::Duration,
         pub allocation: std::time::Duration,
@@ -985,6 +993,7 @@ mod real {
                 let mut sync = std::time::Duration::ZERO;
                 let mut resolve = std::time::Duration::ZERO;
                 let mut storage = std::time::Duration::ZERO;
+                let mut shared_expert = std::time::Duration::ZERO;
                 let mut cpu = std::time::Duration::ZERO;
                 let mut cpu_math = std::time::Duration::ZERO;
                 let mut expert_evals = 0u64;
@@ -1003,6 +1012,7 @@ mod real {
                     sync += l.router_sync + l.synchronization;
                     resolve += l.expert_resolution;
                     storage += l.storage;
+                    shared_expert += l.shared_expert;
                     cpu += l.cpu_routing;
                     cpu_math += l.cpu_expert_dequant
                         + l.cpu_expert_gate
@@ -1025,10 +1035,10 @@ mod real {
                     device_misses = device_misses.saturating_add(l.device_cache_misses);
                 }
                 report.push_str(&format!(
-                    "\nK3 token {} [{}]: total {:.3}s, layers {:.3}s, output {:.3}s, unclassified {:.3}s\n  GPU activity {:.3}s, synchronization/readback {:.3}s, expert resolution {:.3}s (storage {:.3}s), CPU work {:.3}s\n  CPU math categories {:.3}s; expert evals {}; matrices {}; weight bytes {}; storage: {} bytes in {} reads; H2D {} bytes; D2H {} bytes; host cache {:.1}% ({} hits/{} misses); device cache {:.1}% ({} hits/{} misses)",
+                    "\nK3 token {} [{}]: total {:.3}s, layers {:.3}s, output {:.3}s, unclassified {:.3}s\n  GPU activity {:.3}s, synchronization/readback {:.3}s, expert resolution {:.3}s (storage {:.3}s), shared expert {:.3}s, CPU work {:.3}s\n  CPU math categories {:.3}s; expert evals {}; matrices {}; weight bytes {}; storage: {} bytes in {} reads; H2D {} bytes; D2H {} bytes; host cache {:.1}% ({} hits/{} misses); device cache {:.1}% ({} hits/{} misses)",
                     token.index, token.phase, token.total.as_secs_f64(), token.layers.as_secs_f64(),
                     token.output.as_secs_f64(), token.unclassified.as_secs_f64(), gpu.as_secs_f64(),
-                    sync.as_secs_f64(), resolve.as_secs_f64(), storage.as_secs_f64(), cpu.as_secs_f64(), cpu_math.as_secs_f64(), expert_evals, expert_matrices, expert_bytes, storage_bytes,
+                    sync.as_secs_f64(), resolve.as_secs_f64(), storage.as_secs_f64(), shared_expert.as_secs_f64(), cpu.as_secs_f64(), cpu_math.as_secs_f64(), expert_evals, expert_matrices, expert_bytes, storage_bytes,
                     storage_reads, h2d, d2h, Self::hit_rate(host_hits, host_misses), host_hits,
                     host_misses, Self::hit_rate(device_hits, device_misses), device_hits, device_misses
                 ));
@@ -1080,11 +1090,11 @@ mod real {
                     category_total.as_secs_f64()
                 ));
                 for l in &token.layers_detail {
-                    out.push_str(&format!("  Layer {} [{}] total {:.3}ms input {:.3}ms KDA {:.3}ms MLA {:.3}ms router {:.3}ms resolve {:.3}ms storage {:.3}ms H2D {:.3}ms MoE {:.3}ms residual {:.3}ms sync {:.3}ms unclassified {:.3}ms\n    CPU dequant {:.3}ms gate {:.3}ms up {:.3}ms activation {:.3}ms down {:.3}ms accumulation {:.3}ms latent_norm {:.3}ms misc {:.3}ms; expert evals {} matrices {} weight_bytes {} threads {}\n",
+                    out.push_str(&format!("  Layer {} [{}] total {:.3}ms input {:.3}ms KDA {:.3}ms MLA {:.3}ms router {:.3}ms resolve {:.3}ms storage {:.3}ms H2D {:.3}ms MoE {:.3}ms shared {:.3}ms residual {:.3}ms sync {:.3}ms unclassified {:.3}ms\n    CPU dequant {:.3}ms gate {:.3}ms up {:.3}ms activation {:.3}ms down {:.3}ms accumulation {:.3}ms latent_norm {:.3}ms misc {:.3}ms; expert evals {} matrices {} weight_bytes {} threads {}\n",
                         l.index, l.kind, l.total.as_secs_f64()*1e3, l.input_residual_norm.as_secs_f64()*1e3,
                         l.kda_gpu.as_secs_f64()*1e3, l.mla_gpu.as_secs_f64()*1e3, l.router_gpu.as_secs_f64()*1e3,
                         l.expert_resolution.as_secs_f64()*1e3, l.storage.as_secs_f64()*1e3, l.h2d.as_secs_f64()*1e3,
-                        l.moe_gpu.as_secs_f64()*1e3, l.output_residual.as_secs_f64()*1e3,
+                         l.moe_gpu.as_secs_f64()*1e3, l.shared_expert.as_secs_f64()*1e3, l.output_residual.as_secs_f64()*1e3,
                         l.synchronization.as_secs_f64()*1e3, l.unclassified.as_secs_f64()*1e3,
                         l.cpu_expert_dequant.as_secs_f64()*1e3, l.cpu_expert_gate.as_secs_f64()*1e3,
                         l.cpu_expert_up.as_secs_f64()*1e3, l.cpu_expert_activation.as_secs_f64()*1e3,
@@ -1385,8 +1395,13 @@ mod real {
 
     impl StreamingStore {
         fn open(shards: &[(u64, std::path::PathBuf)], budget: usize) -> Result<StreamingStore> {
+            let qd = std::env::var("PULSAR_STREAM_QD")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v > 0 && v <= 1024)
+                .unwrap_or(32);
             Ok(StreamingStore {
-                fetcher: stream::fetch::Fetcher::open_split(shards, 32, fetch_buf_alloc())?,
+                fetcher: stream::fetch::Fetcher::open_split(shards, qd, fetch_buf_alloc())?,
                 cache: std::collections::HashMap::new(),
                 used: 0,
                 budget,
@@ -1397,6 +1412,7 @@ mod real {
                 io_reads: 0,
                 io_max_read: 0,
                 io_wait: std::time::Duration::ZERO,
+                io_read_wait: std::time::Duration::ZERO,
                 pinned: Vec::new(),
             })
         }
@@ -1488,6 +1504,7 @@ mod real {
                 );
                 Ok(())
             })?;
+            self.io_read_wait += fetcher.last_stats().read_wait;
             self.io_wait += io_t0.elapsed();
             match place_err {
                 Some(e) => Err(e),
@@ -1524,6 +1541,7 @@ mod real {
             self.io_reads = 0;
             self.io_max_read = 0;
             self.io_wait = std::time::Duration::ZERO;
+            self.io_read_wait = std::time::Duration::ZERO;
         }
 
         fn contains(&self, offset: u64) -> bool {
@@ -2187,21 +2205,133 @@ mod real {
         std::env::var("PULSAR_K3_HOST").ok().as_deref() == Some("1")
     }
 
+    /// K3 requires CUDA for the dense graph, and the routed CUDA path is now
+    /// correctness-validated. Keep CPU implementations as explicit diagnostic
+    /// overrides rather than silently selecting the one-core fallback.
+    pub(super) fn k3_expert_backend() -> &'static str {
+        match std::env::var("PULSAR_K3_EXPERT_BACKEND").as_deref() {
+            Ok("cpu") => "cpu",
+            Ok("cpu-q8") => "cpu-q8",
+            Ok("cuda") | Err(_) => "cuda",
+            _ => "cuda",
+        }
+    }
+
+    const K3_DEFAULT_VRAM_RESERVE: usize = 2048 << 20;
+    const K3_DEFAULT_PLANNED_CTX: u32 = 8192;
+    const K3_FIXED_STATE_RESERVE: usize = 512 << 20;
+    const K3_CUDA_SAFETY_RESERVE: usize = 768 << 20;
+    const K3_BATCH_SCRATCH_RESERVE: usize = 2 << 20;
+
+    fn checked_vram_mul(a: usize, b: usize, what: &str) -> Result<usize> {
+        a.checked_mul(b)
+            .ok_or_else(|| format!("K3 {what} VRAM size overflow").into())
+    }
+
+    fn k3_context_state_bytes(
+        ctx: u32,
+        n_mla: usize,
+        kv_lora: u32,
+        qk_tail: u32,
+        n_head: u32,
+    ) -> Result<usize> {
+        let ctx = ctx as usize;
+        let cache_row = (kv_lora as usize)
+            .checked_add(qk_tail as usize)
+            .ok_or("K3 compact-cache row size overflow")?;
+        let cache = checked_vram_mul(
+            checked_vram_mul(
+                checked_vram_mul(n_mla, ctx, "compact cache")?,
+                cache_row,
+                "compact cache",
+            )?,
+            4,
+            "compact cache",
+        )?;
+        // The cached-attention kernel reuses one score row per head across
+        // MLA layers. Keeping it in global memory avoids a context-sized
+        // dynamic shared-memory launch limit.
+        let scores = checked_vram_mul(
+            checked_vram_mul(ctx, n_head as usize, "MLA score scratch")?,
+            4,
+            "MLA score scratch",
+        )?;
+        cache
+            .checked_add(scores)
+            .ok_or_else(|| "K3 context state VRAM size overflow".into())
+    }
+
+    fn k3_required_vram_headroom(
+        ctx: u32,
+        n_mla: usize,
+        kv_lora: u32,
+        qk_tail: u32,
+        n_head: u32,
+        batch: u32,
+        staging_bytes: usize,
+    ) -> Result<usize> {
+        if ctx == 0 {
+            return Err("K3 context must be greater than zero".into());
+        }
+        let context = k3_context_state_bytes(ctx, n_mla, kv_lora, qk_tail, n_head)?;
+        let batch = checked_vram_mul(
+            batch.max(1) as usize,
+            K3_BATCH_SCRATCH_RESERVE,
+            "batch scratch",
+        )?;
+        [
+            context,
+            K3_FIXED_STATE_RESERVE,
+            K3_CUDA_SAFETY_RESERVE,
+            batch,
+            staging_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| {
+            sum.checked_add(bytes)
+                .ok_or_else(|| "K3 required VRAM headroom overflow".into())
+        })
+        .map(|bytes| bytes.max(K3_DEFAULT_VRAM_RESERVE))
+    }
+
+    fn k3_cuda_staging_bytes(g: &Gguf, s: Shape, cuda_experts: bool) -> Result<usize> {
+        if !cuda_experts {
+            return Ok(0);
+        }
+        let mut largest = 0usize;
+        for il in s.n_leading_dense..s.n_exec_layer {
+            let mut triple = 0usize;
+            for suffix in [
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ] {
+                let name = format!("blk.{il}.{suffix}");
+                let tensor = g.tensor(&name).ok_or_else(|| meta_err(&name))?;
+                let expert = ExpertTensor::new(g, tensor, s.n_expert)?;
+                triple = triple
+                    .checked_add(expert.expert_bytes as usize)
+                    .ok_or("K3 expert staging size overflow")?;
+            }
+            largest = largest.max(triple);
+        }
+        checked_vram_mul(largest, s.n_expert_used as usize, "expert staging")
+    }
+
     /// Allocate a DeviceBuf for K3 resident weights. When PULSAR_K3_HOST=1
     /// the buffer is mapped pinned host memory (device-visible via UVA);
     /// otherwise normal VRAM. Activations, runtime scratch, and expert
     /// cache/staging should NOT use this — they stay on VRAM.
-    fn upload_k3_host(bytes: &[u8]) -> Result<DeviceBuf> {
-        const K3_VRAM_RESERVE: usize = 2048 << 20;
+    fn upload_k3_host(bytes: &[u8], vram_reserve: usize) -> Result<DeviceBuf> {
         let force_host = k3_use_host_pinned();
         let use_host = force_host
             || kernels::selected_device()
                 .ok()
                 .and_then(|dev| kernels::mem_info(dev).ok())
-                .map(|(free, _)| free < bytes.len().saturating_add(K3_VRAM_RESERVE))
+                .map(|(free, _)| free < bytes.len().saturating_add(vram_reserve))
                 .unwrap_or(false);
         if use_host && !force_host {
-            eprintln!("pulsar: K3 VRAM resident budget reached; keeping {:.2} MiB weight host-mapped to preserve {:.0} MiB CUDA headroom", bytes.len() as f64 / (1 << 20) as f64, K3_VRAM_RESERVE as f64 / (1 << 20) as f64);
+            eprintln!("pulsar: K3 VRAM resident budget reached; keeping {:.2} MiB weight host-mapped to preserve {:.0} MiB CUDA headroom", bytes.len() as f64 / (1 << 20) as f64, vram_reserve as f64 / (1 << 20) as f64);
         }
         let mut buf = if use_host {
             DeviceBuf::alloc_pinned(bytes.len())?
@@ -2215,9 +2345,9 @@ mod real {
     /// K3-aware wrapper around the generic upload path. Routes norms,
     /// scalars, and other small K3 resident weights through `upload_k3_host`
     /// so they respect PULSAR_K3_HOST=1.
-    fn upload_k3(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+    fn upload_k3(file: &VFile, g: &Gguf, name: &str, vram_reserve: usize) -> Result<DeviceBuf> {
         let bytes = read_tensor_bytes(file, g, name)?;
-        upload_k3_host(&bytes)
+        upload_k3_host(&bytes, vram_reserve)
     }
 
     fn upload(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
@@ -2269,27 +2399,32 @@ mod real {
     /// or converts F32/F16/BF16 to Q8_0 at load time. Rejects all other
     /// types with an explicit error — no silent fallback.
     /// When PULSAR_K3_HOST=1, allocates host-pinned (mapped) memory.
-    fn upload_k3_mla_q8(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+    fn upload_k3_mla_q8(
+        file: &VFile,
+        g: &Gguf,
+        name: &str,
+        vram_reserve: usize,
+    ) -> Result<DeviceBuf> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let n = t.n_elements() as usize;
         match t.ty {
             TensorType::Q8_0 => {
                 // Passthrough: already Q8_0 bytes
-                upload_k3_host(&read_tensor_bytes(file, g, name)?)
+                upload_k3_host(&read_tensor_bytes(file, g, name)?, vram_reserve)
             }
             TensorType::F32 => {
                 // Quantize F32 -> Q8_0
                 let f32_data = read_tensor_f32(file, g, name)?;
                 let mut q8 = Vec::with_capacity(n / 32 * 34);
                 requant::quantize_q8_0(&f32_data, &mut q8);
-                upload_k3_host(&q8)
+                upload_k3_host(&q8, vram_reserve)
             }
             TensorType::F16 => {
                 // F16 -> F32 -> Q8_0
                 let f32_data = read_f16_as_f32(file, g, name)?;
                 let mut q8 = Vec::with_capacity(n / 32 * 34);
                 requant::quantize_q8_0(&f32_data, &mut q8);
-                upload_k3_host(&q8)
+                upload_k3_host(&q8, vram_reserve)
             }
             TensorType::BF16 => {
                 // BF16 -> F32 -> Q8_0
@@ -2301,7 +2436,7 @@ mod real {
                     .collect();
                 let mut q8 = Vec::with_capacity(n / 32 * 34);
                 requant::quantize_q8_0(&f32_data, &mut q8);
-                upload_k3_host(&q8)
+                upload_k3_host(&q8, vram_reserve)
             }
             // K-quant types: read_tensor_bytes already converts K-quant -> Q8_0
             TensorType::Q2K
@@ -2309,7 +2444,7 @@ mod real {
             | TensorType::Q4K
             | TensorType::Q5K
             | TensorType::Q6K => {
-                upload_k3_host(&read_tensor_bytes(file, g, name)?)
+                upload_k3_host(&read_tensor_bytes(file, g, name)?, vram_reserve)
             }
             other => Err(format!(
                 "{name}: K3 MLA Q8_0 path does not accept type {other:?} — expected Q8_0, F32, F16, BF16, or K-quant"
@@ -2329,7 +2464,12 @@ mod real {
     /// but tags as Q8_0 since matmul_kq only supports Q2_K/Q3_K today.
     /// Absorbed MLA tensors (wk_b, wv_b) that require F32 should still use
     /// `upload_k3_mla_absorbed_f32`.
-    fn upload_k3_mla_kq(file: &VFile, g: &Gguf, name: &str) -> Result<kimi_k3::K3DenseWeight> {
+    fn upload_k3_mla_kq(
+        file: &VFile,
+        g: &Gguf,
+        name: &str,
+        vram_reserve: usize,
+    ) -> Result<kimi_k3::K3DenseWeight> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let n = t.n_elements() as usize;
         let row_elems = *t.dims.first().ok_or_else(|| meta_err(name))?;
@@ -2340,7 +2480,7 @@ mod real {
                 let raw = read_tensor_bytes_raw(file, g, name)?;
                 let quant = kimi_k3::K3WeightQuant::from_gguf(t.ty, row_elems)
                     .ok_or_else(|| format!("{name}: K3WeightQuant::from_gguf failed for {ty:?}", ty = t.ty))?;
-                let buf = upload_k3_host(&raw)?;
+                let buf = upload_k3_host(&raw, vram_reserve)?;
                 Ok(kimi_k3::K3DenseWeight::new(buf, quant))
             }
             // Q8_0 passthrough
@@ -2348,7 +2488,7 @@ mod real {
                 let raw = read_tensor_bytes(file, g, name)?;
                 let quant = kimi_k3::K3WeightQuant::from_gguf(t.ty, row_elems)
                     .ok_or_else(|| format!("{name}: K3WeightQuant::from_gguf failed for Q8_0"))?;
-                let buf = upload_k3_host(&raw)?;
+                let buf = upload_k3_host(&raw, vram_reserve)?;
                 Ok(kimi_k3::K3DenseWeight::new(buf, quant))
             }
             // F32/F16/BF16 → Q8_0 conversion
@@ -2360,7 +2500,7 @@ mod real {
                     quant: kernels::QUANT_Q8_0,
                     row_bytes: (row_elems.div_ceil(32) * 34) as u64,
                 };
-                let buf = upload_k3_host(&q8)?;
+                let buf = upload_k3_host(&q8, vram_reserve)?;
                 Ok(kimi_k3::K3DenseWeight::new(buf, quant))
             }
             TensorType::F16 => {
@@ -2371,7 +2511,7 @@ mod real {
                     quant: kernels::QUANT_Q8_0,
                     row_bytes: (row_elems.div_ceil(32) * 34) as u64,
                 };
-                let buf = upload_k3_host(&q8)?;
+                let buf = upload_k3_host(&q8, vram_reserve)?;
                 Ok(kimi_k3::K3DenseWeight::new(buf, quant))
             }
             TensorType::BF16 => {
@@ -2387,7 +2527,7 @@ mod real {
                     quant: kernels::QUANT_Q8_0,
                     row_bytes: (row_elems.div_ceil(32) * 34) as u64,
                 };
-                let buf = upload_k3_host(&q8)?;
+                let buf = upload_k3_host(&q8, vram_reserve)?;
                 Ok(kimi_k3::K3DenseWeight::new(buf, quant))
             }
             // Q4_K/Q5_K/Q6_K: convert to Q8_0 (same as old path), tag as Q8_0
@@ -2397,7 +2537,7 @@ mod real {
                     quant: kernels::QUANT_Q8_0,
                     row_bytes: (row_elems.div_ceil(32) * 34) as u64,
                 };
-                let buf = upload_k3_host(&q8_bytes)?;
+                let buf = upload_k3_host(&q8_bytes, vram_reserve)?;
                 Ok(kimi_k3::K3DenseWeight::new(buf, quant))
             }
             other => Err(format!(
@@ -2429,7 +2569,12 @@ mod real {
     /// these tensors as F32 because it performs per-head 3D indexing. Native
     /// F32/F16/BF16 and Q8/K-quant sources are converted explicitly; packed
     /// NVFP4 and unknown layouts fail closed.
-    fn upload_k3_mla_absorbed_f32(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+    fn upload_k3_mla_absorbed_f32(
+        file: &VFile,
+        g: &Gguf,
+        name: &str,
+        vram_reserve: usize,
+    ) -> Result<DeviceBuf> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let n = t.n_elements() as usize;
         let values = match t.ty {
@@ -2480,7 +2625,7 @@ mod real {
                 .into())
             }
         };
-        Ok(upload_k3_host(kernels::as_bytes(&values))?)
+        Ok(upload_k3_host(kernels::as_bytes(&values), vram_reserve)?)
     }
 
     /// Big attention weights: VRAM while `vram_budget` lasts, then pinned
@@ -2506,6 +2651,20 @@ mod real {
 
     impl Model {
         pub fn load(path: &Path) -> Result<Model> {
+            Self::load_impl(path, Some(K3_DEFAULT_PLANNED_CTX))
+        }
+
+        /// Load a model while reserving enough primary-device memory for a
+        /// state with the requested context. K3 callers should prefer this to
+        /// `load`, because its compact MLA caches are allocated after weights.
+        pub fn load_for_ctx(path: &Path, ctx: u32) -> Result<Model> {
+            if ctx == 0 {
+                return Err("context must be greater than zero".into());
+            }
+            Self::load_impl(path, Some(ctx))
+        }
+
+        fn load_impl(path: &Path, planned_ctx: Option<u32>) -> Result<Model> {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
@@ -2580,6 +2739,53 @@ mod real {
             } else {
                 Vec::new()
             };
+            let k3_planned_batch = if shape.family == Family::KimiK3 && planned_ctx.is_some() {
+                Some(
+                    std::env::var("PULSAR_BATCH")
+                        .ok()
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .unwrap_or(1)
+                        .max(1),
+                )
+            } else {
+                None
+            };
+            let k3_planned_cuda_experts = if shape.family == Family::KimiK3 && planned_ctx.is_some()
+            {
+                Some(k3_expert_backend() == "cuda")
+            } else {
+                None
+            };
+            let k3_vram_reserve = if shape.family == Family::KimiK3 {
+                if let Some(ctx) = planned_ctx {
+                    let n_mla = k3_layer_kinds
+                        .iter()
+                        .filter(|&&kind| kind == kimi_k3::K3LayerKind::Mla)
+                        .count();
+                    let batch = k3_planned_batch.unwrap_or(1);
+                    let cuda_experts = k3_planned_cuda_experts.unwrap_or(false);
+                    let staging = k3_cuda_staging_bytes(&gguf, shape, cuda_experts)?;
+                    let reserve = k3_required_vram_headroom(
+                        ctx,
+                        n_mla,
+                        shape.n_kv_lora,
+                        shape.qk_rope,
+                        shape.n_head,
+                        batch,
+                        staging,
+                    )?;
+                    eprintln!(
+                        "pulsar: K3 context plan: ctx {ctx}, {n_mla} MLA layers, batch {batch}, CUDA staging {:.1} MiB -> reserve {:.1} MiB VRAM",
+                        staging as f64 / (1 << 20) as f64,
+                        reserve as f64 / (1 << 20) as f64,
+                    );
+                    reserve
+                } else {
+                    K3_DEFAULT_VRAM_RESERVE
+                }
+            } else {
+                0
+            };
 
             // the embedding table is read ~one row per token - pinned
             // host is free for it and returns ~1GB of VRAM to hot weights
@@ -2620,7 +2826,7 @@ mod real {
                 let mut buf = if matches!(shape.family, Family::Mla | Family::Dsv4) {
                     DeviceBuf::alloc_pinned(bytes.len())?
                 } else if shape.family == Family::KimiK3 {
-                    upload_k3_host(&bytes)?
+                    upload_k3_host(&bytes, k3_vram_reserve)?
                 } else {
                     DeviceBuf::alloc(bytes.len())?
                 };
@@ -2630,7 +2836,7 @@ mod real {
                 buf
             };
             let output_norm = if shape.family == Family::KimiK3 {
-                upload_k3(&file, &gguf, "output_norm.weight")?
+                upload_k3(&file, &gguf, "output_norm.weight", k3_vram_reserve)?
             } else {
                 upload(&file, &gguf, "output_norm.weight")?
             };
@@ -2642,7 +2848,7 @@ mod real {
                 "token_embd.weight"
             };
             let output = if shape.family == Family::KimiK3 {
-                upload_k3(&file, &gguf, head_name)?
+                upload_k3(&file, &gguf, head_name, k3_vram_reserve)?
             } else {
                 upload(&file, &gguf, head_name)?
             };
@@ -3240,14 +3446,22 @@ mod real {
                         let kind = *k3_layer_kinds
                             .get(il as usize)
                             .ok_or_else(|| format!("missing K3 layer kind for layer {il}"))?;
+                        let k3_tensor = |name: &str| upload_k3(&file, &gguf, name, k3_vram_reserve);
+                        let k3_mla_kq =
+                            |name: &str| upload_k3_mla_kq(&file, &gguf, name, k3_vram_reserve);
+                        let k3_mla_q8 =
+                            |name: &str| upload_k3_mla_q8(&file, &gguf, name, k3_vram_reserve);
+                        let k3_absorbed = |name: &str| {
+                            upload_k3_mla_absorbed_f32(&file, &gguf, name, k3_vram_reserve)
+                        };
                         let mut k3 = kimi_k3::KimiK3W {
                             kind,
-                            attn_norm: upload_k3(&file, &gguf, &t("attn_norm.weight"))?,
-                            ffn_norm: upload_k3(&file, &gguf, &t("ffn_norm.weight"))?,
-                            attn_res_norm: upload_k3(&file, &gguf, &t("attn_res_norm.weight"))?,
-                            attn_res_proj: upload_k3(&file, &gguf, &t("attn_res_proj.weight"))?,
-                            ffn_res_norm: upload_k3(&file, &gguf, &t("ffn_res_norm.weight"))?,
-                            ffn_res_proj: upload_k3(&file, &gguf, &t("ffn_res_proj.weight"))?,
+                            attn_norm: k3_tensor(&t("attn_norm.weight"))?,
+                            ffn_norm: k3_tensor(&t("ffn_norm.weight"))?,
+                            attn_res_norm: k3_tensor(&t("attn_res_norm.weight"))?,
+                            attn_res_proj: k3_tensor(&t("attn_res_proj.weight"))?,
+                            ffn_res_norm: k3_tensor(&t("ffn_res_norm.weight"))?,
+                            ffn_res_proj: k3_tensor(&t("ffn_res_proj.weight"))?,
                             ssm_q_conv: None,
                             ssm_k_conv: None,
                             ssm_v_conv: None,
@@ -3290,52 +3504,32 @@ mod real {
 
                         match kind {
                             kimi_k3::K3LayerKind::Kda => {
-                                k3.ssm_q_conv =
-                                    Some(upload_k3(&file, &gguf, &t("ssm_conv1d_q.weight"))?);
-                                k3.ssm_k_conv =
-                                    Some(upload_k3(&file, &gguf, &t("ssm_conv1d_k.weight"))?);
-                                k3.ssm_v_conv =
-                                    Some(upload_k3(&file, &gguf, &t("ssm_conv1d_v.weight"))?);
-                                k3.wq = Some(upload_k3_mla_kq(&file, &gguf, &t("attn_q.weight"))?);
-                                k3.wk = Some(upload_k3_mla_kq(&file, &gguf, &t("attn_k.weight"))?);
-                                k3.wv = Some(upload_k3_mla_kq(&file, &gguf, &t("attn_v.weight"))?);
-                                k3.ssm_f_a =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("ssm_f_a.weight"))?);
-                                k3.ssm_f_b = Some(upload_k3_mla_absorbed_f32(
-                                    &file,
-                                    &gguf,
-                                    &t("ssm_f_b.weight"),
-                                )?);
-                                k3.ssm_beta =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("ssm_beta.weight"))?);
-                                k3.ssm_a = Some(upload_k3(&file, &gguf, &t("ssm_a"))?);
-                                k3.ssm_dt_b = Some(upload_k3(&file, &gguf, &t("ssm_dt.bias"))?);
-                                k3.wqkv_gate =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_gate.weight"))?);
-                                k3.ssm_o_norm =
-                                    Some(upload_k3(&file, &gguf, &t("ssm_norm.weight"))?);
-                                k3.wo =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_output.weight"))?);
+                                k3.ssm_q_conv = Some(k3_tensor(&t("ssm_conv1d_q.weight"))?);
+                                k3.ssm_k_conv = Some(k3_tensor(&t("ssm_conv1d_k.weight"))?);
+                                k3.ssm_v_conv = Some(k3_tensor(&t("ssm_conv1d_v.weight"))?);
+                                k3.wq = Some(k3_mla_kq(&t("attn_q.weight"))?);
+                                k3.wk = Some(k3_mla_kq(&t("attn_k.weight"))?);
+                                k3.wv = Some(k3_mla_kq(&t("attn_v.weight"))?);
+                                k3.ssm_f_a = Some(k3_mla_kq(&t("ssm_f_a.weight"))?);
+                                k3.ssm_f_b = Some(k3_absorbed(&t("ssm_f_b.weight"))?);
+                                k3.ssm_beta = Some(k3_mla_kq(&t("ssm_beta.weight"))?);
+                                k3.ssm_a = Some(k3_tensor(&t("ssm_a"))?);
+                                k3.ssm_dt_b = Some(k3_tensor(&t("ssm_dt.bias"))?);
+                                k3.wqkv_gate = Some(k3_mla_kq(&t("attn_gate.weight"))?);
+                                k3.ssm_o_norm = Some(k3_tensor(&t("ssm_norm.weight"))?);
+                                k3.wo = Some(k3_mla_kq(&t("attn_output.weight"))?);
                             }
                             kimi_k3::K3LayerKind::Mla => {
-                                k3.mla_wq_a =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_q_a.weight"))?);
-                                k3.mla_q_a_norm =
-                                    Some(upload_k3(&file, &gguf, &t("attn_q_a_norm.weight"))?);
-                                k3.mla_wq_b =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_q_b.weight"))?);
-                                k3.mla_wkv_a_mqa = Some(upload_k3_mla_kq(
-                                    &file,
-                                    &gguf,
-                                    &t("attn_kv_a_mqa.weight"),
-                                )?);
-                                k3.mla_kv_a_norm =
-                                    Some(upload_k3(&file, &gguf, &t("attn_kv_a_norm.weight"))?);
+                                k3.mla_wq_a = Some(k3_mla_kq(&t("attn_q_a.weight"))?);
+                                k3.mla_q_a_norm = Some(k3_tensor(&t("attn_q_a_norm.weight"))?);
+                                k3.mla_wq_b = Some(k3_mla_kq(&t("attn_q_b.weight"))?);
+                                k3.mla_wkv_a_mqa = Some(k3_mla_kq(&t("attn_kv_a_mqa.weight"))?);
+                                k3.mla_kv_a_norm = Some(k3_tensor(&t("attn_kv_a_norm.weight"))?);
                                 let optional_mla_kq =
                                     |suffix: &str| -> Result<Option<kimi_k3::K3DenseWeight>> {
                                         let name = t(suffix);
                                         if gguf.tensor(&name).is_some() {
-                                            Ok(Some(upload_k3_mla_kq(&file, &gguf, &name)?))
+                                            Ok(Some(k3_mla_kq(&name)?))
                                         } else {
                                             Ok(None)
                                         }
@@ -3344,9 +3538,7 @@ mod real {
                                     |suffix: &str| -> Result<Option<DeviceBuf>> {
                                         let name = t(suffix);
                                         if gguf.tensor(&name).is_some() {
-                                            Ok(Some(upload_k3_mla_absorbed_f32(
-                                                &file, &gguf, &name,
-                                            )?))
+                                            Ok(Some(k3_absorbed(&name)?))
                                         } else {
                                             Ok(None)
                                         }
@@ -3360,37 +3552,26 @@ mod real {
                                 // before the fused kernel). Q8_0 is valid here since the matmul
                                 // is a standard projection.
                                 k3.mla_wkv_b = optional_mla_kq("attn_kv_b.weight")?;
-                                k3.mla_wqkv_gate =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_gate.weight"))?);
-                                k3.mla_wo =
-                                    Some(upload_k3_mla_kq(&file, &gguf, &t("attn_output.weight"))?);
+                                k3.mla_wqkv_gate = Some(k3_mla_kq(&t("attn_gate.weight"))?);
+                                k3.mla_wo = Some(k3_mla_kq(&t("attn_output.weight"))?);
                             }
                         }
 
                         if il < shape.n_leading_dense {
-                            k3.ffn_gate =
-                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_gate.weight"))?);
-                            k3.ffn_up = Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_up.weight"))?);
-                            k3.ffn_down =
-                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_down.weight"))?);
+                            k3.ffn_gate = Some(k3_mla_kq(&t("ffn_gate.weight"))?);
+                            k3.ffn_up = Some(k3_mla_kq(&t("ffn_up.weight"))?);
+                            k3.ffn_down = Some(k3_mla_kq(&t("ffn_down.weight"))?);
                         } else {
-                            k3.ffn_gate_inp =
-                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_gate_inp.weight"))?);
+                            k3.ffn_gate_inp = Some(k3_mla_kq(&t("ffn_gate_inp.weight"))?);
                             let bias_name = if gguf.tensor(&t("exp_probs_b.bias")).is_some() {
                                 t("exp_probs_b.bias")
                             } else {
                                 t("exp_probs_b")
                             };
-                            k3.ffn_exp_probs_b = Some(upload_k3(&file, &gguf, &bias_name)?);
-                            k3.ffn_latent_down = Some(upload_k3_mla_kq(
-                                &file,
-                                &gguf,
-                                &t("ffn_latent_down.weight"),
-                            )?);
-                            k3.ffn_latent_norm =
-                                Some(upload_k3(&file, &gguf, &t("ffn_latent_norm.weight"))?);
-                            k3.ffn_latent_up =
-                                Some(upload_k3_mla_q8(&file, &gguf, &t("ffn_latent_up.weight"))?);
+                            k3.ffn_exp_probs_b = Some(k3_tensor(&bias_name)?);
+                            k3.ffn_latent_down = Some(k3_mla_kq(&t("ffn_latent_down.weight"))?);
+                            k3.ffn_latent_norm = Some(k3_tensor(&t("ffn_latent_norm.weight"))?);
+                            k3.ffn_latent_up = Some(k3_mla_q8(&t("ffn_latent_up.weight"))?);
                             for (slot, suffix) in [
                                 (&mut k3.ffn_gate_exps, "ffn_gate_exps.weight"),
                                 (&mut k3.ffn_up_exps, "ffn_up_exps.weight"),
@@ -3400,12 +3581,9 @@ mod real {
                                 let ti = gguf.tensor(&name).ok_or_else(|| meta_err(&name))?;
                                 *slot = Some(ExpertTensor::new(&gguf, ti, shape.n_expert)?);
                             }
-                            k3.ffn_gate_shexp =
-                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_gate_shexp.weight"))?);
-                            k3.ffn_up_shexp =
-                                Some(upload_k3_mla_kq(&file, &gguf, &t("ffn_up_shexp.weight"))?);
-                            k3.ffn_down_shexp =
-                                Some(upload_k3_mla_q8(&file, &gguf, &t("ffn_down_shexp.weight"))?);
+                            k3.ffn_gate_shexp = Some(k3_mla_kq(&t("ffn_gate_shexp.weight"))?);
+                            k3.ffn_up_shexp = Some(k3_mla_kq(&t("ffn_up_shexp.weight"))?);
+                            k3.ffn_down_shexp = Some(k3_mla_q8(&t("ffn_down_shexp.weight"))?);
                         }
 
                         return Ok(LayerW {
@@ -3678,7 +3856,12 @@ mod real {
             // K3 output AttnRes tensors (global, optional)
             let k3_output_res_norm = if shape.family == Family::KimiK3 {
                 if gguf.tensor("output_res_norm.weight").is_some() {
-                    Some(upload(&file, &gguf, "output_res_norm.weight")?)
+                    Some(upload_k3(
+                        &file,
+                        &gguf,
+                        "output_res_norm.weight",
+                        k3_vram_reserve,
+                    )?)
                 } else {
                     None
                 }
@@ -3687,7 +3870,12 @@ mod real {
             };
             let k3_output_res_proj = if shape.family == Family::KimiK3 {
                 if gguf.tensor("output_res_proj.weight").is_some() {
-                    Some(upload(&file, &gguf, "output_res_proj.weight")?)
+                    Some(upload_k3(
+                        &file,
+                        &gguf,
+                        "output_res_proj.weight",
+                        k3_vram_reserve,
+                    )?)
                 } else {
                     None
                 }
@@ -3725,6 +3913,13 @@ mod real {
                 k3_layer_kinds,
                 k3_output_res_norm,
                 k3_output_res_proj,
+                k3_planned_ctx: if shape.family == Family::KimiK3 {
+                    planned_ctx
+                } else {
+                    None
+                },
+                k3_planned_batch,
+                k3_planned_cuda_experts,
                 k3_device_log: std::sync::OnceLock::new(),
             })
         }
@@ -3735,6 +3930,13 @@ mod real {
     /// census, so tiers activate from the second run on.
     fn build_tiers(m: &Model, mb: u32, primary: i32) -> Result<Vec<ExpertTier>> {
         let s = m.shape;
+        // K3 experts live in Attn::KimiK3 and use the dedicated synchronous
+        // staging path. The generic tier census only understands Ffn::Moe;
+        // allocating its pool for K3 consumes the secondary GPU but can never
+        // place or serve a triple.
+        if s.family == Family::KimiK3 {
+            return Ok(Vec::new());
+        }
         if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
             return Ok(Vec::new());
         }
@@ -4140,6 +4342,36 @@ mod real {
 
         pub fn with_cache(m: &Model, ctx: u32, cache_bytes: usize) -> Result<State> {
             let s = m.shape;
+            let configured_batch = std::env::var("PULSAR_BATCH")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(if s.family == Family::KimiK3 { 1 } else { 256 })
+                .max(1);
+            if s.family == Family::KimiK3 {
+                if let Some(planned) = m.k3_planned_ctx {
+                    if ctx > planned {
+                        return Err(format!(
+                            "K3 state context {ctx} exceeds model-load plan {planned}; reload with Model::load_for_ctx(path, {ctx})"
+                        )
+                        .into());
+                    }
+                }
+                if let Some(planned) = m.k3_planned_batch {
+                    if configured_batch > planned {
+                        return Err(format!(
+                            "K3 state batch {configured_batch} exceeds model-load plan {planned}; set PULSAR_BATCH before Model::load_for_ctx"
+                        )
+                        .into());
+                    }
+                }
+                let cuda_experts = k3_expert_backend() == "cuda";
+                if cuda_experts && m.k3_planned_cuda_experts == Some(false) {
+                    return Err(
+                        "K3 CUDA experts were enabled after model loading; set PULSAR_K3_EXPERT_BACKEND=cuda before Model::load_for_ctx"
+                            .into(),
+                    );
+                }
+            }
             let f32s = |n: u32| DeviceBuf::alloc(n as usize * 4);
             let n_used = s.n_expert_used as usize;
             // uniform slab size across gate/up/down on this model; assert at fetch
@@ -4248,12 +4480,8 @@ mod real {
                         .map(|d| d.clamp(1, 15) + 1)
                         .unwrap_or(0),
                 );
-            let mb = std::env::var("PULSAR_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                // K3's wide expert scratch is reserved for explicit batching.
-                .unwrap_or(if s.family == Family::KimiK3 { 1 } else { 256 })
-                .max(1);
+            // K3's wide expert scratch is reserved for explicit batching.
+            let mb = configured_batch;
 
             // everything the attn segment touches lives on the attn GPU
             // when one is set: KV, MLA scratch, q/heads, hop buffers
@@ -4320,7 +4548,11 @@ mod real {
             let kv_raw = f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?;
             let kv_norm = f32s(mb * s.n_kv_lora.max(1))?;
             let qk_low = f32s(mb * s.n_head * s.n_kv_lora.max(1))?;
-            let mla_selected = DeviceBuf::alloc(mb as usize * ctx as usize * 4)?;
+            let mla_selected = DeviceBuf::alloc(if s.family == Family::KimiK3 {
+                s.n_head as usize * ctx as usize * 4
+            } else {
+                mb as usize * ctx as usize * 4
+            })?;
             // DSA indexer buffers live beside the attn stack (same device)
             let has_idx = s.n_idx_topk > 0 && s.family == Family::Mla;
             let mut idx_kcache = Vec::new();
@@ -4619,9 +4851,7 @@ mod real {
                         c.max(1)
                     };
                     // decode floor: one layer's slot resolve always fits
-                    let gpu_moe = s.family == Family::KimiK3
-                        && std::env::var("PULSAR_K3_EXPERT_BACKEND").ok().as_deref()
-                            == Some("cuda");
+                    let gpu_moe = s.family == Family::KimiK3 && k3_expert_backend() == "cuda";
                     // The initial K3 CUDA backend is synchronous and reuses one
                     // layer-sized packed staging slot. It does not reserve a
                     // prefetch window or the complete expert bank.
@@ -6999,6 +7229,27 @@ mod real {
         static ENV_LOCK: Mutex<()> = Mutex::new(());
 
         #[test]
+        fn k3_backend_defaults_to_cuda_with_explicit_cpu_overrides() {
+            let _guard = ENV_LOCK.lock().unwrap();
+            let previous = std::env::var("PULSAR_K3_EXPERT_BACKEND").ok();
+
+            std::env::remove_var("PULSAR_K3_EXPERT_BACKEND");
+            assert_eq!(k3_expert_backend(), "cuda");
+            std::env::set_var("PULSAR_K3_EXPERT_BACKEND", "cpu");
+            assert_eq!(k3_expert_backend(), "cpu");
+            std::env::set_var("PULSAR_K3_EXPERT_BACKEND", "cpu-q8");
+            assert_eq!(k3_expert_backend(), "cpu-q8");
+            std::env::set_var("PULSAR_K3_EXPERT_BACKEND", "cuda");
+            assert_eq!(k3_expert_backend(), "cuda");
+
+            if let Some(value) = previous {
+                std::env::set_var("PULSAR_K3_EXPERT_BACKEND", value);
+            } else {
+                std::env::remove_var("PULSAR_K3_EXPERT_BACKEND");
+            }
+        }
+
+        #[test]
         fn k3_host_upload_uses_mapped_storage_when_enabled() {
             let _guard = ENV_LOCK.lock().unwrap();
             // Exercise the actual DeviceBuf placement, not just env parsing.
@@ -7009,7 +7260,8 @@ mod real {
             }
             let prev = std::env::var("PULSAR_K3_HOST").ok();
             std::env::set_var("PULSAR_K3_HOST", "1");
-            let buf = upload_k3_host(&[0x5au8; 256]).expect("mapped pinned alloc");
+            let buf = upload_k3_host(&[0x5au8; 256], K3_DEFAULT_VRAM_RESERVE)
+                .expect("mapped pinned alloc");
             assert!(
                 buf.is_pinned(),
                 "PULSAR_K3_HOST=1 must select pinned storage"
@@ -7030,12 +7282,44 @@ mod real {
             }
             let prev = std::env::var("PULSAR_K3_HOST").ok();
             std::env::remove_var("PULSAR_K3_HOST");
-            let buf = upload_k3_host(&[0xa5u8; 256]).expect("device alloc");
+            let buf = upload_k3_host(&[0xa5u8; 256], 0).expect("device alloc");
             assert!(!buf.is_pinned(), "default K3 placement must remain VRAM");
             drop(buf);
             if let Some(v) = prev {
                 std::env::set_var("PULSAR_K3_HOST", v);
             }
+        }
+
+        #[test]
+        fn k3_context_vram_scales_with_mla_cache_and_score_rows() {
+            let one = k3_context_state_bytes(1, 24, 512, 64, 96).unwrap();
+            assert_eq!(one, 24 * (512 + 64) * 4 + 96 * 4);
+            assert_eq!(
+                k3_context_state_bytes(32_768, 24, 512, 64, 96).unwrap(),
+                one * 32_768
+            );
+        }
+
+        #[test]
+        fn k3_32k_vram_plan_covers_state_safety_and_cuda_staging() {
+            let staging = 191_299_584usize;
+            let context = k3_context_state_bytes(32_768, 24, 512, 64, 96).unwrap();
+            let expected = context
+                + K3_FIXED_STATE_RESERVE
+                + K3_CUDA_SAFETY_RESERVE
+                + K3_BATCH_SCRATCH_RESERVE
+                + staging;
+            let planned = k3_required_vram_headroom(32_768, 24, 512, 64, 96, 1, staging).unwrap();
+            assert_eq!(planned, expected);
+            assert!(planned > K3_DEFAULT_VRAM_RESERVE);
+        }
+
+        #[test]
+        fn k3_small_context_keeps_the_existing_reserve_floor() {
+            assert_eq!(
+                k3_required_vram_headroom(256, 24, 512, 64, 96, 1, 0).unwrap(),
+                K3_DEFAULT_VRAM_RESERVE
+            );
         }
     }
 }

@@ -5522,6 +5522,7 @@ __global__ static void k3_mla_qk_lowrank_f32_kernel(
 
 __global__ static void k3_mla_cached_attn_f32_kernel(
         float *out,
+        float *score_scratch,
         const float *q,
         const float *qk_low,
         const float *kv_lora_cache,
@@ -5541,8 +5542,8 @@ __global__ static void k3_mla_cached_attn_f32_kernel(
 
     extern __shared__ float sm[];
     float *red = sm;
-    float *scores = sm + 256u;
-    float *latent = scores + n_kv;
+    float *latent = sm + 256u;
+    float *scores = score_scratch + (uint64_t)h * cache_cap;
     const uint32_t qk_dim = qk_nope + qk_tail;
     const float *qh = q + (uint64_t)h * qk_dim;
     const float *low = qk_low + (uint64_t)h * kv_lora_rank;
@@ -5603,6 +5604,7 @@ __global__ static void k3_mla_cached_attn_f32_kernel(
 extern "C" int pulsar_k3_mla_cached_attn_split(
         void *out_dev,
         void *qk_low_dev,
+        void *score_scratch_dev,
         const void *q_dev,
         const void *kv_lora_cache_dev,
         const void *k_tail_cache_dev,
@@ -5616,7 +5618,7 @@ extern "C" int pulsar_k3_mla_cached_attn_split(
         uint32_t kv_lora_rank,
         uint32_t v_mla,
         float scale) {
-    if (!out_dev || !qk_low_dev || !q_dev || !kv_lora_cache_dev ||
+    if (!out_dev || !qk_low_dev || !score_scratch_dev || !q_dev || !kv_lora_cache_dev ||
         !k_tail_cache_dev || !wk_b_dev || !wv_b_dev || n_kv == 0 ||
         n_kv > cache_cap || n_head == 0 || qk_nope == 0 || qk_tail == 0 ||
         kv_lora_rank == 0 || kv_lora_rank > 1024u || v_mla == 0) {
@@ -5626,11 +5628,12 @@ extern "C" int pulsar_k3_mla_cached_attn_split(
             (float *)qk_low_dev, (const float *)q_dev, (const float *)wk_b_dev,
             n_head, qk_nope, qk_tail, kv_lora_rank);
     if (!cuda_ok(cudaGetLastError(), "k3 mla qk lowrank f32 launch")) return 0;
-    const uint64_t smem = (256u + (uint64_t)n_kv + kv_lora_rank) * sizeof(float);
+    const uint64_t smem = (256u + (uint64_t)kv_lora_rank) * sizeof(float);
     if (!mla_smem_ok((const void *)k3_mla_cached_attn_f32_kernel, smem,
                      "k3 mla cached attention smem opt-in")) return 0;
     k3_mla_cached_attn_f32_kernel<<<n_head, 256, (size_t)smem>>>(
-            (float *)out_dev, (const float *)q_dev, (const float *)qk_low_dev,
+            (float *)out_dev, (float *)score_scratch_dev,
+            (const float *)q_dev, (const float *)qk_low_dev,
             (const float *)kv_lora_cache_dev, (const float *)k_tail_cache_dev,
             (const float *)wv_b_dev, n_kv, cache_cap, n_head, qk_nope, qk_tail,
             kv_lora_rank, v_mla, scale);
@@ -6137,6 +6140,137 @@ extern "C" int pulsar_k3_mla_absorbed_attn_split_q8_selftest(void) {
            k3_mla_absorbed_attn_split_q8_selftest_one(8, 16, 8, 32, 16) &&
            k3_mla_absorbed_attn_split_q8_selftest_one(4, 128, 64, 64, 32) &&
            k3_mla_absorbed_attn_split_q8_selftest_one(2, 128, 64, 512, 128);
+}
+
+extern "C" int pulsar_k3_mla_cached_attn_32k_selftest(void) {
+    const uint32_t cache_cap = 32768, n_kv = 32767;
+    const uint32_t n_head = 2, qk_nope = 8, qk_tail = 4;
+    const uint32_t lora = 16, value = 8, qk_dim = qk_nope + qk_tail;
+    const uint64_t q_n = (uint64_t)n_head * qk_dim;
+    const uint64_t cache_n = (uint64_t)cache_cap * lora;
+    const uint64_t tail_n = (uint64_t)cache_cap * qk_tail;
+    const uint64_t wk_n = (uint64_t)qk_nope * lora * n_head;
+    const uint64_t wv_n = (uint64_t)lora * value * n_head;
+    const uint64_t out_n = (uint64_t)n_head * value;
+    const uint64_t score_n = (uint64_t)n_head * cache_cap;
+
+    float *q = (float *)malloc(q_n * sizeof(float));
+    float *cache = (float *)malloc(cache_n * sizeof(float));
+    float *tail = (float *)malloc(tail_n * sizeof(float));
+    float *wk = (float *)malloc(wk_n * sizeof(float));
+    float *wv = (float *)malloc(wv_n * sizeof(float));
+    float *ref = (float *)calloc(out_n, sizeof(float));
+    float *gpu = (float *)malloc(out_n * sizeof(float));
+    float *scores = (float *)malloc((uint64_t)n_kv * sizeof(float));
+    float *score_guard = (float *)malloc(score_n * sizeof(float));
+    if (!q || !cache || !tail || !wk || !wv || !ref || !gpu || !scores || !score_guard) return 0;
+
+    for (uint64_t i = 0; i < q_n; i++) q[i] = 0.01f * (float)(1 + i % 13);
+    for (uint64_t i = 0; i < score_n; i++) score_guard[i] = 12345.0f;
+    for (uint32_t t = 0; t < cache_cap; t++) {
+        const float phase = t < n_kv / 2 ? -1.0f : 1.0f;
+        for (uint32_t j = 0; j < lora; j++)
+            cache[(uint64_t)t * lora + j] =
+                    phase * 0.2f * (float)(1 + j) + 0.001f * (float)(t % 17);
+        for (uint32_t r = 0; r < qk_tail; r++)
+            tail[(uint64_t)t * qk_tail + r] =
+                    phase * 0.3f * (float)(1 + r) + 0.002f * (float)(t % 13);
+    }
+    for (uint32_t h = 0; h < n_head; h++) {
+        for (uint32_t j = 0; j < lora; j++) {
+            for (uint32_t i = 0; i < qk_nope; i++) {
+                wk[i + (uint64_t)qk_nope * (j + (uint64_t)lora * h)] =
+                        0.001f * (float)(1 + i + 3 * j + 5 * h);
+            }
+        }
+        for (uint32_t d = 0; d < value; d++) {
+            for (uint32_t j = 0; j < lora; j++) {
+                const float w = 0.002f * (float)(1 + j + 2 * d + 7 * h);
+                wv[j + (uint64_t)lora * (d + (uint64_t)value * h)] = w;
+            }
+        }
+    }
+
+    const float scale = 1.0f / sqrtf((float)qk_dim);
+    for (uint32_t h = 0; h < n_head; h++) {
+        float q_low[16], latent[16];
+        const float *qh = q + (uint64_t)h * qk_dim;
+        for (uint32_t j = 0; j < lora; j++) {
+            q_low[j] = 0.0f;
+            latent[j] = 0.0f;
+            for (uint32_t i = 0; i < qk_nope; i++) {
+                q_low[j] += qh[i] * wk[i + (uint64_t)qk_nope * (j + (uint64_t)lora * h)];
+            }
+        }
+        float max_score = -INFINITY;
+        for (uint32_t t = 0; t < n_kv; t++) {
+            float score = 0.0f;
+            for (uint32_t j = 0; j < lora; j++)
+                score += q_low[j] * cache[(uint64_t)t * lora + j];
+            for (uint32_t r = 0; r < qk_tail; r++)
+                score += qh[qk_nope + r] * tail[(uint64_t)t * qk_tail + r];
+            scores[t] = score * scale;
+            max_score = fmaxf(max_score, scores[t]);
+        }
+        float denom = 0.0f;
+        for (uint32_t t = 0; t < n_kv; t++) {
+            scores[t] = expf(scores[t] - max_score);
+            denom += scores[t];
+            for (uint32_t j = 0; j < lora; j++)
+                latent[j] += scores[t] * cache[(uint64_t)t * lora + j];
+        }
+        for (uint32_t j = 0; j < lora; j++) latent[j] /= denom;
+        for (uint32_t d = 0; d < value; d++) {
+            for (uint32_t j = 0; j < lora; j++) {
+                ref[(uint64_t)h * value + d] +=
+                        latent[j] * wv[j + (uint64_t)lora * (d + (uint64_t)value * h)];
+            }
+        }
+    }
+
+    void *dq = NULL, *dcache = NULL, *dtail = NULL, *dwk = NULL, *dwv = NULL;
+    void *dqk = NULL, *dscores = NULL, *dout = NULL;
+    int ok = cuda_ok(cudaMalloc(&dq, q_n * sizeof(float)), "cached q alloc") &&
+             cuda_ok(cudaMalloc(&dcache, cache_n * sizeof(float)), "cached kv alloc") &&
+             cuda_ok(cudaMalloc(&dtail, tail_n * sizeof(float)), "cached tail alloc") &&
+             cuda_ok(cudaMalloc(&dwk, wk_n * sizeof(float)), "cached wk alloc") &&
+             cuda_ok(cudaMalloc(&dwv, wv_n * sizeof(float)), "cached wv alloc") &&
+             cuda_ok(cudaMalloc(&dqk, (uint64_t)n_head * lora * sizeof(float)), "cached qk alloc") &&
+             cuda_ok(cudaMalloc(&dscores, score_n * sizeof(float)), "cached scores alloc") &&
+             cuda_ok(cudaMalloc(&dout, out_n * sizeof(float)), "cached out alloc") &&
+             cuda_ok(cudaMemcpy(dq, q, q_n * sizeof(float), cudaMemcpyHostToDevice), "cached q h2d") &&
+             cuda_ok(cudaMemcpy(dcache, cache, cache_n * sizeof(float), cudaMemcpyHostToDevice), "cached kv h2d") &&
+             cuda_ok(cudaMemcpy(dtail, tail, tail_n * sizeof(float), cudaMemcpyHostToDevice), "cached tail h2d") &&
+             cuda_ok(cudaMemcpy(dwk, wk, wk_n * sizeof(float), cudaMemcpyHostToDevice), "cached wk h2d") &&
+             cuda_ok(cudaMemcpy(dwv, wv, wv_n * sizeof(float), cudaMemcpyHostToDevice), "cached wv h2d") &&
+             cuda_ok(cudaMemcpy(dscores, score_guard, score_n * sizeof(float), cudaMemcpyHostToDevice),
+                     "cached scores h2d");
+    if (ok) {
+        ok &= pulsar_k3_mla_cached_attn_split(
+                dout, dqk, dscores, dq, dcache, dtail, dwk, dwv, n_kv, cache_cap,
+                n_head, qk_nope, qk_tail, lora, value, scale);
+        ok &= cuda_ok(cudaDeviceSynchronize(), "cached 32k sync");
+        ok &= cuda_ok(cudaMemcpy(gpu, dout, out_n * sizeof(float), cudaMemcpyDeviceToHost),
+                      "cached 32k d2h");
+        ok &= cuda_ok(cudaMemcpy(score_guard, dscores, score_n * sizeof(float), cudaMemcpyDeviceToHost),
+                      "cached scores d2h");
+    }
+    float maxd = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < out_n; i++) maxd = fmaxf(maxd, fabsf(gpu[i] - ref[i]));
+        ok = maxd <= 1.0e-4f &&
+             score_guard[n_kv] == 12345.0f && score_guard[score_n - 1] == 12345.0f &&
+             score_guard[0] != 12345.0f && score_guard[cache_cap] != 12345.0f;
+    }
+    fprintf(stderr, "k3-mla-cached-attn-32k-selftest: %s (max diff %.2e)\n",
+            ok ? "PASS" : "FAIL", (double)maxd);
+
+    if (dq) cudaFree(dq); if (dcache) cudaFree(dcache); if (dtail) cudaFree(dtail);
+    if (dwk) cudaFree(dwk); if (dwv) cudaFree(dwv); if (dqk) cudaFree(dqk);
+    if (dscores) cudaFree(dscores); if (dout) cudaFree(dout);
+    free(q); free(cache); free(tail); free(wk); free(wv); free(ref); free(gpu);
+    free(scores); free(score_guard);
+    return ok;
 }
 
 extern "C" int pulsar_k3_mla_absorbed_attn_split_selftest(void) {

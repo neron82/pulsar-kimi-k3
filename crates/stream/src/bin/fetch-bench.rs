@@ -28,9 +28,8 @@ fn main() {
 fn plan(model: &str, count: &str, seed: &str, out: &str) {
     let count: usize = count.parse().expect("count");
     let mut state: u64 = seed.parse().expect("seed");
-    let head = read_head(model, 32 << 20);
-    let g = gguf::Gguf::parse(&head).expect("gguf parse");
-    let model_len = std::fs::metadata(model).expect("stat").len();
+    let shards = open_shards(model);
+    let (g, model_len) = merged_header(&shards);
     let all = stream::expert_reads(&g, model_len).expect("expert reads");
     eprintln!(
         "universe: {} expert slabs across {} exps tensors",
@@ -60,25 +59,34 @@ fn plan(model: &str, count: &str, seed: &str, out: &str) {
 
 #[cfg(target_os = "linux")]
 fn run(model: &str, plan_file: &str, qd: &str) {
-    use std::os::unix::fs::OpenOptionsExt;
     let qd: usize = qd.parse().expect("qd");
     let reads = stream::plan_from_str(&std::fs::read_to_string(plan_file).expect("read plan"))
         .expect("parse plan");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(model)
-        .expect("open O_DIRECT");
-    let stats = stream::uring::run_plan(&file, &reads, qd, 4096).expect("run");
+    let shards = open_shards(model);
+    let mut fetcher = stream::fetch::Fetcher::open_split(&shards, qd, None).expect("open O_DIRECT");
+    let t0 = std::time::Instant::now();
+    let slabs = fetcher.fetch(&reads).expect("run");
+    let secs = t0.elapsed().as_secs_f64();
+    let payload: u64 = slabs.iter().map(|s| s.payload().len() as u64).sum();
+    let disk: u64 = reads
+        .iter()
+        .map(|r| {
+            let aligned = r.offset & !4095;
+            (r.offset - aligned + r.len).next_multiple_of(4096)
+        })
+        .sum();
+    let checksum = slabs.iter().fold(0u8, |sum, slab| {
+        sum ^ slab.payload()[slab.payload().len() / 2]
+    });
     println!(
         "rust: {} reads, payload {:.2} GiB, disk {:.2} GiB, {:.3} s, {:.2} GB/s payload, {:.2} GB/s disk, checksum {:02x}",
-        stats.reads,
-        stats.bytes_payload as f64 / (1u64 << 30) as f64,
-        stats.bytes_disk as f64 / (1u64 << 30) as f64,
-        stats.secs,
-        stats.bytes_payload as f64 / stats.secs / 1e9,
-        stats.bytes_disk as f64 / stats.secs / 1e9,
-        stats.checksum,
+        reads.len(),
+        payload as f64 / (1u64 << 30) as f64,
+        disk as f64 / (1u64 << 30) as f64,
+        secs,
+        payload as f64 / secs / 1e9,
+        disk as f64 / secs / 1e9,
+        checksum,
     );
 }
 
@@ -90,8 +98,9 @@ fn pipeline_run(model: &str, plan_file: &str, qd: &str, max_slots: &str) {
     let reads = stream::plan_from_str(&std::fs::read_to_string(plan_file).expect("read plan"))
         .expect("parse plan");
 
-    let mut pl = Pipeline::open(
-        &std::path::Path::new(model),
+    let shards = open_shards(model);
+    let mut pl = Pipeline::open_split(
+        &shards,
         PipelineConfig {
             qd,
             max_slots,
@@ -150,4 +159,32 @@ fn read_head(path: &str, n: usize) -> Vec<u8> {
     }
     buf.truncate(got);
     buf
+}
+
+fn open_shards(model: &str) -> Vec<(u64, std::path::PathBuf)> {
+    let path = std::path::Path::new(model);
+    let paths = gguf::split_shards(path).unwrap_or_else(|| vec![path.to_path_buf()]);
+    let mut base = 0u64;
+    let mut shards = Vec::with_capacity(paths.len());
+    for path in paths {
+        let len = std::fs::metadata(&path).expect("stat shard").len();
+        shards.push((base, path));
+        base += len;
+    }
+    shards
+}
+
+fn merged_header(shards: &[(u64, std::path::PathBuf)]) -> (gguf::Gguf, u64) {
+    let mut headers = Vec::with_capacity(shards.len());
+    let mut model_len = 0u64;
+    for (_, path) in shards {
+        headers.push(gguf::Gguf::parse(&read_head_path(path, 32 << 20)).expect("gguf parse"));
+        model_len += std::fs::metadata(path).expect("stat shard").len();
+    }
+    let bases: Vec<u64> = shards.iter().map(|(base, _)| *base).collect();
+    (gguf::Gguf::merge_split(headers, &bases), model_len)
+}
+
+fn read_head_path(path: &std::path::Path, n: usize) -> Vec<u8> {
+    read_head(path.to_str().expect("utf8 model path"), n)
 }

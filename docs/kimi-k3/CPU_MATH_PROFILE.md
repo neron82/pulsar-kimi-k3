@@ -159,11 +159,11 @@ phase, consistent with this order of magnitude.
 
 ## Scope And Verification
 
-The selectable backend is `PULSAR_K3_EXPERT_BACKEND=cpu|cuda`; CPU is the
-default and remains the reference. CUDA uses `moe_pair_swiglu` and `moe_down`
-with Q8_K activations, `ExpertPtrs`, and `act_op=4`. Existing CUDA selftests
-cover Q2_K, Q3_K, routing, and SiTU activation; a real-model CPU/CUDA token
-comparison is required before changing the default.
+At the time of this profile, CPU was the default and reference backend. CUDA
+uses `moe_pair_swiglu` and `moe_down` with Q8_K activations, `ExpertPtrs`, and
+`act_op=4`. Subsequent semantic recovery, real-model behavioral validation,
+and the 32K server test promoted CUDA to the default. CPU and CPU-Q8 remain
+available through `PULSAR_K3_EXPERT_BACKEND` for diagnostics.
 
 `cargo build --release -p engine`, `cargo test -p engine` (44 tests), and
 `git diff --check` passed. The profile run completed on the requested RTX

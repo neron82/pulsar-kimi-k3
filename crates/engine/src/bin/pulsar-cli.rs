@@ -193,7 +193,7 @@ fn run() -> engine::Result {
 
     eprintln!("pulsar: loading {model_path}");
     let t0 = std::time::Instant::now();
-    let model = engine::Model::load(std::path::Path::new(&model_path))?;
+    let model = engine::Model::load_for_ctx(std::path::Path::new(&model_path), ctx)?;
     let tok = {
         let (_, g) = engine::parse_header(std::path::Path::new(&model_path))?;
         tokenizer::Tokenizer::from_gguf(&g)?
@@ -246,7 +246,7 @@ fn run() -> engine::Result {
     // Long prompts want one big prefill chunk (each chunk costs a full
     // expert-corpus pass) and can trade VRAM pool for it - the pool barely
     // hits during prefill anyway. Explicit env vars win.
-    if prompt_ids.len() > 384 {
+    if prompt_ids.len() > 384 && model.shape.family != engine::Family::KimiK3 {
         if std::env::var_os("PULSAR_BATCH").is_none() {
             std::env::set_var("PULSAR_BATCH", prompt_ids.len().min(768).to_string());
         }

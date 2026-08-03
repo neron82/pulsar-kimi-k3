@@ -315,8 +315,8 @@ the static reference result or the exact-GGUF incompatibility.
   residual, cache, KDA, state-reset, and XTML corrections. It remains useful
   historical evidence but is not an oracle for the corrected graph.
 - Corrected CPU-Q8 generated `Paris`; corrected CUDA passed the seven-prompt
-  behavioral suite in `BEHAVIOURAL_VALIDATION.md`. Exact layerwise
-  CPU-Q8/CUDA numerical parity has not been re-established, so CUDA remains
-  opt-in.
+  behavioral suite and 32K server validation in
+  `BEHAVIOURAL_VALIDATION.md`. CUDA is now the default expert backend; exact
+  layerwise CPU-Q8/CUDA numerical parity remains an open diagnostic question.
 - Fused `wkv_b` MLA is not cache-aware and is rejected explicitly. The tested
   Q2_K checkpoint uses split `wk_b`/`wv_b` tensors.

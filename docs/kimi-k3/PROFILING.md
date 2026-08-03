@@ -63,11 +63,15 @@ event synchronizes and therefore detailed mode has measurement perturbation.
 The following are exact counters at the instrumented boundaries: token/layer
 wall time, selected token IDs, router D2H bytes, requested expert IDs, cache
 hit/miss deltas, storage read request count/bytes/max size, and H2D/D2H byte
-counts. Storage wait is fetch submission-to-completion for the blocking
-`fetch_each` call, including completion handling; it is not an NVMe hardware
-latency sample. H2D time is exact only for the existing measured write calls
-in the generic path. Resident-tier accesses are counted as device-resident
-but are not storage reads.
+counts. Storage wait is time spent waiting for io_uring completions during the
+blocking `fetch_each` call; completion-callback work is not included. It is not
+an NVMe hardware latency sample. H2D time is exact for the measured K3 staging
+writes. Resident-tier accesses are counted as device-resident but are not
+storage reads.
+
+`PULSAR_STREAM_QD` overrides the default 32-read io_uring depth for controlled
+queue-depth experiments. The queue depth changes submission behavior only; it
+does not change the model or cache policy.
 
 Wall accounting is deliberately separate from activity accounting. Per-token
 `layers total + output/lm-head + unclassified` is a non-overlapping wall view;

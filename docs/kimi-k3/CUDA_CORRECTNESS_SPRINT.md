@@ -126,7 +126,9 @@ smokes correctly: `Paris`, `4`, `red`, `Cold`, `Oxygen`,
 17 CUDA self-tests passed. Exact prompts and token counts are recorded in
 `BEHAVIOURAL_VALIDATION.md`.
 
-CUDA remains opt-in because exact layerwise CPU-Q8/CUDA numerical parity has
-not been re-established. It is no longer classified as behaviorally broken
-for the tested split-weight Q2_K model. Fused `wkv_b` MLA remains explicitly
-unsupported until it receives a cache-aware path.
+CUDA remained opt-in at this checkpoint because exact layerwise CPU-Q8/CUDA
+numerical parity had not been re-established. After the seven-prompt suite,
+32K cached-attention test, and 32K real-model server validation, it became the
+default K3 expert backend. CPU and CPU-Q8 remain explicit diagnostics. Fused
+`wkv_b` MLA remains explicitly unsupported until it receives a cache-aware
+path.

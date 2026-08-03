@@ -77,3 +77,55 @@ usable K3 text behavior for this split-weight Q2_K checkpoint on both the
 shared CPU-Q8 graph and the CUDA expert path. It is not a claim of bitwise
 backend parity, fused-MLA support, optimized prefill, or support for raw chat
 prompts without XTML.
+
+## 32K Context Allocation Recovery
+
+The original model loader preserved a fixed 2048 MiB of primary VRAM before
+constructing `State`. That is insufficient for `--ctx 32768`: the 24 MLA
+layers require 1728 MiB of compact KV cache by themselves, before per-head
+score scratch, KDA recurrent state, runtime scratch, optional CUDA expert
+staging, and allocator safety margin.
+
+CLI and server now call `Model::load_for_ctx`, which computes K3 headroom from
+the requested context before placing weights. For this model the startup plans
+are:
+
+- CPU-Q8 experts: 3022.0 MiB reserved.
+- CUDA experts: 3204.4 MiB reserved, including 182.4 MiB expert staging.
+
+The cached MLA kernel now stores per-head scores in reusable global scratch,
+so dynamic shared memory no longer grows with context. Its CUDA self-test runs
+with `cache_cap=32768` and `n_kv=32767` using nonidentical cache rows.
+
+The following configuration loaded, reached the `/v1` listener, and answered
+the France smoke with exactly `Paris`:
+
+```bash
+PULSAR_GPU=GPU-7ac9a486-bc2d-f429-bcab-2e6fd1aee04b \
+PULSAR_CACHE_GB=50 \
+target/release/pulsar-serve \
+  -m /home/neron/models/kimi-k3/Q2_K/Kimi-K3-Q2_K-00001-of-00024.gguf \
+  --ctx 32768 --host 0.0.0.0
+```
+
+CUDA is the default K3 expert backend after behavioral and 32K validation.
+`PULSAR_K3_EXPERT_BACKEND=cpu` and `cpu-q8` remain explicit diagnostic
+overrides; they are not suitable server defaults because routed expert
+evaluation is serial and can leave one CPU core busy for many minutes.
+
+After the request, observed process RSS was about 59.2 GiB, system available
+memory was 27 GiB, and the RTX 3090 retained about 0.68 GiB free. The generic
+secondary-GPU expert tier is now skipped for K3 because it cannot resolve K3's
+architecture-specific expert records; this avoids reserving most of the RTX
+3060 Ti for zero usable triples.
+
+`PULSAR_CACHE_GB=85` is not safe on this 94 GiB host. Startup succeeds, but a
+request grows the host expert cache alongside mapped K3 weights and causes
+system memory pressure; the test server was killed before completing the
+request. This is a host-RAM limit, separate from the corrected primary-VRAM
+allocation.
+
+With the CUDA-default fix, `PULSAR_CACHE_GB=65` completed the France request,
+but process RSS reached about 72.7 GiB and only 11 GiB system memory remained
+available. The validated 50 GiB setting is the recommended ceiling on this
+host.

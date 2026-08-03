@@ -18,22 +18,11 @@
 //! Reference: moonshotai/Kimi-K3 (HF), sglang kimi_k3.py,
 //! atomic-llama-cpp-turboquant-kimi/src/models/kimi-k3.cpp.
 
-use super::{Model, Result, State};
+use super::{k3_expert_backend, Model, Result, State};
 use kernels::{DeviceBuf, ExpertPtrs};
 use stream::Read as StreamRead;
 
 use super::StreamingStore;
-
-/// Select the K3 routed-expert implementation. CPU remains the default until
-/// the CUDA path has been validated against the host reference.
-fn k3_expert_backend() -> &'static str {
-    match std::env::var("PULSAR_K3_EXPERT_BACKEND").as_deref() {
-        Ok("cuda") => "cuda",
-        Ok("cpu-q8") => "cpu-q8",
-        Ok("cpu") | Err(_) => "cpu",
-        _ => "cpu",
-    }
-}
 
 fn k3_accum_mode() -> &'static str {
     match std::env::var("PULSAR_K3_ACCUM_MODE").as_deref() {
@@ -547,6 +536,7 @@ impl Model {
         kv_lora_cache: &mut DeviceBuf,     // [ctx, kv_lora_rank] f32
         k_tail_cache: &mut DeviceBuf,      // [ctx, qk_rope] f32
         qk_low: &mut DeviceBuf,            // [n_head, kv_lora_rank] f32
+        score_scratch: &mut DeviceBuf,     // [n_head, ctx] f32
         pos: u32,
         ctx: u32,
         dims: &K3MlaDims,
@@ -629,6 +619,7 @@ impl Model {
                 kernels::k3_mla_cached_attn_split(
                     attn,
                     qk_low,
+                    score_scratch,
                     q_full,
                     kv_lora_cache,
                     k_tail_cache,
@@ -1444,6 +1435,7 @@ impl Model {
             store.io_reads,
             store.io_max_read,
             store.io_wait,
+            store.io_read_wait,
         );
         let dev_before = (dev_cache.hits, dev_cache.misses);
         let resolve_t0 = std::time::Instant::now();
@@ -1485,9 +1477,13 @@ impl Model {
             })?;
         }
         if let Some(p) = layer_prof.as_deref_mut() {
-            p.expert_resolution += resolve_t0.elapsed();
-            p.storage += store.io_wait.saturating_sub(store_before.5);
-            p.cache += resolve_t0.elapsed().saturating_sub(p.storage);
+            let resolve_elapsed = resolve_t0.elapsed();
+            let storage_wait = store.io_read_wait.saturating_sub(store_before.6);
+            p.expert_resolution += resolve_elapsed;
+            p.storage += storage_wait;
+            p.cache += resolve_elapsed
+                .saturating_sub(storage_wait)
+                .saturating_sub(resolved_h2d_time);
             p.h2d_bytes = p.h2d_bytes.saturating_add(resolved_h2d_bytes);
             p.h2d += resolved_h2d_time;
             p.storage_bytes = p
@@ -1623,6 +1619,7 @@ impl Model {
         k3_dump_device(step, "moe", il, "latent_up_output", &rt.moe_out, n_embd)?;
 
         // 8. Shared experts (on full hidden state, SiTU-GLU)
+        let shared_t0 = std::time::Instant::now();
         // gate = x @ W_gate_sh  [n_embd -> n_ff_exp * n_expert_shared]
         let shexp_width = n_ff_exp * n_expert_shared;
         ffn_gate_shexp.matmul(
@@ -1668,6 +1665,9 @@ impl Model {
             &rt.shexp_out,
             n_embd,
         )?;
+        if let Some(p) = layer_prof.as_deref_mut() {
+            p.shared_expert += shared_t0.elapsed();
+        }
 
         // 9. ffn_out = moe_out + shexp_out
         kernels::add(&mut rt.ffn_out, &rt.moe_out, &rt.shexp_out, n_embd)?;
@@ -2890,6 +2890,7 @@ impl Model {
                         &mut st.kcache[il],
                         &mut st.vcache[il],
                         &mut st.qk_low,
+                        &mut st.mla_selected,
                         pos0,
                         st.ctx,
                         &dims,

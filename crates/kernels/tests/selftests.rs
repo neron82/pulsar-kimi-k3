@@ -27,5 +27,6 @@ selftest!(k3_situ_glu_selftest);
 selftest!(k3_router_selftest);
 selftest!(k3_kda_step_selftest);
 selftest!(k3_mla_absorbed_attn_split_selftest);
+selftest!(k3_mla_cached_attn_32k_selftest);
 selftest!(k3_mla_absorbed_attn_split_q8_selftest);
 selftest!(k3_mla_absorbed_attn_fused_selftest);

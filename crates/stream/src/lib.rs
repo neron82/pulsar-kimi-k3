@@ -272,6 +272,16 @@ pub mod fetch {
         files: Vec<(u64, std::fs::File)>,
         qd: usize,
         buf_alloc: Option<super::uring::BufAlloc>,
+        last_stats: FetchStats,
+    }
+
+    /// Timing for the most recent [`Fetcher::fetch_each`] call.
+    #[derive(Debug, Clone, Default)]
+    pub struct FetchStats {
+        /// Time spent waiting for io_uring completions.
+        pub read_wait: std::time::Duration,
+        /// Time spent in the completion callback, including consumer work.
+        pub callback: std::time::Duration,
     }
 
     impl Fetcher {
@@ -315,6 +325,7 @@ pub mod fetch {
                 files,
                 qd,
                 buf_alloc,
+                last_stats: FetchStats::default(),
             })
         }
 
@@ -346,6 +357,7 @@ pub mod fetch {
             reads: &[Read],
             mut on_slab: impl FnMut(usize, Slab) -> std::io::Result<()>,
         ) -> std::io::Result<()> {
+            let mut stats = FetchStats::default();
             let mut pending: Vec<Option<Slab>> = (0..reads.len()).map(|_| None).collect();
             let mut next = 0usize;
             let mut inflight = 0usize;
@@ -381,7 +393,9 @@ pub mod fetch {
                 if inflight == 0 {
                     break;
                 }
+                let wait_t0 = std::time::Instant::now();
                 self.ring.submit_and_wait(1)?;
+                stats.read_wait += wait_t0.elapsed();
                 let completions: Vec<(u64, i32)> = self
                     .ring
                     .completion()
@@ -394,10 +408,17 @@ pub mod fetch {
                     inflight -= 1;
                     let idx = ud as usize;
                     let slab = pending[idx].take().expect("slot occupied");
+                    let callback_t0 = std::time::Instant::now();
                     on_slab(idx, slab)?;
+                    stats.callback += callback_t0.elapsed();
                 }
             }
+            self.last_stats = stats;
             Ok(())
+        }
+
+        pub fn last_stats(&self) -> &FetchStats {
+            &self.last_stats
         }
     }
 }
